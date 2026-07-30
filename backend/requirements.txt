@@ -7,6 +7,8 @@ httpx>=0.27.0
 python-jose[cryptography]==3.3.0
 openpyxl==3.1.2
 reportlab>=4.2.2
+Pillow>=10.3.0   # report asset trimming + image embedding (services/report.py)
+PyYAML>=6.0.1    # report copy/layout template (assets/report_template.yml)
 python-multipart>=0.0.9
 pydantic>=2.11.0
 pydantic-settings>=2.6.0
