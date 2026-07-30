@@ -1,12 +1,10 @@
 """
 Client-facing cost-assessment report (PDF) + workbook (Excel).
 
-`generate_pdf` renders the branded TechPlus Talent template: cover page, table of contents,
-executive summary with 3-year spend projections, Purpose, Methodology, Evaluation Summary
-(environment details), and Cost Optimization broken out by pillar (Compute / Storage / Network) with
-per-optimization tables (Reserved Instances 1yr/3yr, Azure Hybrid Benefit, Savings Plan, right-sizing,
-orphaned disks, public IPs). Numbers come straight from the findings — which are now grounded in
-actual cost — so the report never shows savings exceeding spend.
+`generate_pdf` renders the branded TechPlus Talent template. The document's *copy and layout* live
+in `assets/report_template.yml`; this module only supplies the *data* — every figure, table row and
+chart series is derived from the assessment and its findings, so nothing in the report is
+hardcoded. Sections whose findings are absent are skipped rather than printed empty.
 
 `generate_excel` remains the detailed data workbook for analysts.
 """
@@ -15,35 +13,41 @@ from __future__ import annotations
 import io
 import os
 from collections import OrderedDict
+from datetime import datetime
 from typing import Dict, List, Optional
 
+import yaml
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
-    HRFlowable, Image, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
+    KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
 )
 from reportlab.platypus.tableofcontents import TableOfContents
-from reportlab.graphics.shapes import Drawing
+from reportlab.graphics.shapes import Drawing, Rect, String
 from reportlab.graphics.charts.barcharts import VerticalBarChart
 from reportlab.graphics.charts.legends import Legend
+
+from PIL import Image as PILImage
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 
-# ── Brand palette (TPT client template) ──────────────────────────────────────────
-TEAL = colors.HexColor("#0E7C86")      # section headings
-HEAD_BLUE = colors.HexColor("#2E75B6")  # table header fill
-SAVINGS = colors.HexColor("#2E7D32")    # savings (green)
-SPEND = colors.HexColor("#2E75B6")      # current spend (blue)
-AFTER = colors.HexColor("#ED7D31")      # optimized spend (orange)
-ROW_ALT = colors.HexColor("#F2F6FA")
-INK = colors.HexColor("#1A2B3C")
-MUTED = colors.HexColor("#5B6B7B")
+_ASSET_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
+_TEMPLATE_PATH = os.path.join(_ASSET_DIR, "report_template.yml")
 
-_LOGO_PATH = os.path.join(os.path.dirname(__file__), "..", "assets", "tpt_logo.png")
+# Cover artwork (see assets/README.md). Everything but the backdrop is optional — a missing file is
+# simply not drawn, so the cover degrades gracefully rather than failing the whole report.
+_COVER_BG = "bg.png"                        # full-bleed backdrop, authored at the A4 aspect ratio
+_COVER_LOGO = "Picture1.png"                # TPT wordmark lockup
+_COVER_ART = "cover_illustration.png.png"   # isometric assessment illustration
+_COVER_COIN = "Picture5.png"                # green "$" hexagon
+_COVER_AZURE = "azure_logo.png"             # Azure "A" (rasterised from Picture4.svg)
 
 # Helvetica-safe currency symbols (₹/native glyphs don't render in the base PDF font, so INR → "Rs ";
 # the $-currencies are disambiguated with a country prefix).
@@ -61,19 +65,139 @@ def _usd(v: Optional[float], dec: int = 2) -> str:
     return f"{_CUR['symbol']}{(v or 0):,.{dec}f}"
 
 
-def _logo() -> Optional[str]:
-    return _LOGO_PATH if os.path.exists(_LOGO_PATH) else None
+def _money0(v: Optional[float]) -> str:
+    """Whole-currency, for chart labels and axis ticks."""
+    return f"{_CUR['symbol']}{(v or 0):,.0f}"
 
 
-# ── Findings organisation ─────────────────────────────────────────────────────────
+# ── Template ────────────────────────────────────────────────────────────────────────
 
-# category → pillar. Everything database-ish folds into Compute (commitment-style), matching the
-# 3-pillar client template (Compute / Storage / Network).
+_TEMPLATE_CACHE: Dict[str, object] = {}
+
+
+def _template() -> Dict:
+    """Parsed report_template.yml, reloaded whenever the file changes on disk."""
+    try:
+        stamp = os.path.getmtime(_TEMPLATE_PATH)
+    except OSError:
+        return {}
+    if _TEMPLATE_CACHE.get("stamp") != stamp:
+        with open(_TEMPLATE_PATH, encoding="utf-8") as fh:
+            _TEMPLATE_CACHE["data"] = yaml.safe_load(fh) or {}
+        _TEMPLATE_CACHE["stamp"] = stamp
+    return _TEMPLATE_CACHE["data"]  # type: ignore[return-value]
+
+
+# ── Fonts ───────────────────────────────────────────────────────────────────────────
+
+_FONTS_READY: Dict[str, str] = {}
+
+
+def _fonts(cfg: Dict) -> str:
+    """Register the bundled font family and return its base name.
+
+    Falls back to Helvetica when the TTFs are missing so the report still renders; only the
+    typeface differs.
+    """
+    family = cfg.get("family") or "Carlito"
+    if _FONTS_READY.get("family"):
+        return _FONTS_READY["family"]
+    directory = os.path.join(_ASSET_DIR, cfg.get("dir") or "fonts")
+    faces = {
+        family: cfg.get("regular"),
+        f"{family}-Bold": cfg.get("bold"),
+        f"{family}-Italic": cfg.get("italic"),
+        f"{family}-BoldItalic": cfg.get("bold_italic"),
+    }
+    try:
+        for name, filename in faces.items():
+            pdfmetrics.registerFont(TTFont(name, os.path.join(directory, filename)))
+        pdfmetrics.registerFontFamily(
+            family, normal=family, bold=f"{family}-Bold",
+            italic=f"{family}-Italic", boldItalic=f"{family}-BoldItalic")
+    except Exception:  # noqa: BLE001 — missing/unreadable TTFs
+        family = "Helvetica"
+    _FONTS_READY["family"] = family
+    return family
+
+
+# ── Assets ──────────────────────────────────────────────────────────────────────────
+
+_ASSET_CACHE: Dict[str, Optional[ImageReader]] = {}
+
+
+def _asset(name: str) -> Optional[ImageReader]:
+    """Cached ImageReader for a cover asset, trimmed to its visible (non-transparent) bounds.
+
+    The source art carries wide transparent margins that differ per file, so trimming lets the
+    layout position the *artwork* rather than each file's incidental padding. Returns None when
+    the file is missing or unreadable — callers just skip it.
+    """
+    if name not in _ASSET_CACHE:
+        path = os.path.join(_ASSET_DIR, name)
+        reader = None
+        try:
+            im = PILImage.open(path)
+            im.load()
+            if im.mode in ("RGBA", "LA"):
+                box = im.getchannel("A").getbbox()
+                if box:
+                    im = im.crop(box)
+            reader = ImageReader(im)
+        except Exception:  # noqa: BLE001
+            reader = None
+        _ASSET_CACHE[name] = reader
+    return _ASSET_CACHE[name]
+
+
+def _asset_image(name: str, width: float):
+    """Trimmed asset as an Image *flowable* (for use inside tables), or None if unavailable.
+
+    Goes through an in-memory PNG because the Image flowable takes a path or file-like, not the
+    ImageReader that `_asset` caches.
+    """
+    if _asset(name) is None:
+        return None
+    try:
+        from reportlab.platypus import Image as _Image
+        im = PILImage.open(os.path.join(_ASSET_DIR, name)).convert("RGBA")
+        box = im.getchannel("A").getbbox()
+        if box:
+            im = im.crop(box)
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        buf.seek(0)
+        return _Image(buf, width=width, height=width * im.height / im.width)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _place(canvas, name: str, x: float, top: float, width: float = None,
+           height: float = None) -> None:
+    """Draw cover asset `name` with its top-left at (x, top), `top` measured down from the page top.
+
+    Give width or height; the other follows from the artwork's aspect ratio.
+    """
+    reader = _asset(name)
+    if reader is None:
+        return
+    iw, ih = reader.getSize()
+    if width is None:
+        width = height * iw / ih
+    if height is None:
+        height = width * ih / iw
+    canvas.drawImage(reader, x, A4[1] - top - height, width=width, height=height, mask="auto")
+
+
+# ── Findings organisation ───────────────────────────────────────────────────────────
+
+# category → pillar, matching the 3-pillar client template (Compute / Storage / Network).
+# Database-style commitments fold into Compute.
 _PILLAR = {
     "ri_vm": "Compute", "savings_plan_vm": "Compute", "windows_ahb": "Compute",
     "oversized_vms": "Compute", "idle_vms": "Compute", "deallocated_vms": "Compute",
     "vm_rightsizing": "Compute", "idle_app_service_plans": "Compute",
-    "app_service_reserved_capacity": "Compute", "app_service_plan_rightsizing": "Compute",
+    "app_service_reserved_capacity": "Compute",
     "paused_sql_databases": "Compute", "stopped_sql_managed_instances": "Compute",
     "sql_db_reserved_capacity": "Compute", "sql_mi_reserved_capacity": "Compute",
     "cosmos_reserved_capacity": "Compute", "mysql_reserved_capacity": "Compute",
@@ -83,562 +207,701 @@ _PILLAR = {
     "orphaned_public_ips": "Network", "empty_load_balancers": "Network",
     "idle_nat_gateways": "Network", "bastion_hosts": "Network",
 }
+# Categories rendered by their own dedicated table, so the pillar's catch-all table skips them.
+_DEDICATED = {"ri_vm", "windows_ahb", "disk_rightsizing"}
+_PILLARS = ("Compute", "Storage", "Network")
 
 
-def _by_category(findings: List) -> "OrderedDict[str, List]":
-    d: "OrderedDict[str, List]" = OrderedDict()
+def _pillar_of(finding) -> str:
+    return _PILLAR.get(finding.category, "Other")
+
+
+def _annual(f) -> float:
+    return float(getattr(f, "estimated_savings_annual", 0.0) or 0.0)
+
+
+def _ordinal(n: int) -> str:
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+
+
+# ── Data context ────────────────────────────────────────────────────────────────────
+
+def _ri_items(findings: List) -> List[Dict]:
+    """Per-VM Reserved Instance rows from the aggregated ri_vm finding's reservation items."""
+    out: List[Dict] = []
     for f in findings:
-        d.setdefault(f.category, []).append(f)
-    return d
+        if f.category != "ri_vm":
+            continue
+        for item in (f.details or {}).get("reservation_items", []) or []:
+            out.append({
+                "name": item.get("name") or item.get("sku") or "—",
+                "sku": item.get("sku") or "—",
+                "region": item.get("region") or "—",
+                "quantity": item.get("quantity") or "",
+                "annual_ondemand": (item.get("monthly_ondemand") or 0) * 12,
+                "annual_savings": (item.get("monthly_savings") or 0) * 12,
+                "annual_savings_3yr": (item.get("monthly_savings_3yr") or 0) * 12,
+            })
+    return out
 
 
-def _one(cat: Dict, key: str):
-    """First finding for an aggregated category (ri_vm / savings_plan_vm / windows_ahb), or None."""
-    lst = cat.get(key)
-    return lst[0] if lst else None
+def _ahb_items(findings: List) -> List[Dict]:
+    """Per-VM Azure Hybrid Benefit rows.
 
-
-def _pillar_totals(findings: List) -> Dict[str, float]:
-    totals = {"Compute": 0.0, "Storage": 0.0, "Network": 0.0, "Other": 0.0}
+    Current annual cost prefers the VM's measured cost; when Cost Management data is absent it
+    falls back to the Windows-inclusive list price used to derive the saving, so the column is
+    always grounded in the same figure the saving came from.
+    """
+    out: List[Dict] = []
     for f in findings:
-        pillar = _PILLAR.get(f.category, "Other")
-        totals[pillar] += f.estimated_savings_annual or 0.0
-    return totals
+        if f.category != "windows_ahb":
+            continue
+        for vm in (f.details or {}).get("eligible_vms", []) or []:
+            # None (not 0) when neither figure is present, so the cell reads "—" rather than
+            # asserting the VM costs nothing.
+            monthly_cost = vm.get("actual_monthly_cost") or vm.get("windows_price")
+            out.append({
+                "name": vm.get("name") or "—",
+                "sku": vm.get("sku") or "—",
+                "annual_cost": monthly_cost * 12 if monthly_cost else None,
+                "annual_savings": (vm.get("monthly_savings") or 0) * 12,
+            })
+    return out
 
 
-# ── Charts ─────────────────────────────────────────────────────────────────────────
+def _disk_sku_items(findings: List) -> List[Dict]:
+    """Managed-disk SKU right-sizing rows (premium → standard SSD), when the engine emits them."""
+    out: List[Dict] = []
+    for f in findings:
+        if f.category != "disk_rightsizing":
+            continue
+        d = f.details or {}
+        monthly_cost = getattr(f, "actual_monthly_cost", None) or d.get("monthly_cost")
+        out.append({
+            "name": f.resource_name or "—",
+            "current_sku": d.get("current_sku") or "—",
+            "recommended_sku": d.get("recommended_sku") or "—",
+            "quantity": d.get("quantity") or 1,
+            "annual_cost": monthly_cost * 12 if monthly_cost else None,
+            "annual_savings": _annual(f),
+        })
+    return out
 
-_GROWTH = OrderedDict([
-    ("Fixed Consumption Spend Trajectory", 0.0),
-    ("Conservative Growth ACR", 0.07),
-    ("Linear Growth ACR", 0.15),
-    ("Civo 2024 SMB Report (25%) ACR", 0.25),
-])
+
+def _pillar_rows(findings: List, pillar: str) -> List[Dict]:
+    """Catch-all rows for a pillar: every finding without a dedicated table of its own."""
+    out: List[Dict] = []
+    for f in findings:
+        if _pillar_of(f) != pillar or f.category in _DEDICATED:
+            continue
+        monthly_cost = getattr(f, "actual_monthly_cost", None)
+        out.append({
+            "name": f.resource_name or f.display_name or "—",
+            "opportunity": f.display_name or f.category,
+            "annual_cost": (monthly_cost * 12) if monthly_cost else None,
+            "annual_savings": _annual(f),
+        })
+    out.sort(key=lambda r: r["annual_savings"], reverse=True)
+    return out
 
 
-def _projection(spend: float, savings: float, g: float):
-    """Cumulative 3-year (ACR, ACR-after-savings, savings) with annual growth rate `g`."""
+def _pillar_options(findings: List, pillar: str) -> List[Dict]:
+    """Chart series for a pillar: annual savings grouped by opportunity type."""
+    totals: "OrderedDict[str, float]" = OrderedDict()
+    for f in findings:
+        if _pillar_of(f) != pillar:
+            continue
+        label = f.display_name or f.category
+        totals[label] = totals.get(label, 0.0) + _annual(f)
+    rows = [{"label": k, "value": v} for k, v in totals.items() if v > 0]
+    rows.sort(key=lambda r: r["value"], reverse=True)
+    return rows
+
+
+def _environment_rows(assessment, findings: List) -> List[List[str]]:
+    """Left/right rows for the Environment Details table, from the assessment record."""
+    tenant = assessment.tenant_display_name or "—"
+    rows = [["Tenant Details", f"{tenant}<br/>({assessment.tenant_id or '—'})"]]
+
+    subs = assessment.subscription_names or {}
+    if subs:
+        detail = "<br/>".join(f"{name or sid}<br/>({sid})" for sid, name in subs.items())
+    else:
+        detail = "<br/>".join(assessment.subscription_ids or []) or "—"
+    rows.append(["Subscription Details", detail])
+
+    rows.append(["Total No. of resources", str(assessment.total_resources or "—")])
+
+    types = [t.get("type", "") for t in (assessment.major_resource_types or []) if t.get("type")]
+    rows.append(["Major Resource Type", " and ".join(types) if types else "—"])
+
+    if assessment.current_monthly_spend is not None:
+        when = assessment.created_at.strftime("%b %Y") if assessment.created_at else ""
+        label = f"Last Month Consumption ({when})" if when else "Last Month Consumption"
+        rows.append([label, _usd(assessment.current_monthly_spend, 0)])
+    return rows
+
+
+def _context(assessment, findings: List) -> Dict:
+    """Everything the template can reference — all of it derived from the assessment."""
+    annual = assessment.total_savings_annual or 0.0
+    monthly = assessment.total_savings_monthly or 0.0
+    spend = assessment.current_annual_spend if assessment.cost_data_available else None
+
+    # `tenant_display_name` doubles as both today; a distinct engaging-client field would slot in
+    # here without touching the template.
+    name = assessment.tenant_display_name or "Your Organisation"
+
+    ctx: Dict = {
+        "client": name,
+        "tenant": name,
+        "tenant_id": assessment.tenant_id or "—",
+        "savings_3year": _usd(annual * 3),
+        "savings_annual": _usd(annual),
+        "savings_monthly": _usd(monthly),
+        "annual_spend": _usd(spend) if spend else "",
+        "has_spend": bool(spend),
+        "no_spend": not spend,
+        "_spend": spend or 0.0,
+        "_savings": annual,
+        "environment_rows": _environment_rows(assessment, findings),
+        "ri_items": _ri_items(findings),
+        "ahb_items": _ahb_items(findings),
+        "disk_sku_items": _disk_sku_items(findings),
+        "_year": (assessment.created_at or datetime.utcnow()).year,
+    }
+
+    for pillar in _PILLARS:
+        key = pillar.lower()
+        total = sum(_annual(f) for f in findings if _pillar_of(f) == pillar)
+        ctx[f"{key}_savings"] = _usd(total)
+        ctx[f"{key}_any"] = total > 0 or any(_pillar_of(f) == pillar for f in findings)
+        ctx[f"{key}_options"] = _pillar_options(findings, pillar)
+        ctx[f"{key}_other"] = _pillar_rows(findings, pillar)
+
+    ctx["vm_any"] = bool(ctx["ri_items"] or ctx["ahb_items"])
+    ctx["compute_other"] = _pillar_rows(findings, "Compute")
+    ctx["no_findings"] = not findings
+    return ctx
+
+
+# ── Styles ──────────────────────────────────────────────────────────────────────────
+
+_ALIGN = {"left": TA_LEFT, "center": TA_CENTER, "right": TA_RIGHT, "justify": TA_JUSTIFY}
+
+
+def _styles(tpl: Dict) -> Dict[str, ParagraphStyle]:
+    """Build ParagraphStyles from the template's `styles` + `palette` blocks."""
+    family = _fonts(tpl.get("fonts") or {})
+    palette = tpl.get("palette") or {}
+
+    def colour(value, default="#000000"):
+        raw = palette.get(value, value if isinstance(value, str) else default) or default
+        return colors.HexColor(raw)
+
+    out: Dict[str, ParagraphStyle] = {}
+    for name, spec in (tpl.get("styles") or {}).items():
+        spec = spec or {}
+        size = float(spec.get("size", 11))
+        out[name] = ParagraphStyle(
+            name,
+            fontName=f"{family}-Bold" if spec.get("bold") else family,
+            fontSize=size,
+            leading=float(spec.get("leading", size * 1.32)),
+            textColor=colour(spec.get("colour", "ink")),
+            alignment=_ALIGN.get(spec.get("align", "left"), TA_LEFT),
+            spaceBefore=float(spec.get("space_before", 0)),
+            spaceAfter=float(spec.get("space_after", 0)),
+            leftIndent=float(spec.get("left_indent", 0)),
+            bulletIndent=float(spec.get("bullet_indent", 0)),
+        )
+    # Heading levels double as TOC anchors; ReportLab keys the notification off the style name.
+    for level, key in ((0, "h1"), (1, "h2"), (2, "h3")):
+        if key in out:
+            out[key].name = f"TOCH{level + 1}"
+    return out
+
+
+# ── Charts ──────────────────────────────────────────────────────────────────────────
+
+def _projection(spend: float, savings: float, growth: float):
+    """Cumulative 3-year (ACR, ACR-after-savings, savings) at annual growth rate `growth`."""
     rate = (savings / spend) if spend else 0.0
-    acr, after, sav = [], [], []
-    c_acr = c_after = c_sav = 0.0
-    for y in range(3):
-        annual = spend * ((1 + g) ** y)
+    acr, after, saved = [], [], []
+    c_acr = c_after = c_saved = 0.0
+    for year in range(3):
+        annual = spend * ((1 + growth) ** year)
         s = annual * rate
         c_acr += annual
-        c_sav += s
+        c_saved += s
         c_after += annual - s
-        acr.append(round(c_acr)); after.append(round(c_after)); sav.append(round(c_sav))
-    return acr, after, sav
+        acr.append(round(c_acr))
+        after.append(round(c_after))
+        saved.append(round(c_saved))
+    return acr, after, saved
 
 
-def _bar_chart(series, cats, colours, width=470, height=210, legend_names=None):
+def _framed(drawing: Drawing, palette: Dict) -> Drawing:
+    """Wrap a chart in the reference's thin outer frame."""
+    frame = Rect(0, 0, drawing.width, drawing.height, fillColor=None,
+                 strokeColor=colors.HexColor(palette.get("panel_border", "#9DC3E6")),
+                 strokeWidth=0.75)
+    drawing.insert(0, frame)
+    return drawing
+
+
+def _projection_chart(title: str, series, labels, tpl: Dict, family: str, width: float):
+    """Grouped 3-series bar chart matching the reference: value labels, bottom legend, frame."""
+    palette = tpl.get("palette") or {}
+    cols = [colors.HexColor(palette.get(k, d)) for k, d in
+            (("spend", "#2E74B5"), ("after", "#ED7D31"), ("savings", "#1E6C34"))]
+    names = (tpl.get("projections") or {}).get("series") or ["ACR", "ACR after Savings", "Savings"]
+
+    height = 232.0
     d = Drawing(width, height)
+    d.add(String(width / 2, height - 22, title, fontName=family, fontSize=12,
+                 fillColor=colors.HexColor(palette.get("ink", "#000000")), textAnchor="middle"))
+
     bc = VerticalBarChart()
-    bc.x, bc.y = 45, 45
-    bc.width, bc.height = width - 90, height - 80
+    bc.x, bc.y = 56, 52
+    bc.width, bc.height = width - 78, height - 104
     bc.data = series
-    bc.categoryAxis.categoryNames = cats
-    bc.categoryAxis.labels.fontSize = 8
-    bc.valueAxis.valueMin = 0
-    bc.valueAxis.labels.fontSize = 7
-    bc.barSpacing = 1
-    bc.groupSpacing = 12
-    for i, col in enumerate(colours):
-        bc.bars[i].fillColor = col
-        bc.bars[i].strokeColor = colors.white
-    # $ value label on top of every bar (like the client template).
-    bc.barLabelFormat = f"{_CUR['symbol']}%0.0f"
-    bc.barLabels.fontName = "Helvetica"
-    bc.barLabels.fontSize = 6
-    bc.barLabels.dy = 4
-    bc.barLabels.fillColor = INK
-    d.add(bc)
-    if legend_names:
-        lg = Legend()
-        lg.x, lg.y = 45, 16
-        lg.deltax = 120
-        lg.dxTextSpace = 5
-        lg.columnMaximum = 1
-        lg.alignment = "right"
-        lg.fontSize = 8
-        lg.colorNamePairs = list(zip(colours, legend_names))
-        d.add(lg)
-    return d
-
-
-def _savings_options_chart(cat_finding):
-    """Compute-pillar options bar: RI 1yr / RI 3yr / AHB / Savings Plan annual savings."""
-    labels, values, cols = [], [], []
-    ri = _one(cat_finding, "ri_vm")
-    if ri:
-        det = ri.details or {}
-        one = (det.get("total_1yr_monthly") or 0) * 12
-        three = (det.get("total_3yr_monthly") or 0) * 12
-        if one:
-            labels.append("RI (1 Year)"); values.append(round(one)); cols.append(SAVINGS)
-        if three:
-            labels.append("RI (3 Year)"); values.append(round(three)); cols.append(AFTER)
-    sp = _one(cat_finding, "savings_plan_vm")
-    if sp:
-        labels.append("Savings Plan"); values.append(round(sp.estimated_savings_annual)); cols.append(SPEND)
-    ahb = _one(cat_finding, "windows_ahb")
-    if ahb:
-        labels.append("Azure Hybrid Benefit"); values.append(round(ahb.estimated_savings_annual)); cols.append(TEAL)
-    if not values:
-        return None
-    d = Drawing(470, 200)
-    bc = VerticalBarChart()
-    bc.x, bc.y = 45, 35
-    bc.width, bc.height = 380, 140
-    bc.data = [values]
     bc.categoryAxis.categoryNames = labels
-    bc.categoryAxis.labels.fontSize = 8
+    bc.categoryAxis.labels.fontName = family
+    bc.categoryAxis.labels.fontSize = 8.5
+    bc.categoryAxis.strokeColor = colors.HexColor("#BFBFBF")
     bc.valueAxis.valueMin = 0
-    bc.valueAxis.labels.fontSize = 7
-    bc.barWidth = 18
-    for i in range(len(values)):
-        bc.bars[(0, i)].fillColor = cols[i]
-    bc.barLabelFormat = f"{_CUR['symbol']}%0.0f"
-    bc.barLabels.fontName = "Helvetica-Bold"
-    bc.barLabels.fontSize = 7
-    bc.barLabels.dy = 4
-    bc.barLabels.fillColor = INK
+    bc.valueAxis.labels.fontName = family
+    bc.valueAxis.labels.fontSize = 8.5
+    bc.valueAxis.labelTextFormat = lambda v: _money0(v)
+    bc.valueAxis.strokeColor = colors.HexColor("#BFBFBF")
+    bc.valueAxis.gridStrokeColor = colors.HexColor("#D9D9D9")
+    bc.valueAxis.gridStrokeWidth = 0.4
+    bc.valueAxis.visibleGrid = True
+    # Gap between adjacent bars matters: ACR and ACR-after-savings sit close in value, so their
+    # labels collide if the bars touch.
+    bc.barSpacing = 4
+    bc.groupSpacing = 26
+    for i, col in enumerate(cols):
+        bc.bars[i].fillColor = col
+        bc.bars[i].strokeColor = None
+    bc.barLabelFormat = lambda v: _money0(v)
+    bc.barLabels.fontName = family
+    bc.barLabels.fontSize = 6.5
+    bc.barLabels.dy = 5
+    bc.barLabels.fillColor = colors.HexColor("#404040")
     d.add(bc)
-    return d
+
+    legend = Legend()
+    legend.x, legend.y = width / 2 - 96, 22
+    legend.deltax = 74
+    legend.dxTextSpace = 4
+    legend.columnMaximum = 1
+    legend.alignment = "right"
+    legend.fontName = family
+    legend.fontSize = 8.5
+    legend.colorNamePairs = list(zip(cols, names))
+    d.add(legend)
+    return _framed(d, palette)
 
 
-# ── PDF document (TOC-aware) ────────────────────────────────────────────────────────
+def _options_chart(title: str, options: List[Dict], tpl: Dict, family: str, width: float):
+    """Single-series bar chart of annual savings per opportunity, one colour per bar."""
+    palette = tpl.get("palette") or {}
+    cycle = [colors.HexColor(palette.get(k, d)) for k, d in
+             (("savings", "#1E6C34"), ("after", "#ED7D31"), ("spend", "#2E74B5"))]
+    values = [round(o["value"]) for o in options]
+    names = [o["label"] for o in options]
+
+    height = 236.0
+    d = Drawing(width, height)
+    d.add(String(width / 2, height - 24, title, fontName=family, fontSize=12,
+                 fillColor=colors.HexColor(palette.get("ink", "#000000")), textAnchor="middle"))
+
+    bc = VerticalBarChart()
+    bc.x, bc.y = 58, 54
+    bc.width, bc.height = width - 82, height - 106
+    bc.data = [values]
+    bc.categoryAxis.categoryNames = [""] * len(values)   # identified by the legend, as in the reference
+    bc.categoryAxis.strokeColor = colors.HexColor("#BFBFBF")
+    bc.valueAxis.valueMin = 0
+    bc.valueAxis.labels.fontName = family
+    bc.valueAxis.labels.fontSize = 8.5
+    bc.valueAxis.labelTextFormat = lambda v: _money0(v)
+    bc.valueAxis.strokeColor = colors.HexColor("#BFBFBF")
+    bc.valueAxis.gridStrokeColor = colors.HexColor("#D9D9D9")
+    bc.valueAxis.gridStrokeWidth = 0.4
+    bc.valueAxis.visibleGrid = True
+    bc.groupSpacing = 26
+    bc.barWidth = 26
+    for i in range(len(values)):
+        bc.bars[(0, i)].fillColor = cycle[i % len(cycle)]
+        bc.bars[(0, i)].strokeColor = None
+    bc.barLabelFormat = lambda v: _money0(v)
+    bc.barLabels.fontName = f"{family}-Bold"
+    bc.barLabels.fontSize = 8
+    bc.barLabels.dy = 6
+    bc.barLabels.fillColor = colors.HexColor("#262626")
+    d.add(bc)
+
+    legend = Legend()
+    legend.x, legend.y = 58, 22
+    legend.deltax = min(150, max(90, (width - 90) / max(1, len(names))))
+    legend.dxTextSpace = 4
+    legend.columnMaximum = 1
+    legend.alignment = "right"
+    legend.fontName = family
+    legend.fontSize = 8.5
+    legend.colorNamePairs = [(cycle[i % len(cycle)], n) for i, n in enumerate(names)]
+    d.add(legend)
+    return _framed(d, palette)
+
+
+# ── Document shell ──────────────────────────────────────────────────────────────────
 
 class _TPTDoc(SimpleDocTemplate):
-    """SimpleDocTemplate that notifies the TableOfContents of H1/H2 headings for page numbers."""
+    """SimpleDocTemplate that notifies the TableOfContents of H1/H2/H3 headings."""
 
     def afterFlowable(self, flowable):
         if not isinstance(flowable, Paragraph):
             return
         name = flowable.style.name
-        if name == "TOCH1":
-            self.notify("TOCEntry", (0, flowable.getPlainText(), self.page))
-        elif name == "TOCH2":
-            self.notify("TOCEntry", (1, flowable.getPlainText(), self.page))
+        if name in ("TOCH1", "TOCH2", "TOCH3") and getattr(flowable, "_toc", False):
+            level = int(name[-1]) - 1
+            self.notify("TOCEntry", (level, flowable.getPlainText(), self.page))
 
 
-def _cover(canvas, doc):
-    """Full-page dark cover drawn under the page-1 flowables."""
-    canvas.saveState()
-    w, h = A4
-    canvas.setFillColor(colors.HexColor("#0B1622"))
-    canvas.rect(0, 0, w, h, fill=1, stroke=0)
-    canvas.setFillColor(colors.HexColor("#123047"))
-    canvas.rect(0, 0, w, 2.4 * inch, fill=1, stroke=0)  # subtle base band
-    canvas.restoreState()
+def _cover(client: str, when: str):
+    """Build the page-1 painter for the branded cover.
+
+    The whole cover is drawn on the canvas rather than flowed as platypus content: it is a fixed
+    composition of overlapping artwork (Azure mark bleeding off the bottom edge, the "$" hexagon
+    sitting on top of it), which flowables cannot express. Page 1 therefore carries no story
+    content. Positions are fractions of the page so the layout holds at any page size.
+    """
+
+    def draw(canvas, doc):
+        canvas.saveState()
+        w, h = A4
+
+        # Backdrop: full-bleed artwork (authored at the A4 aspect, so no distortion), else flat dark.
+        if _asset(_COVER_BG) is not None:
+            canvas.drawImage(_asset(_COVER_BG), 0, 0, width=w, height=h,
+                             preserveAspectRatio=False, mask="auto")
+        else:
+            canvas.setFillColor(colors.HexColor("#0B1622"))
+            canvas.rect(0, 0, w, h, fill=1, stroke=0)
+            canvas.setFillColor(colors.HexColor("#123047"))
+            canvas.rect(0, 0, w, 2.4 * inch, fill=1, stroke=0)
+
+        # Decorative art, back to front — the hexagon overlaps the Azure mark, which bleeds off-page.
+        _place(canvas, _COVER_AZURE, x=0.055 * w, top=0.750 * h, width=0.385 * w)
+        _place(canvas, _COVER_COIN, x=0.255 * w, top=0.700 * h, width=0.180 * w)
+        _place(canvas, _COVER_ART, x=0.595 * w, top=0.440 * h, width=0.325 * w)
+
+        # TPT lockup, top-left.
+        _place(canvas, _COVER_LOGO, x=0.075 * w, top=0.070 * h, width=0.560 * w)
+
+        family = _fonts((_template().get("fonts") or {}))
+        canvas.setFillColor(colors.white)
+        canvas.setFont(f"{family}-Bold", 32)
+        canvas.drawString(0.150 * w, h - 0.256 * h, _template().get("meta", {}).get(
+            "title", "Cost Assessment"))
+
+        canvas.setStrokeColor(colors.white)
+        canvas.setLineWidth(1.6)
+        canvas.line(0.110 * w, h - 0.350 * h, 0.310 * w, h - 0.350 * h)
+
+        canvas.setFont(f"{family}-Bold", 16)
+        if when:
+            canvas.drawString(0.110 * w, h - 0.397 * h, when)
+        canvas.drawString(0.110 * w, h - 0.437 * h, f"Prepared for: {client}")
+
+        canvas.restoreState()
+
+    return draw
 
 
-def _decorate(canvas, doc):
-    """Header logo + footer page number on content pages."""
-    canvas.saveState()
-    w, h = A4
-    logo = _logo()
-    if logo:
-        try:
-            canvas.drawImage(logo, w - 1.7 * inch, h - 0.75 * inch, width=1.2 * inch,
-                             height=0.42 * inch, preserveAspectRatio=True, mask="auto")
-        except Exception:  # noqa: BLE001
-            pass
-    canvas.setStrokeColor(colors.HexColor("#DDE5EE"))
-    canvas.setLineWidth(0.5)
-    canvas.line(0.7 * inch, 0.6 * inch, w - 0.7 * inch, 0.6 * inch)
-    canvas.setFont("Helvetica", 8)
-    canvas.setFillColor(MUTED)
-    canvas.drawRightString(w - 0.7 * inch, 0.42 * inch, f"{doc.page} | P a g e")
-    canvas.restoreState()
+def _decorate(tpl: Dict):
+    """Content-page painter: page border, header logo, footer rule + page number."""
+    page_cfg = tpl.get("page") or {}
+    border = page_cfg.get("border") or {}
+    logo_cfg = page_cfg.get("header_logo") or {}
+    footer = page_cfg.get("footer") or {}
+    family = _fonts(tpl.get("fonts") or {})
+
+    def draw(canvas, doc):
+        canvas.saveState()
+        w, h = A4
+
+        inset = float(border.get("inset", 24))
+        canvas.setStrokeColor(colors.HexColor(border.get("colour", "#000000")))
+        canvas.setLineWidth(float(border.get("width", 1.0)))
+        canvas.rect(inset, inset, w - 2 * inset, h - 2 * inset, fill=0, stroke=1)
+
+        if logo_cfg.get("asset"):
+            lw = float(logo_cfg.get("width", 122))
+            _place(canvas, logo_cfg["asset"],
+                   x=w - inset - float(logo_cfg.get("right", 30)) - lw,
+                   top=inset + float(logo_cfg.get("top", 30)), width=lw)
+
+        rule = footer.get("rule") or {}
+        baseline = float(footer.get("baseline", 40))
+        if rule:
+            canvas.setStrokeColor(colors.HexColor(rule.get("colour", "#BFBFBF")))
+            canvas.setLineWidth(float(rule.get("width", 0.6)))
+            y = baseline + float(rule.get("above", 14))
+            canvas.line(inset + 26, y, w - inset - 26, y)
+
+        canvas.setFont(family, float(footer.get("size", 10.5)))
+        canvas.setFillColor(colors.HexColor(footer.get("colour", "#595959")))
+        label = str(footer.get("text", "{page} | P a g e")).format(page=doc.page)
+        canvas.drawRightString(w - inset - 26, baseline, label)
+        canvas.restoreState()
+
+    return draw
 
 
-def _styles():
-    s = getSampleStyleSheet()
-    return {
-        "cover_title": ParagraphStyle("cover_title", fontName="Helvetica-Bold", fontSize=40,
-                                      textColor=colors.white, leading=46),
-        "cover_meta": ParagraphStyle("cover_meta", fontName="Helvetica-Bold", fontSize=16,
-                                     textColor=colors.white, leading=22),
-        "h1": ParagraphStyle("TOCH1", fontName="Helvetica-Bold", fontSize=17, textColor=TEAL,
-                             spaceBefore=6, spaceAfter=8),
-        "h2": ParagraphStyle("TOCH2", fontName="Helvetica-Bold", fontSize=13, textColor=TEAL,
-                             spaceBefore=8, spaceAfter=5),
-        "h3": ParagraphStyle("h3", fontName="Helvetica-Bold", fontSize=10.5, textColor=INK,
-                             spaceBefore=6, spaceAfter=3),
-        "body": ParagraphStyle("body", parent=s["Normal"], fontSize=9.5, textColor=INK, leading=14,
-                               spaceAfter=4),
-        "small": ParagraphStyle("small", parent=s["Normal"], fontSize=8, textColor=MUTED, leading=11),
-        "cell": ParagraphStyle("cell", parent=s["Normal"], fontSize=8, textColor=INK, leading=10),
-        "cellh": ParagraphStyle("cellh", parent=s["Normal"], fontSize=8, textColor=colors.white,
-                                fontName="Helvetica-Bold", leading=10),
-        "toch": ParagraphStyle("toch", fontName="Helvetica-Bold", fontSize=16, textColor=TEAL,
-                               spaceAfter=10, alignment=TA_CENTER),
-    }
+# ── Block renderers ─────────────────────────────────────────────────────────────────
+
+def _fmt(value, kind: Optional[str]) -> str:
+    if value is None or value == "":
+        return "—"
+    if kind == "currency":
+        return _usd(value)
+    if kind == "currency0":
+        return _usd(value, 0)
+    return str(value)
 
 
-def _table(headers, rows, col_widths, st, align_right_from=None):
-    """A branded data table: blue header, alternating rows, right-aligned money columns."""
-    data = [[Paragraph(h, st["cellh"]) for h in headers]]
-    for r in rows:
-        data.append([c if hasattr(c, "wrap") else Paragraph(str(c), st["cell"]) for c in r])
-    t = Table(data, colWidths=col_widths, repeatRows=1)
-    style = [
-        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BLUE),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DEE8")),
+def _text(raw: str, ctx: Dict) -> str:
+    """Fill {placeholders} from the context, leaving unknown ones untouched."""
+    class _Safe(dict):
+        def __missing__(self, key):  # noqa: D105
+            return "{" + key + "}"
+    return str(raw).format_map(_Safe(ctx))
+
+
+def _data_table(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float) -> Optional[Table]:
+    rows = ctx.get(block.get("source")) or []
+    if not rows:
+        return None
+    palette = tpl.get("palette") or {}
+    tcfg = tpl.get("table") or {}
+    cols = block.get("columns") or []
+    fractions = block.get("widths") or [1.0 / len(cols)] * len(cols)
+    widths = [avail * f for f in fractions]
+
+    data = [[Paragraph(c["header"], st["cell_h"]) for c in cols]]
+    for row in rows:
+        data.append([Paragraph(_fmt(row.get(c["field"]), c.get("format")), st["cell"])
+                     for c in cols])
+
+    table = Table(data, colWidths=widths, repeatRows=1)
+    pad = float(tcfg.get("row_padding", 6))
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(palette.get("table_header_bg", "#2E74B5"))),
+        ("GRID", (0, 0), (-1, -1), float(tcfg.get("grid_width", 0.75)),
+         colors.HexColor(palette.get("table_grid", "#000000"))),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-    ]
-    if align_right_from is not None:
-        style.append(("ALIGN", (align_right_from, 1), (-1, -1), "RIGHT"))
-    for i in range(1, len(data)):
-        if i % 2 == 0:
-            style.append(("BACKGROUND", (0, i), (-1, i), ROW_ALT))
-    t.setStyle(TableStyle(style))
-    return t
-
-
-def _hero(assessment, st):
-    """Executive-summary savings hero (3-year / yearly / monthly)."""
-    annual = assessment.total_savings_annual or 0.0
-    monthly = assessment.total_savings_monthly or 0.0
-    cells = [
-        [Paragraph("Potential 3-Year Savings", st["cellh"]),
-         Paragraph("Potential Yearly Savings", st["cellh"]),
-         Paragraph("Potential Monthly Savings", st["cellh"])],
-        [Paragraph(f"<b>{_usd(annual * 3)}</b>", ParagraphStyle("hb", parent=st["body"], fontSize=18,
-                                                                textColor=SAVINGS, alignment=TA_CENTER)),
-         Paragraph(f"<b>{_usd(annual)}</b>", ParagraphStyle("hy", parent=st["body"], fontSize=18,
-                                                            textColor=SAVINGS, alignment=TA_CENTER)),
-         Paragraph(f"<b>{_usd(monthly)}</b>", ParagraphStyle("hm", parent=st["body"], fontSize=18,
-                                                             textColor=SAVINGS, alignment=TA_CENTER))],
-    ]
-    t = Table(cells, colWidths=[2.3 * inch] * 3)
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BLUE),
-        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.white),
-        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#EAF4EC")),
-        ("TOPPADDING", (0, 1), (-1, 1), 8), ("BOTTOMPADDING", (0, 1), (-1, 1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), pad),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), pad),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
     ]))
-    return t
+    return table
 
 
-# ── Pillar detail builders ──────────────────────────────────────────────────────────
+def _environment_table(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float) -> Table:
+    palette = tpl.get("palette") or {}
+    rows = ctx.get("environment_rows") or []
+    header = Paragraph(_text(block.get("title", "Environment Details"), ctx), st["cell_h"])
+    centred = ParagraphStyle("env_value", parent=st["cell"], alignment=TA_CENTER)
+    data = [[header, ""]]
+    data += [[Paragraph(label, st["cell"]), Paragraph(value, centred)] for label, value in rows]
 
-def _compute_section(cat: Dict, st) -> List:
+    table = Table(data, colWidths=[avail * 0.36, avail * 0.64])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor(palette.get("table_header_bg", "#2E74B5"))),
+        ("SPAN", (0, 0), (-1, 0)),
+        ("GRID", (0, 0), (-1, -1), 0.75, colors.HexColor(palette.get("table_grid", "#000000"))),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return table
+
+
+def _savings_panel(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float) -> Table:
+    """Executive-summary hero: bordered panel, coin mark, label/value pairs."""
+    palette = tpl.get("palette") or {}
+    family = _fonts(tpl.get("fonts") or {})
+    label_style = ParagraphStyle("panel_label", fontName=f"{family}-Bold", fontSize=16,
+                                 textColor=colors.HexColor(palette.get("label", "#1F3864")),
+                                 leading=20, spaceAfter=1)
+    value_style = ParagraphStyle("panel_value", fontName=f"{family}-Bold", fontSize=27,
+                                 textColor=colors.HexColor(palette.get("savings", "#1E6C34")),
+                                 leading=32, spaceAfter=8)
+
+    stack: List = []
+    for row in block.get("rows") or []:
+        stack.append(Paragraph(_text(row["label"], ctx), label_style))
+        stack.append(Paragraph(_text(row["value"], ctx), value_style))
+
+    mark = _asset_image(_COVER_COIN, width=78.0) or ""
+
+    panel = Table([[mark, stack]], colWidths=[avail * 0.30, avail * 0.70])
+    panel.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.9, colors.HexColor(palette.get("panel_border", "#9DC3E6"))),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(palette.get("panel_bg", "#FBFCFE"))),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (0, 0), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 20),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 20),
+        ("LEFTPADDING", (0, 0), (-1, -1), 12),
+    ]))
+    return panel
+
+
+def _projection_blocks(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float) -> List:
+    """One framed chart + caption per scenario, page-broken every `per_page`."""
+    cfg = tpl.get("projections") or {}
+    family = _fonts(tpl.get("fonts") or {})
+    spend, savings = ctx["_spend"], ctx["_savings"]
+
+    base = ctx["_year"] + int(cfg.get("base_year_offset", 0))
+    pattern = cfg.get("year_label", "{ordinal} Year ({start}-{end})")
+    labels = [pattern.format(ordinal=_ordinal(i + 1), start=base + i, end=str(base + i + 1)[-2:])
+              for i in range(3)]
+
+    per_page = int(block.get("per_page", 2))
     out: List = []
-    chart = _savings_options_chart(cat)
-    if chart:
-        out.append(Paragraph("Potential Annual Savings by Optimization Option", st["h3"]))
-        out.append(chart)
-        out.append(Spacer(1, 6))
-
-    ri = _one(cat, "ri_vm")
-    if ri and (ri.details or {}).get("reservation_items"):
-        items = ri.details["reservation_items"]
-        out.append(Paragraph("Reserved Instances (1 Year)", st["h3"]))
-        out.append(Paragraph(
-            "Virtual machines expected to run long-term. Purchasing a 1-year Reserved Instance for "
-            "these achieves the savings below versus pay-as-you-go.", st["small"]))
-        out.append(Spacer(1, 3))
-        rows = [[i.get("name") or i.get("sku"), i.get("sku"), i.get("region") or "—",
-                 i.get("quantity") or "—",
-                 _usd((i.get("monthly_ondemand") or 0) * 12), _usd((i.get("monthly_savings") or 0) * 12)]
-                for i in items]
-        out.append(_table(["Name", "SKU", "Region", "Qty", "Current Annual", "Annual Savings (1 Yr)"],
-                          rows, [1.5 * inch, 1.3 * inch, 0.9 * inch, 0.5 * inch, 1.1 * inch, 1.4 * inch],
-                          st, align_right_from=4))
-        out.append(Spacer(1, 8))
-        three = [i for i in items if i.get("monthly_savings_3yr")]
-        if three:
-            out.append(Paragraph("Reserved Instances (3 Year)", st["h3"]))
-            rows3 = [[i.get("name") or i.get("sku"), i.get("sku"), i.get("region") or "—",
-                      i.get("quantity") or "—", _usd((i.get("monthly_savings_3yr") or 0) * 12)]
-                     for i in three]
-            out.append(_table(["Name", "SKU", "Region", "Qty", "Annual Savings (3 Yr)"], rows3,
-                              [1.7 * inch, 1.4 * inch, 1.0 * inch, 0.6 * inch, 1.5 * inch],
-                              st, align_right_from=4))
-            out.append(Spacer(1, 8))
-
-    sp = _one(cat, "savings_plan_vm")
-    if sp and (sp.details or {}).get("reservation_items"):
-        items = sp.details["reservation_items"]
-        out.append(Paragraph("Savings Plan (Compute)", st["h3"]))
-        rows = [[i.get("name") or i.get("sku"), i.get("sku"), i.get("region") or "—",
-                 _usd((i.get("monthly_savings") or 0) * 12)] for i in items]
-        out.append(_table(["Name", "SKU", "Region", "Annual Savings (1 Yr)"], rows,
-                          [2.0 * inch, 1.6 * inch, 1.2 * inch, 1.5 * inch], st, align_right_from=3))
-        out.append(Spacer(1, 8))
-
-    ahb = _one(cat, "windows_ahb")
-    if ahb and (ahb.details or {}).get("eligible_vms"):
-        vms = ahb.details["eligible_vms"]
-        out.append(Paragraph("Azure Hybrid Benefit", st["h3"]))
-        out.append(Paragraph(
-            "Windows VMs eligible to apply Azure Hybrid Benefit (requires eligible Windows Server "
-            "licences with Software Assurance). Savings shown are the Windows licence portion of each "
-            "VM's actual cost.", st["small"]))
-        out.append(Spacer(1, 3))
-        rows = [[v.get("name"), v.get("sku"), _usd((v.get("monthly_savings") or 0) * 12)] for v in vms]
-        out.append(_table(["Name", "Size", "Annual Savings"], rows,
-                          [2.6 * inch, 1.8 * inch, 1.6 * inch], st, align_right_from=2))
-        out.append(Spacer(1, 8))
-
-    oversized = cat.get("oversized_vms") or []
-    if oversized:
-        out.append(Paragraph("Right-Sizing (under-utilised VMs)", st["h3"]))
-        rows = []
-        for f in oversized:
-            d = f.details or {}
-            rows.append([f.resource_name, d.get("current_sku") or "—", d.get("recommended_sku") or "—",
-                         _usd(f.estimated_savings_annual)])
-        out.append(_table(["Name", "Current Size", "New Size", "Annual Savings"], rows,
-                          [1.9 * inch, 1.6 * inch, 1.6 * inch, 1.3 * inch], st, align_right_from=3))
-        out.append(Spacer(1, 8))
-
-    idle = (cat.get("idle_vms") or []) + (cat.get("deallocated_vms") or [])
-    if idle:
-        out.append(Paragraph("Idle / Deallocated VMs", st["h3"]))
-        rows = [[f.resource_name, f.resource_type.split("/")[-1] if f.resource_type else "VM",
-                 _usd(f.estimated_savings_annual)] for f in idle]
-        out.append(_table(["Name", "Type", "Annual Savings"], rows,
-                          [2.8 * inch, 1.6 * inch, 1.4 * inch], st, align_right_from=2))
-        out.append(Spacer(1, 8))
+    scenarios = cfg.get("scenarios") or []
+    for index, scenario in enumerate(scenarios):
+        acr, after, saved = _projection(spend, savings, float(scenario.get("growth", 0)))
+        chart = _projection_chart(_text(scenario.get("title", ""), ctx), [acr, after, saved],
+                                  labels, tpl, family, avail)
+        caption = Paragraph(_text(scenario.get("caption", ""), ctx), st["caption"])
+        out.append(KeepTogether([chart, Spacer(1, 8), caption]))
+        if per_page and (index + 1) % per_page == 0 and index + 1 < len(scenarios):
+            out.append(PageBreak())
     return out
 
 
-def _storage_section(cat: Dict, st) -> List:
-    out: List = []
-    disks = cat.get("unattached_managed_disks") or []
-    if disks:
-        out.append(Paragraph("Orphaned (Unattached) Disks", st["h3"]))
-        out.append(Paragraph(
-            "Managed disks not attached to any VM. Validate they are not needed for backup/DR, then "
-            "delete to stop the storage charge.", st["small"]))
-        out.append(Spacer(1, 3))
-        rows = []
-        for f in disks:
-            d = f.details or {}
-            rows.append([f.resource_name, d.get("skuName") or "—", _usd(f.estimated_savings_annual)])
-        out.append(_table(["Name", "Storage Type", "Annual Savings"], rows,
-                          [3.6 * inch, 1.4 * inch, 1.4 * inch], st, align_right_from=2))
-        out.append(Spacer(1, 8))
-    for cat_key, title in (("orphaned_snapshots", "Orphaned Snapshots"),
-                           ("backup_redundancy", "Backup Redundancy (GRS → LRS)"),
-                           ("managed_disk_reserved_capacity", "Managed Disk Reserved Capacity")):
-        fs = cat.get(cat_key) or []
-        if fs:
-            out.append(Paragraph(title, st["h3"]))
-            rows = [[f.resource_name or "—", _usd(f.estimated_savings_annual)] for f in fs]
-            out.append(_table(["Name", "Annual Savings"], rows, [5.0 * inch, 1.4 * inch], st,
-                              align_right_from=1))
-            out.append(Spacer(1, 8))
-    return out
+def _render(tpl: Dict, ctx: Dict, st: Dict, toc: TableOfContents, avail: float) -> List:
+    """Walk the template's content blocks into a platypus story."""
+    story: List = []
+    for block in tpl.get("content") or []:
+        kind = block.get("type")
+        need = block.get("require")
+        if need and not ctx.get(need):
+            continue
 
+        if kind == "page_break":
+            story.append(PageBreak())
 
-def _network_section(cat: Dict, st) -> List:
-    out: List = []
-    for cat_key, title, note in (
-        ("orphaned_public_ips", "Orphaned Public IP Addresses",
-         "Unattached public IPs — review and delete if no longer required."),
-        ("empty_load_balancers", "Empty Load Balancers", ""),
-        ("idle_nat_gateways", "Idle NAT Gateways", ""),
-        ("bastion_hosts", "Azure Bastion (review)", ""),
-    ):
-        fs = cat.get(cat_key) or []
-        if fs:
-            out.append(Paragraph(title, st["h3"]))
-            if note:
-                out.append(Paragraph(note, st["small"]))
-                out.append(Spacer(1, 3))
-            rows = [[f.resource_name or "—", (f.details or {}).get("skuName") or "Standard",
-                     _usd(f.estimated_savings_monthly)] for f in fs]
-            out.append(_table(["Name", "SKU", "Cost / Month"], rows,
-                              [3.6 * inch, 1.4 * inch, 1.4 * inch], st, align_right_from=2))
-            out.append(Spacer(1, 8))
-    return out
+        elif kind == "toc":
+            story.append(Paragraph(_text(block.get("title", "Table of Contents"), ctx),
+                                   st["toc_h"]))
+            story.append(toc)
+
+        elif kind == "heading":
+            level = int(block.get("level", 1))
+            style = st.get(f"h{level}", st["h1"])
+            number = block.get("number")
+            label = f"{number} {block['text']}" if number else block["text"]
+            para = Paragraph(_text(label, ctx), style)
+            para._toc = bool(block.get("toc"))
+            story.append(para)
+
+        elif kind == "paragraph":
+            style = st.get(block.get("style", "body"), st["body"])
+            story.append(Paragraph(_text(block.get("text", ""), ctx), style))
+
+        elif kind == "ordered_list":
+            for i, item in enumerate(block.get("items") or [], 1):
+                story.append(Paragraph(_text(item, ctx), st["listed"],
+                                       bulletText=f"{i}."))
+
+        elif kind == "bullet_list":
+            for item in block.get("items") or []:
+                story.append(Paragraph(_text(item, ctx), st["bullet"], bulletText="•"))
+
+        elif kind == "savings_panel":
+            story.append(_savings_panel(block, ctx, st, tpl, avail))
+            story.append(Spacer(1, 12))
+
+        elif kind == "projections":
+            story.extend(_projection_blocks(block, ctx, st, tpl, avail))
+
+        elif kind == "environment_table":
+            # Kept whole — a single orphaned row reads as a rendering fault, not a page break.
+            story.append(KeepTogether(_environment_table(block, ctx, st, tpl, avail)))
+            story.append(Spacer(1, 10))
+
+        elif kind == "savings_chart":
+            options = ctx.get(block.get("source")) or []
+            if options:
+                family = _fonts(tpl.get("fonts") or {})
+                story.append(_options_chart(_text(block.get("title", ""), ctx), options,
+                                            tpl, family, avail))
+                story.append(Spacer(1, 12))
+
+        elif kind == "table":
+            table = _data_table(block, ctx, st, tpl, avail)
+            if table is not None:
+                story.append(table)
+                story.append(Spacer(1, 12))
+
+        elif kind == "spacer":
+            story.append(Spacer(1, float(block.get("height", 10))))
+
+    return story
 
 
 # ── PDF assembly ────────────────────────────────────────────────────────────────────
 
 def generate_pdf(assessment, findings: List) -> bytes:
     _set_currency(getattr(assessment, "currency", None))
-    st = _styles()
+    tpl = _template()
+    st = _styles(tpl)
+    family = _fonts(tpl.get("fonts") or {})
+
+    page_cfg = tpl.get("page") or {}
+    margins = page_cfg.get("margins") or {}
+    left = float(margins.get("left", 78))
+    right = float(margins.get("right", 78))
+
     buf = io.BytesIO()
-    doc = _TPTDoc(buf, pagesize=A4, leftMargin=0.7 * inch, rightMargin=0.7 * inch,
-                  topMargin=0.9 * inch, bottomMargin=0.8 * inch,
-                  title="Cost Assessment", author="TechPlus Talent")
+    doc = _TPTDoc(buf, pagesize=A4,
+                  leftMargin=left, rightMargin=right,
+                  topMargin=float(margins.get("top", 78)),
+                  bottomMargin=float(margins.get("bottom", 66)),
+                  title=tpl.get("meta", {}).get("title", "Cost Assessment"),
+                  author=tpl.get("meta", {}).get("author", "TechPlus Talent"))
+    avail = A4[0] - left - right
 
     active = [f for f in findings if not getattr(f, "dismissed", 0)]
-    cat = _by_category(active)
-    client = assessment.tenant_display_name or (
-        list((assessment.subscription_names or {}).values() or [None])[0]) or "Your Organisation"
-    when = (assessment.created_at.strftime("%B %d, %Y") if assessment.created_at else "")
-    pillar_totals = _pillar_totals(active)
-    spend_annual = assessment.current_annual_spend if assessment.cost_data_available else None
+    ctx = _context(assessment, active)
+    when = assessment.created_at.strftime("%B %d, %Y") if assessment.created_at else ""
 
-    story: List = []
-
-    # ── Cover (page 1; dark background drawn by _cover) ─────────────────────────
-    story.append(Spacer(1, 1.4 * inch))
-    logo = _logo()
-    if logo:
-        try:
-            story.append(Image(logo, width=2.2 * inch, height=0.8 * inch))
-            story.append(Spacer(1, 0.5 * inch))
-        except Exception:  # noqa: BLE001
-            pass
-    else:
-        story.append(Paragraph("TECH<font color='#ED7D31'>PLUS</font>TALENT", st["cover_meta"]))
-        story.append(Spacer(1, 0.5 * inch))
-    story.append(Paragraph("Cost Assessment", st["cover_title"]))
-    story.append(Spacer(1, 0.3 * inch))
-    story.append(HRFlowable(width=1.6 * inch, thickness=2, color=colors.white, hAlign="LEFT"))
-    story.append(Spacer(1, 0.25 * inch))
-    if when:
-        story.append(Paragraph(when, st["cover_meta"]))
-    story.append(Paragraph(f"Prepared for: {client}", st["cover_meta"]))
-    story.append(PageBreak())
-
-    # ── Table of Contents ───────────────────────────────────────────────────────
-    story.append(Paragraph("Table of Contents", st["toch"]))
     toc = TableOfContents()
     toc.levelStyles = [
-        ParagraphStyle("toc1", fontName="Helvetica-Bold", fontSize=11, leading=18, textColor=INK),
-        ParagraphStyle("toc2", fontName="Helvetica", fontSize=9.5, leading=15, leftIndent=16,
-                       textColor=MUTED),
+        ParagraphStyle("toc1", fontName=family, fontSize=12, leading=24,
+                       textColor=colors.HexColor("#000000")),
+        ParagraphStyle("toc2", fontName=family, fontSize=12, leading=24, leftIndent=22,
+                       textColor=colors.HexColor("#000000")),
+        ParagraphStyle("toc3", fontName=family, fontSize=12, leading=24, leftIndent=44,
+                       textColor=colors.HexColor("#000000")),
     ]
-    story.append(toc)
-    story.append(PageBreak())
+    toc.dotsMinLevel = 0   # dot leaders on every level, including the numbered top-level entries
 
-    # ── 1. Executive Summary ────────────────────────────────────────────────────
-    story.append(Paragraph("1.  Executive Summary", st["h1"]))
-    story.append(Paragraph(
-        f"As part of its cloud optimization strategy, <b>{client}</b> engaged <b>TechPlus Talent</b> "
-        "to perform a comprehensive Cost Assessment of its Azure environment — evaluating spend "
-        "patterns, analysing cost distribution across services, and identifying opportunities to "
-        "optimize while maintaining operational effectiveness. Based on the Phase 1 assessment, the "
-        "following savings have been identified:", st["body"]))
-    story.append(Spacer(1, 8))
-    story.append(_hero(assessment, st))
-    story.append(Spacer(1, 10))
-    if spend_annual:
-        story.append(Paragraph(
-            f"Current forecasted annual spend is <b>{_usd(spend_annual)}</b>; the recommendations "
-            f"below identify up to <b>{_usd(assessment.total_savings_annual)}</b> in annual savings "
-            f"(about {round((assessment.total_savings_annual or 0) / spend_annual * 100)}% of spend).",
-            st["body"]))
-        story.append(Spacer(1, 8))
-        # 3-year projection scenarios.
-        for title, g in _GROWTH.items():
-            acr, after, sav = _projection(spend_annual, assessment.total_savings_annual or 0, g)
-            story.append(Paragraph(f"{title} — 3 Years", st["h3"]))
-            story.append(_bar_chart(
-                [acr, after, sav], ["Year 1", "Year 2", "Year 3"], [SPEND, AFTER, SAVINGS],
-                legend_names=["Projected spend (ACR)", "Spend after savings", "Cumulative savings"]))
-            story.append(Spacer(1, 6))
-    else:
-        story.append(Paragraph(
-            "Azure Cost Management billing data was not available for the signed-in account, so total "
-            "spend and multi-year projections are omitted. The savings figures above are grounded in "
-            "each resource's estimated cost.", st["small"]))
-    story.append(PageBreak())
+    story = [Spacer(1, 1), PageBreak()]          # page 1 is painted on the canvas
+    story += _render(tpl, ctx, st, toc, avail)
 
-    # ── 2. Purpose ───────────────────────────────────────────────────────────────
-    story.append(Paragraph("2.  Purpose", st["h1"]))
-    for point in [
-        f"Assess {client}'s Azure landscape with a focused review of compute, storage and network "
-        "resources to understand key cost drivers and consumption trends.",
-        "Validate that existing workloads adhere to Microsoft best practices for cost efficiency, "
-        "data management, and long-term operational sustainability.",
-        "Provide clear, actionable recommendations to optimize resource utilization, strengthen cost "
-        "governance, and maximize cloud investment value.",
-        "Support strategic decision-making by presenting transparent cost-saving projections, "
-        "balancing a strong operational posture with financial efficiency.",
-    ]:
-        story.append(Paragraph(f"•  {point}", st["body"]))
-
-    # ── 3. TPT Methodology ────────────────────────────────────────────────────────
-    story.append(Paragraph("3.  TPT Methodology", st["h1"]))
-    story.append(Paragraph("Phase 1: Quick Win Assessment", st["h2"]))
-    story.append(Paragraph(
-        "<b>Objective</b> — Assess the environment and provide recommendations that do not require "
-        "architectural changes.<br/><b>Outcome</b> — Immediate cost savings through configuration "
-        "tweaks, resource optimization, and policy adjustments.", st["body"]))
-    story.append(Paragraph("Phase 2: Deep Dive Modernization", st["h2"]))
-    story.append(Paragraph(
-        "<b>Objective</b> — Comprehensive assessment of the environment, inside and out.<br/>"
-        "<b>Outcome</b> — Architectural changes, modernization strategies, and advanced optimizations "
-        "for further cost savings.", st["body"]))
-
-    # ── 4. Evaluation Summary ─────────────────────────────────────────────────────
-    story.append(Paragraph("4.  Evaluation Summary", st["h1"]))
-    story.append(Paragraph("3 Pillars of Azure Cost Assessment: Compute · Storage · Network", st["body"]))
-    story.append(Spacer(1, 4))
-    subs = assessment.subscription_names or {}
-    sub_str = "; ".join(f"{name or sid}" for sid, name in subs.items()) or \
-        ", ".join(assessment.subscription_ids or [])
-    major = assessment.major_resource_types or []
-    major_str = ", ".join(m.get("type", "") for m in major) or "—"
-    env_rows = [
-        ["Tenant", f"{client}  ({assessment.tenant_id or '—'})"],
-        ["Subscription(s)", sub_str or "—"],
-        ["Total No. of resources", str(assessment.total_resources or "—")],
-        ["Major Resource Types", major_str],
-    ]
-    if assessment.current_monthly_spend is not None:
-        env_rows.append(["Last Month Consumption", _usd(assessment.current_monthly_spend)])
-    et = Table([[Paragraph("Environment Details", st["cellh"]), ""]] +
-               [[Paragraph(k, st["cell"]), Paragraph(str(v), st["cell"])] for k, v in env_rows],
-               colWidths=[2.2 * inch, 4.4 * inch])
-    et.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BLUE), ("SPAN", (0, 0), (-1, 0)),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D6DEE8")),
-        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#EAF1F8")),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(et)
-    story.append(Spacer(1, 8))
-    story.append(Paragraph("Identified savings by pillar:", st["body"]))
-    pillar_rows = [[p, _usd(pillar_totals.get(p, 0))] for p in ("Compute", "Storage", "Network")
-                   if pillar_totals.get(p, 0) > 0]
-    if pillar_totals.get("Other", 0) > 0:
-        pillar_rows.append(["Other", _usd(pillar_totals["Other"])])
-    if pillar_rows:
-        story.append(_table(["Pillar", "Annual Savings"], pillar_rows,
-                            [3.0 * inch, 1.6 * inch], st, align_right_from=1))
-    story.append(PageBreak())
-
-    # ── 5. Cost Optimization (by pillar) ──────────────────────────────────────────
-    story.append(Paragraph("5.  Cost Optimization", st["h1"]))
-    pillar_builders = [
-        ("5.1  Compute", "Compute", _compute_section),
-        ("5.2  Storage", "Storage", _storage_section),
-        ("5.3  Network", "Network", _network_section),
-    ]
-    any_pillar = False
-    for heading, pillar, builder in pillar_builders:
-        section = builder(cat, st)
-        if not section:
-            continue
-        any_pillar = True
-        story.append(Paragraph(heading, st["h2"]))
-        story.append(Paragraph(
-            f"Identified cost-saving opportunities for {pillar.lower()} resources — "
-            f"max yearly savings {_usd(pillar_totals.get(pillar, 0))}.", st["body"]))
-        story.append(Spacer(1, 4))
-        story.extend(section)
-    if not any_pillar:
-        story.append(Paragraph("No optimization opportunities were identified in this assessment.",
-                               st["body"]))
-
-    doc.multiBuild(story, onFirstPage=_cover, onLaterPages=_decorate)
+    doc.multiBuild(story, onFirstPage=_cover(ctx["client"], when),
+                   onLaterPages=_decorate(tpl))
     return buf.getvalue()
 
 

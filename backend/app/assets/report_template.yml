@@ -1,0 +1,346 @@
+# ─────────────────────────────────────────────────────────────────────────────────────
+# Cost Assessment report template.
+#
+# Everything the report SAYS lives here; everything it KNOWS comes from the assessment.
+# report.py walks `content` block by block and renders it — no copy is held in the code.
+#
+# Placeholders in `text` are filled from the data context built by report.py
+# (see _context()). A block is skipped entirely when its `require:` key resolves to
+# empty, so sections with no findings disappear rather than printing an empty table.
+#
+# Currency symbols come from the assessment's billing currency, never hardcoded.
+# ─────────────────────────────────────────────────────────────────────────────────────
+
+meta:
+  title: Cost Assessment
+  author: TechPlus Talent
+
+# ── Page geometry ────────────────────────────────────────────────────────────────────
+page:
+  margins: {left: 78, right: 78, top: 78, bottom: 66}
+  border: {inset: 24, width: 1.0, colour: "#000000"}
+  # Dark-text variant of the lockup: Picture1.png's wordmark is white (built for the dark cover)
+  # and would be invisible against the white content pages.
+  header_logo: {asset: Picture1_dark.png, width: 122, top: 30, right: 30}
+  footer:
+    text: "{page} | P a g e"
+    size: 10.5
+    colour: "#595959"
+    baseline: 40
+    rule: {colour: "#BFBFBF", width: 0.6, above: 14}
+
+# ── Fonts ────────────────────────────────────────────────────────────────────────────
+# Carlito is metric-compatible with Calibri (identical advance widths, so line breaks
+# and text sizes match the Word original) and is OFL-licensed, so it can be bundled and
+# redistributed with the app — Calibri itself cannot.
+fonts:
+  dir: fonts
+  family: Carlito
+  regular: Carlito-Regular.ttf
+  bold: Carlito-Bold.ttf
+  italic: Carlito-Italic.ttf
+  bold_italic: Carlito-BoldItalic.ttf
+
+palette:
+  heading: "#2E74B5"
+  ink: "#000000"
+  muted: "#595959"
+  table_header_bg: "#2E74B5"
+  table_header_fg: "#FFFFFF"
+  table_grid: "#000000"
+  panel_border: "#9DC3E6"
+  panel_bg: "#FBFCFE"
+  label: "#1F3864"
+  spend: "#2E74B5"      # ACR
+  after: "#ED7D31"      # ACR after savings
+  savings: "#1E6C34"    # savings
+
+styles:
+  h1:      {size: 20,   colour: heading, space_before: 2,  space_after: 12}
+  h2:      {size: 16,   colour: heading, space_before: 12, space_after: 7,  left_indent: 18}
+  h3:      {size: 14,   colour: heading, space_before: 10, space_after: 5,  left_indent: 30}
+  h4:      {size: 11,   colour: ink,     space_before: 8,  space_after: 4,  left_indent: 30, bold: true}
+  body:    {size: 11,   colour: ink,     leading: 15.6, align: justify, space_after: 10, left_indent: 30}
+  caption: {size: 11,   colour: ink,     leading: 15.6, align: justify, space_after: 14}
+  note:    {size: 11,   colour: ink,     leading: 15.6, align: justify, space_after: 10, left_indent: 44}
+  bullet:  {size: 11,   colour: ink,     leading: 15.6, space_after: 2,  left_indent: 66, bullet_indent: 52}
+  listed:  {size: 11,   colour: ink,     leading: 15.6, align: justify, space_after: 3, left_indent: 62, bullet_indent: 40}
+  cell:    {size: 10,   colour: ink,     leading: 12.6}
+  cell_h:  {size: 10,   colour: "#FFFFFF", leading: 12.6, bold: true, align: center}
+  toc_h:   {size: 20,   colour: heading, align: center, space_after: 20}
+
+# ── Table styling ────────────────────────────────────────────────────────────────────
+table:
+  header_height: 30
+  row_padding: 6
+  grid_width: 0.75
+
+# ── Three-year projection scenarios ──────────────────────────────────────────────────
+# `growth` is the assumed annual growth rate applied to the assessed run-rate. Bars are
+# cumulative over three years. Year labels are derived from the assessment date, never
+# hardcoded: `base_year_offset` shifts year 1 relative to the report's year (-1 labels
+# year 1 as the trailing twelve months the run-rate was measured over).
+projections:
+  base_year_offset: -1
+  year_label: "{ordinal} Year ({start}-{end})"
+  series: ["ACR", "ACR after Savings", "Savings"]
+  scenarios:
+    - title: "Fixed Consumption Spend Trajectory - 3 Years"
+      growth: 0.00
+      caption: >-
+        Illustrates a scenario where current annual consumption remains constant over the next
+        three years, showing cumulative projected spend, cumulative savings, and net cost after
+        optimization.
+    - title: "Linear Growth ACR - 3 Years"
+      growth: 0.15
+      caption: >-
+        Represents a scenario where the current annual growth rate is assumed to continue linearly
+        for the next three years, highlighting cumulative projected spend, savings, and
+        post-optimization costs.
+    - title: "Conservative Growth ACR - 3 Years"
+      growth: 0.07
+      caption: >-
+        Depicts a conservative scenario with minimal annual growth assumed over three years,
+        presenting cumulative projected spend, potential savings, and optimized costs.
+    - title: "Civo's Report 2024 based Theoritical ACR - 3 Years"
+      growth: 0.25
+      caption: >-
+        Models a theoretical scenario assuming a 25% annual growth rate over three years, based on
+        the Civo 2024 SMB report, showing cumulative projected spend, savings, and costs after
+        optimization.
+
+# ── Document body ────────────────────────────────────────────────────────────────────
+content:
+
+  # ── Page 2 — Table of contents ─────────────────────────────────────────────────────
+  - {type: toc, title: "Table of Contents"}
+  - {type: page_break}
+
+  # ── Page 3 — Executive summary ─────────────────────────────────────────────────────
+  - {type: heading, level: 1, number: "1.", text: "Executive Summary", toc: true}
+  - type: paragraph
+    text: >-
+      As part of its ongoing cloud optimization strategy, <b>{client}</b> engaged
+      <b>TechPlus Talent</b> to perform a comprehensive <b>Cost Assessment</b> of
+      <b>{tenant}</b> Azure environment. The purpose of this engagement was to evaluate current
+      cloud spending patterns, analyse cost distribution across services, and identify
+      opportunities for optimization to ensure sustainable and efficient financial management of
+      Azure resources.
+  - type: paragraph
+    text: >-
+      The assessment was designed for key stakeholders including <b>TechPlus Talent</b>
+      Stakeholders, <b>TechPlus Talent</b> Technical Consultants, and <b>{client}</b> technical
+      team. It provides actionable insights into cost allocation, highlights areas of potential
+      overspending, and recommends strategies for budget planning, governance, and cost control
+      across subscriptions.
+  - {type: paragraph, text: "Based on the Phase 1 assessment, the following findings have been identified:"}
+  - type: savings_panel
+    rows:
+      - {label: "Potential 3 Year Savings", value: "{savings_3year}"}
+      - {label: "Potential Yearly Savings", value: "{savings_annual}"}
+      - {label: "Potential Monthly Savings", value: "{savings_monthly}"}
+  - type: paragraph
+    text: >-
+      The findings serve as a financial roadmap for <b>{client}</b> to enhance its cloud cost
+      governance, optimize resource utilization, and maximize return on investment from its Azure
+      environment. By implementing the recommendations, the organization can ensure long-term
+      sustainability and alignment of cloud expenditures with its business objectives.
+
+  # ── Pages 4-5 — Three-year projections (two charts per page) ────────────────────────
+  # Rendered only when Cost Management returned billing data; without spend there is
+  # nothing to project from.
+  - {type: page_break, require: has_spend}
+  - {type: projections, require: has_spend, per_page: 2}
+  - type: paragraph
+    require: no_spend
+    style: note
+    text: >-
+      Azure Cost Management billing data was not available for the signed-in account, so total
+      spend and the three-year projections are omitted. The savings above remain grounded in each
+      resource's own cost.
+
+  # ── Page 6 — Purpose / methodology / evaluation summary ────────────────────────────
+  - {type: page_break}
+  - {type: heading, level: 1, number: "2.", text: "Purpose", toc: true}
+  - type: ordered_list
+    items:
+      - >-
+        Assess <b>{client}</b> Azure landscape with a focused review of compute, storage and
+        network resources to understand key cost drivers and consumption trends.
+      - >-
+        Validate that existing security and analytics workloads adhere to Microsoft best practices
+        for cost efficiency, data management, and long-term operational sustainability.
+      - >-
+        Provide clear, actionable recommendations to optimize resource utilization, strengthen
+        cost governance, and maximize cloud investment value.
+      - >-
+        Support <b>{client}</b> strategic decision-making by presenting transparent cost-saving
+        projections for azure resources, enabling a balance between a strong security posture and
+        financial efficiency.
+
+  - {type: heading, level: 1, number: "3.", text: "TPT Methodology", toc: true}
+  - {type: heading, level: 2, text: "Phase 1: Quick Win Assessment"}
+  - type: paragraph
+    style: note
+    text: >-
+      <b>Objective</b> &#8211; Assess the environment and provide recommendations that do not
+      require architectural changes.<br/><b>Outcome</b> &#8211; Immediate cost savings through
+      configuration tweaks, resource optimization, and policy adjustments.
+  - {type: heading, level: 2, text: "Phase 2: Deep Dive Modernization"}
+  - type: paragraph
+    style: note
+    text: >-
+      <b>Objective:</b> Comprehensive assessment of the environment, understandings it&#8217;s in
+      and out.<br/><b>Outcome:</b> Suggest architectural changes, modernization strategies, and
+      advanced optimizations for further cost savings.
+
+  - {type: heading, level: 1, number: "4.", text: "Evaluation Summary", toc: true}
+  - {type: paragraph, style: h4, text: "3 Pillars of Azure Cost Assessment"}
+  - {type: bullet_list, items: ["Compute", "Storage", "Network"]}
+  - {type: environment_table, title: "Environment Details"}
+
+  # ── Pages 7+ — Cost optimization, one block per pillar ─────────────────────────────
+  - {type: page_break}
+  - {type: heading, level: 1, number: "5.", text: "Cost Optimization:", toc: true}
+
+  # ── 5.1 Compute ────────────────────────────────────────────────────────────────────
+  - {type: heading, level: 2, number: "5.1", text: "Compute", toc: true, require: compute_any}
+  - type: paragraph
+    require: compute_any
+    text: >-
+      We have reviewed the current environment and identified the following cost-saving
+      opportunities for compute resources.
+  - {type: paragraph, style: h4, require: compute_any, text: "Max Yearly Savings - {compute_savings}"}
+  - {type: savings_chart, require: compute_options, title: "Cost Savings", source: compute_options}
+
+  - {type: heading, level: 3, number: "5.1.1", text: "Virtual Machine", toc: true, require: vm_any}
+
+  - {type: heading, level: 4, text: "I. Reserved Instance", require: ri_items}
+  - type: paragraph
+    style: note
+    require: ri_items
+    text: >-
+      Below is the list of virtual machines currently running on the pay-as-you-go pricing model.
+      It is recommended to review these resources and consider purchasing Reserved Instances if
+      they are expected to run long-term to achieve cost savings.
+  - type: table
+    source: ri_items
+    widths: [0.20, 0.22, 0.26, 0.32]
+    columns:
+      - {header: "VM Name", field: name}
+      - {header: "VM Size", field: sku}
+      - {header: "Current Cost Annual", field: annual_ondemand, format: currency}
+      - {header: "Annual Savings (Reserved Instance-1yr)", field: annual_savings, format: currency}
+
+  - {type: heading, level: 4, text: "II. Azure Hybrid Benefit", require: ahb_items}
+  - type: paragraph
+    style: note
+    require: ahb_items
+    text: >-
+      Below is the list of virtual machines that may be eligible for Azure Hybrid Benefit. It is
+      recommended to review these resources and apply Azure Hybrid Benefit if valid Windows Server
+      licenses with Software Assurance are available to reduce compute licensing costs.
+  - type: table
+    source: ahb_items
+    widths: [0.25, 0.25, 0.25, 0.25]
+    columns:
+      - {header: "Name", field: name}
+      - {header: "Size", field: sku}
+      - {header: "Current Cost Annual", field: annual_cost, format: currency}
+      - {header: "AHB(1yr) Saving", field: annual_savings, format: currency}
+
+  # Remaining compute findings that are not RI/AHB (idle, oversized, reserved capacity…).
+  - {type: heading, level: 4, text: "III. Additional Compute Opportunities", require: compute_other}
+  - type: paragraph
+    style: note
+    require: compute_other
+    text: >-
+      The following compute resources were identified as idle, oversized, or eligible for reserved
+      capacity. Review each against its workload before acting.
+  - type: table
+    source: compute_other
+    widths: [0.34, 0.26, 0.20, 0.20]
+    columns:
+      - {header: "Resource", field: name}
+      - {header: "Opportunity", field: opportunity}
+      - {header: "Current Cost Annual", field: annual_cost, format: currency}
+      - {header: "Annual Savings", field: annual_savings, format: currency}
+
+  # ── 5.2 Storage ────────────────────────────────────────────────────────────────────
+  - {type: heading, level: 2, number: "5.2", text: "Storage", toc: true, require: storage_any}
+  - type: paragraph
+    require: storage_any
+    text: >-
+      We have reviewed the current environment and identified the following cost-saving
+      opportunities for storage resources.
+  - {type: paragraph, style: h4, require: storage_any, text: "Max Yearly Savings - {storage_savings}"}
+  - {type: savings_chart, require: storage_options, title: "Cost Savings", source: storage_options}
+
+  # Rendered only when the findings engine emits disk SKU right-sizing recommendations.
+  - {type: heading, level: 3, number: "5.2.1", text: "Managed Disk SKU Recommendations", toc: true, require: disk_sku_items}
+  - {type: heading, level: 4, text: "I. Disk SKU Optimization", require: disk_sku_items}
+  - type: paragraph
+    style: note
+    require: disk_sku_items
+    text: >-
+      Below is the list of managed disks that are currently using premium SSD SKUs. It is
+      recommended to review these disks and consider migrating them to the equivalent E-series
+      SKUs, which provide similar performance at a lower cost. Implementing this change can help
+      reduce storage expenses and generate potential annual savings as highlighted in the table
+      below.
+  - type: table
+    source: disk_sku_items
+    widths: [0.40, 0.11, 0.16, 0.11, 0.11, 0.11]
+    columns:
+      - {header: "Disk Name", field: name}
+      - {header: "Current SKU", field: current_sku}
+      - {header: "Recommended SKU", field: recommended_sku}
+      - {header: "Quantity", field: quantity}
+      - {header: "Current Annual Cost", field: annual_cost, format: currency}
+      - {header: "Annual Savings", field: annual_savings, format: currency}
+
+  - {type: heading, level: 3, number: "5.2.2", text: "Storage Cleanup", toc: true, require: storage_other}
+  - type: paragraph
+    style: note
+    require: storage_other
+    text: >-
+      The following storage resources are unattached, orphaned, or over-provisioned for their
+      redundancy requirement. Validate each is not required for backup or disaster recovery before
+      removing it.
+  - type: table
+    source: storage_other
+    widths: [0.34, 0.26, 0.20, 0.20]
+    columns:
+      - {header: "Resource", field: name}
+      - {header: "Opportunity", field: opportunity}
+      - {header: "Current Cost Annual", field: annual_cost, format: currency}
+      - {header: "Annual Savings", field: annual_savings, format: currency}
+
+  # ── 5.3 Network ────────────────────────────────────────────────────────────────────
+  - {type: heading, level: 2, number: "5.3", text: "Network", toc: true, require: network_any}
+  - type: paragraph
+    require: network_any
+    text: >-
+      We have reviewed the current environment and identified the following cost-saving
+      opportunities for network resources.
+  - {type: paragraph, style: h4, require: network_any, text: "Max Yearly Savings - {network_savings}"}
+  - {type: savings_chart, require: network_options, title: "Cost Savings", source: network_options}
+  - type: paragraph
+    style: note
+    require: network_other
+    text: >-
+      The following network resources are unattached or idle and continue to incur charges. Review
+      and remove those no longer required.
+  - type: table
+    source: network_other
+    widths: [0.34, 0.26, 0.20, 0.20]
+    columns:
+      - {header: "Resource", field: name}
+      - {header: "Opportunity", field: opportunity}
+      - {header: "Current Cost Annual", field: annual_cost, format: currency}
+      - {header: "Annual Savings", field: annual_savings, format: currency}
+
+  # ── Fallback when the assessment found nothing at all ──────────────────────────────
+  - type: paragraph
+    require: no_findings
+    text: "No cost optimization opportunities were identified in this assessment."
