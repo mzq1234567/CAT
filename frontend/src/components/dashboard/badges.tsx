@@ -76,21 +76,28 @@ export function ValidationChip({ finding }: { finding: Finding }) {
 
   const isReview = status === "needs_review";
   const c = isReview ? colors.warning : colors.success;
-  const variance =
-    finding.validation_variance_pct != null
-      ? ` (${finding.validation_variance_pct > 0 ? "+" : ""}${finding.validation_variance_pct.toFixed(0)}%)`
-      : "";
+
+  // The raw variance can be a huge, alarming number (e.g. +4859%) when an estimate sits far above
+  // the billed cost. That belongs in the tooltip as context — never as a scary chip label.
+  const v = finding.validation_variance_pct;
+  const reviewDetail =
+    v != null && v > 0
+      ? v >= 100
+        ? `The estimate is about ${(v / 100 + 1).toFixed(1)}× this resource's actual billed cost, so it's flagged for a human check rather than being presented as fact.`
+        : `The estimate runs ~${v.toFixed(0)}% above this resource's actual billed cost, so it's flagged for a human check.`
+      : "The estimate doesn't line up with this resource's actual billed cost, so it's flagged for a human check.";
+
   return (
     <Tooltip
       title={
         isReview
-          ? "Estimate deviates from this resource's actual billed cost — worth reviewing."
+          ? reviewDetail
           : "Grounded in your actual billed cost (Cost Management) — this is a fraction of what you really pay, not a list-price guess."
       }
     >
       <Chip
         size="small"
-        label={`${isReview ? "Needs review" : "Cost-validated"}${variance}`}
+        label={isReview ? "Needs review" : "Cost-validated"}
         sx={{ bgcolor: alpha(c, 0.14), color: c, border: `1px solid ${alpha(c, 0.3)}`, fontWeight: 600 }}
       />
     </Tooltip>

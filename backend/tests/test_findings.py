@@ -582,12 +582,14 @@ async def test_inventory_finding_correlates_with_advisor_id():
     assert f["advisor_recommendation_id"] == "ADV-1"
 
 
-async def test_validation_needs_review_caps_confidence():
-    # Disk "saves" 19.71 but actual cost is only $5 → estimate exceeds actual → needs_review.
+async def test_estimate_over_actual_is_capped_and_validated():
+    # Disk "saves" 19.71 but actual cost is only $5 → cap to $5. The figure is now the real cost, so
+    # it reads as validated (NOT a scary "needs review +294%" on a number that's now exactly right).
     engine = FindingsEngine(pricing=FakePricing(), cost_map={DISK_RID.lower(): 5.0})
     f = (await engine.detect_unattached_disks([_disk()]))[0]
-    assert f["validation_status"] == "needs_review"
-    assert f["confidence"] <= 0.5
+    assert f["estimated_savings_monthly"] == 5.0            # capped to actual
+    assert f["validation_status"] == "validated"
+    assert f["details"].get("savings_capped_at_actual_cost") is True
 
 
 async def test_validation_validated_within_tolerance():

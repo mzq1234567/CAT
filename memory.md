@@ -1094,6 +1094,38 @@ User questioned the per-finding "Not cost-validated / list-price estimate — up
   NAT/LB/IP/Bastion/vault) and the true list-price fallback show "Estimate".
 - Verify: backend **212 passing** (+grounded-reads-as-validated test); frontend build clean.
 
+### Post-ship 18 — Assessment #37 UI batch: dashboard de-clutter + interactivity + copy polish (2026-07-30)
+User feedback on live dashboard screenshots: redundant panes, no interactive graphs, un-clickable
+1-year term, alarming "Needs review (+4859%)" badge, and over-wordy "why" copy. All addressed:
+- **Clickable commitment terms** (`FindingEvidence.tsx`): single `CommitmentPanel` with ONE term
+  control. Each aggregated commitment finding carries BOTH `reservation_options` (term totals) and
+  `reservation_items` (per-SKU), so the first cut rendered two panels each with its own 1yr/3yr control
+  → user reported "two toggles, only one works" redundancy. Merged into one panel: clicking a term
+  (keyboard-accessible; 3-year keeps the "Best value" badge) highlights that option AND re-prices every
+  SKU below it (sub-heading reads "N Reserved Instances · 3-year term"). Needed
+  `import { useState } from "react"`. Removed the earlier `CommitmentOptionList` / `ReservationItemList`.
+- **Exec summary redesign** (`ExecutiveSummary.tsx`, `reconciles` branch): removed the 4 redundant
+  StatTiles (Current Annual Spend / Est. Annual Savings / Spend After Optimization / Savings %) that
+  duplicated the top flow — the three headline numbers now live ONLY in the top flow row. Added
+  **hover-for-full-amount**: `FlowNumber` gained a `full` prop → MUI `Tooltip` shows exact `fmtUSD`
+  (e.g. hover ₹33K → ₹33,190); savings chip + % pill also get tooltips. Dropped unused
+  `TrendingDown`/`Percent` icon imports.
+- **New interactive chart** `charts/SavingsProjection.tsx` (Recharts AreaChart): cumulative-savings
+  forecast over 36 months, crosshair + custom tooltip (exact saved-to-date + run-rate), Year 1/2/3
+  markers. Honest straight run-rate (month N = N × monthly saving), no compounding. Replaces the
+  removed tiles. Deliberately does NOT duplicate `InsightsRow` (savings-by-area donut + impact bars).
+- **Calmer needs-review badge** (`badges.tsx`): the raw `+X%` variance is gone from the chip label
+  (read as alarming, e.g. "+4859%"); chip is just "Needs review", variance moved into the tooltip in
+  plain language ("about N× this resource's billed cost"). NB the root cause is already dead —
+  `_finding` caps any estimate>actual to actual → VALIDATED — so needs_review is effectively unreachable;
+  this is defensive UI only.
+- **Copy polish** (`findings.py`): AHB description trimmed to 2 sentences; aggregated commitment
+  description trimmed to 2 sentences (numbers via `rate_note`, no /yr redundancy). Fixed a real
+  currency bug — Bastion orphan description hardcoded "~$138/mo" (wrong in INR/GBP tenants) → replaced
+  with currency-neutral "bills whether or not it's used". Other per-resource descriptions were already
+  concise single sentences (left as-is).
+- Verify: backend **212 passing**; frontend `npm run build` clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD

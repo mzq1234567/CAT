@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Box, Typography } from "@mui/material";
 import { alpha } from "@mui/material/styles";
 import MemoryIcon from "@mui/icons-material/Memory";
@@ -84,6 +85,178 @@ function Heading({ icon, children }: { icon: React.ReactNode; children: React.Re
         {children}
       </Typography>
     </Box>
+  );
+}
+
+/**
+ * The whole commitment story in ONE panel with a SINGLE term control.
+ *
+ * Previously this was two panels — a term selector on the options total AND a separate 1yr/3yr
+ * toggle on the per-SKU list — which meant two controls doing the same job (one of them looked
+ * inert because it only moved the other panel's highlight). Now there is one selector: picking a
+ * term highlights that option's total AND re-prices every SKU below it. No redundancy.
+ */
+function CommitmentPanel({
+  options,
+  best,
+  items,
+  kind,
+  d,
+}: {
+  options: ReservationOption[];
+  best: ReservationOption | null;
+  items: ReservationItem[];
+  kind: string;
+  d: EvidenceDetails;
+}) {
+  const sorted = [...options].sort((a, b) => b.monthly_savings - a.monthly_savings);
+  const termOf = (label: string): "1yr" | "3yr" => (label.includes("3-year") ? "3yr" : "1yr");
+  const hasThreeYrItems = items.some((v) => v.monthly_savings_3yr != null);
+  const [selected, setSelected] = useState<string>(best?.label ?? sorted[0]?.label ?? "");
+
+  const selectedTerm: "1yr" | "3yr" = options.length
+    ? termOf(selected)
+    : hasThreeYrItems
+    ? "3yr"
+    : "1yr";
+  const savingFor = (v: ReservationItem) =>
+    selectedTerm === "3yr" ? v.monthly_savings_3yr ?? v.monthly_savings ?? 0 : v.monthly_savings ?? 0;
+
+  return (
+    <Panel>
+      <Heading icon={<SavingsOutlinedIcon fontSize="small" />}>
+        Commitment options{d.ri_price_estimated ? " (RI est.)" : ""}
+      </Heading>
+
+      {d.source === "azure_reservation_recommendations" && (
+        <Typography variant="caption" color={colors.textMuted} display="block" mb={1}>
+          From Azure's own reservation engine — computed on your actual usage at your real prices,
+          excluding reservations you already own.
+          {d.monthly_ondemand != null && d.monthly_reserved != null && (
+            <> On-demand ≈ {fmtUSD(d.monthly_ondemand)}/mo → reserved ≈ {fmtUSD(d.monthly_reserved)}/mo.</>
+          )}
+        </Typography>
+      )}
+      {d.source !== "azure_reservation_recommendations" && d.payg_monthly != null && (
+        <Typography variant="caption" color={colors.textMuted} display="block" mb={1}>
+          Pay-as-you-go today: {fmtUSD(d.payg_monthly)} / mo. Select a term to compare — it re-prices
+          the breakdown below.
+        </Typography>
+      )}
+
+      {/* THE single term control: click a term to select it (highlights + re-prices the list). */}
+      {options.length > 0 && (
+        <Box display="flex" flexDirection="column" gap={1}>
+          {sorted.map((o) => {
+            const isSelected = o.label === selected;
+            const isBest = o.label === best?.label;
+            return (
+              <Box
+                key={o.label}
+                role="button"
+                tabIndex={0}
+                aria-pressed={isSelected}
+                onClick={() => setSelected(o.label)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setSelected(o.label);
+                  }
+                }}
+                display="flex"
+                justifyContent="space-between"
+                alignItems="center"
+                sx={{
+                  px: 1.5,
+                  py: 1,
+                  borderRadius: 1.5,
+                  cursor: "pointer",
+                  outline: "none",
+                  transition: "background-color 0.15s ease, border-color 0.15s ease",
+                  bgcolor: isSelected ? alpha(SAVINGS_COLOR, 0.12) : colors.surface,
+                  border: `1.5px solid ${isSelected ? SAVINGS_COLOR : colors.border}`,
+                  "&:hover": { borderColor: isSelected ? SAVINGS_COLOR : alpha(SAVINGS_COLOR, 0.5) },
+                  "&:focus-visible": { borderColor: SAVINGS_COLOR, boxShadow: `0 0 0 3px ${alpha(SAVINGS_COLOR, 0.2)}` },
+                }}
+              >
+                <Typography variant="body2" fontWeight={isSelected ? 700 : 500} sx={{ color: colors.textPrimary }}>
+                  {o.label}
+                  {isBest && (
+                    <Box
+                      component="span"
+                      sx={{
+                        ml: 1, px: 0.75, py: 0.1, borderRadius: 1, fontSize: 10, fontWeight: 700,
+                        color: SAVINGS_COLOR, bgcolor: alpha(SAVINGS_COLOR, 0.15),
+                        textTransform: "uppercase", letterSpacing: "0.04em",
+                      }}
+                    >
+                      Best value
+                    </Box>
+                  )}
+                </Typography>
+                <Box textAlign="right">
+                  <Typography variant="body2" fontWeight={800} sx={{ color: SAVINGS_COLOR, lineHeight: 1.1 }}>
+                    {fmtUSD(o.monthly_savings * 12)} / yr
+                  </Typography>
+                  <Typography variant="caption" color={colors.textMuted}>
+                    {fmtUSD(o.monthly_savings)} / mo saved
+                  </Typography>
+                </Box>
+              </Box>
+            );
+          })}
+        </Box>
+      )}
+
+      {d.ri_price_estimated && (
+        <Typography variant="caption" color={colors.textMuted} mt={1} display="block">
+          Reserved Instance price estimated from Azure's typical VM discount (retail reservation
+          price wasn't published for this SKU/region). Treat as indicative.
+        </Typography>
+      )}
+
+      {/* Per-SKU breakdown — reflects the selected term above. No separate toggle. */}
+      {items.length > 0 && (
+        <>
+          <Box display="flex" alignItems="center" gap={0.75} mt={2.5} mb={1} sx={{ color: colors.textSecondary }}>
+            <LayersOutlinedIcon fontSize="small" />
+            <Typography variant="caption" fontWeight={700} textTransform="uppercase" letterSpacing="0.05em">
+              {items.length} {kind}{items.length !== 1 ? "s" : ""} · {selectedTerm === "3yr" ? "3-year" : "1-year"} term
+            </Typography>
+          </Box>
+          <Box display="flex" flexDirection="column" gap={0.5}>
+            {items.slice(0, 20).map((v, i) => (
+              <Box
+                key={`${v.sku}-${v.name}-${i}`}
+                display="flex"
+                justifyContent="space-between"
+                alignItems="baseline"
+                sx={{ px: 1.25, py: 0.75, borderRadius: 1, bgcolor: i % 2 ? "transparent" : colors.surface }}
+              >
+                <Box minWidth={0}>
+                  <Typography variant="body2" fontWeight={600} sx={{ color: colors.textPrimary }} noWrap>
+                    {v.quantity && v.quantity > 1 ? `${v.quantity}× ` : ""}
+                    {v.sku || v.name}
+                  </Typography>
+                  <Typography variant="caption" color={colors.textMuted}>
+                    {v.name && v.name !== v.sku ? v.name : ""}
+                    {v.region ? `${v.name && v.name !== v.sku ? " · " : ""}${v.region}` : ""}
+                  </Typography>
+                </Box>
+                <Typography variant="body2" fontWeight={700} sx={{ color: SAVINGS_COLOR, whiteSpace: "nowrap" }}>
+                  {fmtUSD(savingFor(v) * 12)} / yr
+                </Typography>
+              </Box>
+            ))}
+            {items.length > 20 && (
+              <Typography variant="caption" color={colors.textMuted} mt={0.5}>
+                +{items.length - 20} more
+              </Typography>
+            )}
+          </Box>
+        </>
+      )}
+    </Panel>
   );
 }
 
@@ -186,134 +359,9 @@ export default function FindingEvidence({ finding }: { finding: Finding }) {
         </Panel>
       )}
 
-      {/* Commitment options — 1yr RI (headline) vs 3yr RI vs Savings Plan */}
-      {hasCommitment && (
-        <Panel>
-          <Heading icon={<SavingsOutlinedIcon fontSize="small" />}>
-            Commitment options{d.ri_price_estimated ? " (RI est.)" : ""}
-          </Heading>
-          {d.source === "azure_reservation_recommendations" && (
-            <Typography variant="caption" color={colors.textMuted} display="block" mb={1}>
-              From Azure's own reservation engine — computed on your actual usage at your real prices,
-              excluding reservations you already own.
-              {d.monthly_ondemand != null && d.monthly_reserved != null && (
-                <> On-demand ≈ {fmtUSD(d.monthly_ondemand)}/mo → reserved ≈ {fmtUSD(d.monthly_reserved)}/mo.</>
-              )}
-            </Typography>
-          )}
-          {d.source !== "azure_reservation_recommendations" && d.payg_monthly != null && (
-            <Typography variant="caption" color={colors.textMuted} display="block" mb={1}>
-              Pay-as-you-go today: {fmtUSD(d.payg_monthly)} / mo. Each option below is mutually
-              exclusive — pick one.
-            </Typography>
-          )}
-          <Box display="flex" flexDirection="column" gap={1}>
-            {options
-              .slice()
-              .sort((a, b) => b.monthly_savings - a.monthly_savings)
-              .map((o) => {
-                const isBest = o === bestOption;
-                return (
-                  <Box
-                    key={o.label}
-                    display="flex"
-                    justifyContent="space-between"
-                    alignItems="center"
-                    sx={{
-                      px: 1.5,
-                      py: 1,
-                      borderRadius: 1.5,
-                      bgcolor: isBest ? alpha(SAVINGS_COLOR, 0.1) : colors.surface,
-                      border: `1px solid ${isBest ? alpha(SAVINGS_COLOR, 0.35) : colors.border}`,
-                    }}
-                  >
-                    <Typography variant="body2" fontWeight={isBest ? 700 : 500} sx={{ color: colors.textPrimary }}>
-                      {o.label}
-                      {isBest && (
-                        <Box
-                          component="span"
-                          sx={{
-                            ml: 1, px: 0.75, py: 0.1, borderRadius: 1, fontSize: 10, fontWeight: 700,
-                            color: SAVINGS_COLOR, bgcolor: alpha(SAVINGS_COLOR, 0.15),
-                            textTransform: "uppercase", letterSpacing: "0.04em",
-                          }}
-                        >
-                          Best
-                        </Box>
-                      )}
-                    </Typography>
-                    <Box textAlign="right">
-                      <Typography variant="body2" fontWeight={800} sx={{ color: SAVINGS_COLOR, lineHeight: 1.1 }}>
-                        {fmtUSD(o.monthly_savings * 12)} / yr
-                      </Typography>
-                      <Typography variant="caption" color={colors.textMuted}>
-                        {fmtUSD(o.monthly_savings)} / mo saved
-                      </Typography>
-                    </Box>
-                  </Box>
-                );
-              })}
-          </Box>
-          {d.ri_price_estimated && (
-            <Typography variant="caption" color={colors.textMuted} mt={1} display="block">
-              Reserved Instance price estimated from Azure's typical VM discount (retail reservation
-              price wasn't published for this SKU/region). Treat as indicative.
-            </Typography>
-          )}
-        </Panel>
-      )}
-
-      {/* Aggregated reservations — the SKUs / VMs behind the total */}
-      {hasResItems && (
-        <Panel>
-          <Heading icon={<LayersOutlinedIcon fontSize="small" />}>
-            {resItems.length} {commitKind}
-            {resItems.length !== 1 ? "s" : ""} in this recommendation
-          </Heading>
-          <Box display="flex" flexDirection="column" gap={0.5}>
-            {resItems.slice(0, 20).map((v, i) => (
-              <Box
-                key={`${v.sku}-${v.name}-${i}`}
-                display="flex"
-                justifyContent="space-between"
-                alignItems="baseline"
-                sx={{ px: 1.25, py: 0.75, borderRadius: 1, bgcolor: i % 2 ? "transparent" : colors.surface }}
-              >
-                <Box minWidth={0}>
-                  <Typography variant="body2" fontWeight={600} sx={{ color: colors.textPrimary }} noWrap>
-                    {v.quantity && v.quantity > 1 ? `${v.quantity}× ` : ""}
-                    {v.sku || v.name}
-                  </Typography>
-                  <Typography variant="caption" color={colors.textMuted}>
-                    {v.name && v.name !== v.sku ? v.name : ""}
-                    {v.region ? `${v.name && v.name !== v.sku ? " · " : ""}${v.region}` : ""}
-                  </Typography>
-                </Box>
-                <Box textAlign="right">
-                  {v.monthly_savings_3yr != null ? (
-                    <>
-                      <Typography variant="body2" fontWeight={700} sx={{ color: SAVINGS_COLOR, whiteSpace: "nowrap" }}>
-                        3-yr: {fmtUSD((v.monthly_savings_3yr ?? 0) * 12)} / yr
-                      </Typography>
-                      <Typography variant="caption" color={colors.textMuted} sx={{ whiteSpace: "nowrap" }}>
-                        1-yr: {fmtUSD((v.monthly_savings ?? 0) * 12)} / yr
-                      </Typography>
-                    </>
-                  ) : (
-                    <Typography variant="body2" fontWeight={700} sx={{ color: SAVINGS_COLOR, whiteSpace: "nowrap" }}>
-                      1-yr: {fmtUSD((v.monthly_savings ?? 0) * 12)} / yr
-                    </Typography>
-                  )}
-                </Box>
-              </Box>
-            ))}
-            {resItems.length > 20 && (
-              <Typography variant="caption" color={colors.textMuted} mt={0.5}>
-                +{resItems.length - 20} more
-              </Typography>
-            )}
-          </Box>
-        </Panel>
+      {/* Commitment — one panel, one term control driving both totals and the per-SKU breakdown */}
+      {(hasCommitment || hasResItems) && (
+        <CommitmentPanel options={options} best={bestOption} items={resItems} kind={commitKind} d={d} />
       )}
 
       {/* Aggregated Windows AHB — the list of eligible VMs behind the total */}

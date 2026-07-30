@@ -252,9 +252,9 @@ async def test_pipeline_without_cost_access(pipeline_env):
     assert a.current_annual_spend is None
 
 
-async def test_pipeline_flags_needs_review(pipeline_env):
+async def test_pipeline_caps_overestimate_to_actual_cost(pipeline_env):
     TestSession, install, seed = pipeline_env
-    # Disk actually costs only $2 → its $19.71 estimate exceeds actual → needs_review.
+    # Disk actually costs only $2 → its $19.71 estimate is capped to $2 and reads as validated.
     install(_composite_handler(cost_rows=[[2.0, DISK_ID, "USD"], [72.0, VM_ID, "USD"], [4.0, IP_ID, "USD"]]))
     aid = seed()
 
@@ -263,8 +263,9 @@ async def test_pipeline_flags_needs_review(pipeline_env):
     s = TestSession()
     a = s.get(Assessment, aid)
     disk = s.query(Finding).filter(Finding.category == "unattached_managed_disks").one()
-    assert disk.validation_status == "needs_review"
-    assert a.needs_review_count == 1
+    assert disk.estimated_savings_monthly == 2.0       # capped to actual
+    assert disk.validation_status == "validated"       # not a false-alarm "needs review"
+    assert a.needs_review_count == 0
 
 
 async def test_pipeline_marks_failed_on_error(pipeline_env, monkeypatch):

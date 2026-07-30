@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .cost_management import UNVALIDATED, VALIDATED, ValidationResult, validate_savings
-from .currency import from_usd, to_usd
+from .currency import from_usd, symbol, to_usd
 from .pricing import PricingEngine, PricingUnavailableError
 from .vm_specs import VmSpec, get_spec, smaller_same_series
 
@@ -121,7 +121,7 @@ ORPHAN_RULES: Dict[str, OrphanRule] = {
         "bastion_hosts", "microsoft.network/bastionhosts",
         "Confirm Bastion is still needed, or deallocate it when not in use.",
         lambda r: (f"Azure Bastion '{r.get('name')}' ({r.get('skuName') or 'Standard'}) is a "
-                   "fixed-cost resource (~$138/mo) — verify it is still required."),
+                   "fixed-cost resource that bills whether or not it's used — verify it is still required."),
         lambda r: 138.0, 0.6,
     ),
     "geo_redundant_vaults": OrphanRule(
@@ -298,12 +298,27 @@ class FindingsEngine:
         resource_id = resource.get("id")
         # Validation compares the *original* estimate to actual cost (records the overage).
         validation = validate_savings(monthly, resource_id, self._cost_map) if monthly > 0 else None
+
+        # Cap FIRST: you can't save more on a resource than it actually costs. Clamp the estimate to the
+        # real billed cost so totals never exceed spend — and, since the figure now IS the actual cost,
+        # treat it as validated (not "needs review", which would flag a scary +4000% variance on a
+        # number that's now exactly right).
+        capped = False
+        if validation is not None and validation.actual_monthly_cost is not None:
+            actual = validation.actual_monthly_cost
+            if actual >= 0 and monthly > actual:
+                monthly = round(actual, 2)
+                capped = True
+                validation = ValidationResult(
+                    VALIDATED, round(actual, 2), 0.0, "Capped to the resource's actual billed cost.")
+
         # A saving DERIVED from the resource's actual billed cost (AHB = licence fraction of real cost;
         # commitment = discount % of real cost) is inherently validated even when it's an aggregate
-        # with no single resource id to match. Mark it so — otherwise it mislabels as an unvalidated
-        # "list-price estimate", which is exactly backwards for the numbers that ARE grounded.
+        # with no single resource id to match — otherwise it mislabels as an unvalidated list-price
+        # estimate, which is exactly backwards for the numbers that ARE grounded.
         if grounded and monthly > 0 and (validation is None or validation.status == UNVALIDATED):
             validation = ValidationResult(VALIDATED, None, None, "Grounded in the resource's actual billed cost.")
+
         confidence = combine_confidence(base_confidence, validation, has_price)
         advisor_id = self._advisor_id_for(resource_id)
         # An Advisor rec corroborating our own detection raises confidence.
@@ -313,16 +328,8 @@ class FindingsEngine:
         details = dict(extra_details or {})
         if validation is not None:
             details["validation_note"] = validation.note
-
-        # Cap: you can't save more on a resource than it actually costs. When we know the resource's
-        # real billed cost, clamp the estimate to it so totals can never exceed measured spend.
-        capped = False
-        if validation is not None and validation.actual_monthly_cost is not None:
-            actual = validation.actual_monthly_cost
-            if actual >= 0 and monthly > actual:
-                monthly = round(actual, 2)
-                capped = True
-                details["savings_capped_at_actual_cost"] = True
+        if capped:
+            details["savings_capped_at_actual_cost"] = True
 
         return {
             "category": category,
@@ -667,20 +674,21 @@ class FindingsEngine:
             "subscriptionId": items[0].get("subscription_id") if items else None,
             "resourceGroup": None,
         }
-        one_note = (f" A shorter 1-year commitment saves about ${one_total:,.0f}/mo."
-                    if has_3yr and one_total > 0 else "")
+        sym = symbol(self._currency)
+        rate_note = (
+            f"best rate about {sym}{three_total:,.0f}/mo on a 3-year term, {sym}{one_total:,.0f}/mo on 1-year"
+            if has_3yr else f"about {sym}{one_total:,.0f}/mo on a 1-year term"
+        )
         reason = (
             f"Aggregated {n} {kind} candidate{plural} ({source}); best case 3-year "
-            f"${three_total:.2f}/mo, 1-year ${one_total:.2f}/mo. {unit}s: {shown}."
+            f"{sym}{three_total:.2f}/mo, 1-year {sym}{one_total:.2f}/mo. {unit}s: {shown}."
         )
         return self._finding(
             category, synthetic, "microsoft.consumption/reservationrecommendations", headline,
             base_confidence=base_confidence,
             description=(
-                f"{n} {unit}{plural} run steadily enough to commit ({shown}). A {kind} locks in a "
-                f"lower rate than pay-as-you-go in exchange for a 1- or 3-year commitment. The best "
-                f"case — a 3-year term — saves about ${three_total:,.0f}/mo "
-                f"(${three_total * 12:,.0f}/yr).{one_note}"
+                f"{n} {unit}{plural} run steadily enough to reserve ({shown}). A 1- or 3-year "
+                f"{kind} locks in a lower rate than pay-as-you-go — {rate_note}."
             ),
             recommendation=(
                 f"Purchase {'3-year' if has_3yr else '1-year'} {kind}s for the {unit.lower()}{plural} "
@@ -948,19 +956,13 @@ class FindingsEngine:
             "windows_ahb", synthetic, "microsoft.compute/virtualmachines", total,
             base_confidence=0.7,
             description=(
-                f"These {n} Windows VM{'s are' if n != 1 else ' is'} paying Azure's built-in Windows "
-                f"Server licence charge on top of compute ({shown}). Azure Hybrid Benefit removes that "
-                "charge — you pay only for compute — by applying a Windows Server licence with active "
-                f"Software Assurance. The figure below is that licence portion of each VM's current "
-                "bill (1 licence covers up to 16 cores). It is a REALISED saving only if you already "
-                "own eligible licences. If you'd need to buy them, the licence is a separate cost — "
-                "though because the Azure hourly charge is high, it typically pays back within a few "
-                "months on an always-on VM; confirm your licensing position before counting it."
+                f"{n} Windows VM{'s' if n != 1 else ''} pay Azure's Windows Server licence on top of "
+                f"compute ({shown}). Azure Hybrid Benefit removes that charge if you already own Windows "
+                "Server licences with Software Assurance — the saving shown is that licence portion."
             ),
-            recommendation=("Confirm the Windows Server licences (with Software Assurance) you already "
-                            "own, then set 'Azure Hybrid Benefit' (licenseType=Windows_Server) on each "
-                            "covered VM. Where you have no spare licence, leave the VM pay-as-you-go or "
-                            "price a licence purchase against this hourly charge first."),
+            recommendation=("Apply Azure Hybrid Benefit (licenseType=Windows_Server) to the VMs you "
+                            "have spare Windows Server licences (with Software Assurance) for; leave the "
+                            "rest on pay-as-you-go."),
             has_price=True, debug_reason=reason,
             # Grounded when every eligible VM's saving came from its actual bill (not the retail delta).
             grounded=cost_available and grounded_count == n,

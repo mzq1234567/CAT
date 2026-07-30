@@ -25,6 +25,18 @@ _USD_PER_UNIT = {
 }
 
 
+# Display symbols (browser renders these fine; the PDF uses its own Helvetica-safe set in report.py).
+_SYMBOL = {"USD": "$", "EUR": "€", "GBP": "£", "CAD": "CA$", "AUD": "A$", "INR": "₹",
+           "JPY": "¥", "SGD": "S$", "AED": "AED ", "CHF": "CHF ", "NZD": "NZ$", "ZAR": "R",
+           "BRL": "R$", "MXN": "MX$", "SEK": "kr "}
+
+
+def symbol(currency: str) -> str:
+    """Currency symbol for finding text (falls back to the code + space)."""
+    code = (currency or "USD").upper()
+    return _SYMBOL.get(code, code + " ")
+
+
 def to_usd(amount: float, currency: str) -> float:
     """Convert an amount in `currency` to a USD-equivalent (for severity banding)."""
     return amount * _USD_PER_UNIT.get((currency or "USD").upper(), 1.0)
