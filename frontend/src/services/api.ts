@@ -67,6 +67,15 @@ export function useApi() {
       return data;
     },
 
+    async dismissFinding(assessmentId: number, findingId: number): Promise<Finding> {
+      const { data } = await http.post<Finding>(
+        `/assessments/${assessmentId}/findings/${findingId}/dismiss`,
+        {},
+        { headers: await authHeaders() }
+      );
+      return data;
+    },
+
     async downloadReport(id: number, format: "pdf" | "excel"): Promise<void> {
       const token = await getToken();
       const ext = format === "pdf" ? "pdf" : "xlsx";

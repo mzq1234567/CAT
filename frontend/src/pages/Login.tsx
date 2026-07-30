@@ -4,7 +4,7 @@ import MicrosoftIcon from "@mui/icons-material/Window";
 import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import { loginRequest } from "../auth/msalConfig";
-import { colors } from "../theme";
+import { colors, gradients } from "../theme";
 
 export default function Login() {
   const { instance } = useMsal();
@@ -48,7 +48,8 @@ export default function Login() {
             justifyContent: "center",
             mx: "auto",
             mb: 3,
-            background: "linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)",
+            background: gradients.brand,
+            boxShadow: "0 8px 24px rgba(10,166,186,0.28)",
           }}
         >
           <CloudQueueIcon sx={{ color: "white", fontSize: 36 }} />

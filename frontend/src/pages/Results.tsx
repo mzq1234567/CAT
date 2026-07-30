@@ -12,10 +12,9 @@ import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import Layout from "../components/Layout";
-import SummaryCards from "../components/SummaryCards";
-import FindingsTable from "../components/FindingsTable";
+import AssessmentDashboard from "../components/dashboard/AssessmentDashboard";
 import { useApi } from "../services/api";
-import { colors, SEVERITY } from "../theme";
+import { colors, gradients } from "../theme";
 import React from "react";
 import { AssessmentStatus } from "../types";
 
@@ -26,23 +25,34 @@ const pulse = keyframes`
 `;
 
 const STATUS_CHIP: Record<AssessmentStatus, { label: string; color: string }> = {
-  pending: { label: "Queued", color: colors.warning },
-  running: { label: "Running", color: colors.info },
+  queued: { label: "Queued", color: colors.warning },
+  fetching_resources: { label: "Collecting", color: colors.info },
+  fetching_metrics: { label: "Metrics", color: colors.info },
+  running_advisor: { label: "Advisor", color: colors.info },
+  calculating_prices: { label: "Pricing", color: colors.info },
+  detecting_findings: { label: "Analysing", color: colors.info },
+  generating_report: { label: "Finalising", color: colors.info },
   completed: { label: "Completed", color: colors.success },
   failed: { label: "Failed", color: colors.error },
 };
 
-const PHASES = [
-  { key: "pending", label: "Queued for processing" },
-  { key: "running", label: "Collecting Azure inventory" },
-  { key: "running2", label: "Evaluating cost findings" },
-  { key: "completed", label: "Generating report" },
+// Ordered pipeline phases (mirror backend state machine) for the checklist view.
+const PHASES: { key: AssessmentStatus; label: string }[] = [
+  { key: "fetching_resources", label: "Collecting Azure inventory" },
+  { key: "fetching_metrics", label: "Analysing resource utilisation" },
+  { key: "running_advisor", label: "Reviewing optimisation signals" },
+  { key: "calculating_prices", label: "Calculating live prices" },
+  { key: "detecting_findings", label: "Identifying savings opportunities" },
+  { key: "generating_report", label: "Finalising results" },
 ];
 
-function ProgressView({ status }: { status: AssessmentStatus }) {
-  // Map status to an approximate progress + active phase index.
-  const phaseIndex = status === "pending" ? 0 : status === "running" ? 2 : 4;
-  const pct = status === "pending" ? 12 : status === "running" ? 62 : 95;
+function ProgressView({ status, progress, message }: {
+  status: AssessmentStatus;
+  progress: number;
+  message: string | null;
+}) {
+  const phaseIndex = PHASES.findIndex((p) => p.key === status);
+  const pct = progress || (status === "queued" ? 5 : 10);
 
   return (
     <Box display="flex" justifyContent="center" mt={2}>
@@ -67,7 +77,7 @@ function ProgressView({ status }: { status: AssessmentStatus }) {
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
-            background: "linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)",
+            background: gradients.brand,
             animation: `${pulse} 2s ease-in-out infinite`,
           }}
         >
@@ -78,8 +88,7 @@ function ProgressView({ status }: { status: AssessmentStatus }) {
           Running your assessment
         </Typography>
         <Typography variant="body2" color="text.secondary" mb={3}>
-          We are analysing your Azure resources for cost optimisation opportunities.
-          This may take a few minutes.
+          {message || "Analysing your Azure resources for cost optimisation opportunities."}
         </Typography>
 
         <Box mb={3}>
@@ -96,7 +105,7 @@ function ProgressView({ status }: { status: AssessmentStatus }) {
         <Stack spacing={1.25} sx={{ textAlign: "left" }}>
           {PHASES.map((phase, i) => {
             const done = i < phaseIndex;
-            const active = i === phaseIndex || (i === phaseIndex - 1 && status === "running");
+            const active = i === phaseIndex;
             return (
               <Box key={phase.key} display="flex" alignItems="center" gap={1.5}>
                 {done ? (
@@ -136,12 +145,6 @@ export default function Results() {
       const status = query.state.data?.status;
       return status === "completed" || status === "failed" ? false : 4000;
     },
-  });
-
-  const { data: byCategory } = useQuery({
-    queryKey: ["findings-by-category", assessmentId],
-    queryFn: () => api.getFindingsByCategory(assessmentId),
-    enabled: assessment?.status === "completed",
   });
 
   const handleDownload = async (format: "pdf" | "excel") => {
@@ -259,7 +262,13 @@ export default function Results() {
       </Box>
 
       {/* Progress state */}
-      {!isTerminal && <ProgressView status={assessment.status} />}
+      {!isTerminal && (
+        <ProgressView
+          status={assessment.status}
+          progress={assessment.progress}
+          message={assessment.status_message}
+        />
+      )}
 
       {assessment.status === "failed" && (
         <Alert severity="error" icon={<ErrorOutlineIcon />}>
@@ -267,25 +276,8 @@ export default function Results() {
         </Alert>
       )}
 
-      {/* Results */}
-      {assessment.status === "completed" && (
-        <>
-          <SummaryCards assessment={assessment} byCategory={byCategory ?? []} />
-          {assessment.findings.length > 0 ? (
-            <FindingsTable findings={assessment.findings} />
-          ) : (
-            <Alert
-              severity="success"
-              sx={{
-                bgcolor: SEVERITY.low.bg,
-                border: `1px solid ${alpha(colors.success, 0.3)}`,
-              }}
-            >
-              No cost optimisation findings detected — your environment looks well-optimised!
-            </Alert>
-          )}
-        </>
-      )}
+      {/* Results — executive cost-assessment dashboard (real assessment data) */}
+      {assessment.status === "completed" && <AssessmentDashboard assessment={assessment} />}
     </Layout>
   );
 }

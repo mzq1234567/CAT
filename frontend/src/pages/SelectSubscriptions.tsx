@@ -158,8 +158,8 @@ export default function SelectSubscriptions() {
                       bgcolor: isSel ? alpha(colors.accentBlue, 0.1) : colors.surfaceElevated,
                       transition: "all 0.15s ease",
                       "&:hover": {
-                        borderColor: isSel ? colors.accentBlue : "#475569",
-                        bgcolor: isSel ? alpha(colors.accentBlue, 0.14) : "#2c3e54",
+                        borderColor: colors.accentBlue,
+                        bgcolor: isSel ? alpha(colors.accentBlue, 0.14) : alpha(colors.accentBlue, 0.05),
                       },
                     }}
                   >

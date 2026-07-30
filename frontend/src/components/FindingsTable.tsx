@@ -1,13 +1,14 @@
 import React from "react";
 import {
-  Box, Card, CardContent, Chip, Collapse, IconButton, InputAdornment,
-  Stack, Table, TableBody, TableCell, TableContainer, TableHead,
+  Box, Card, CardContent, Chip, Collapse, FormControlLabel, IconButton, InputAdornment,
+  Stack, Switch, Table, TableBody, TableCell, TableContainer, TableHead,
   TablePagination, TableRow, TableSortLabel, TextField, Tooltip, Typography,
 } from "@mui/material";
 import { alpha } from "@mui/material/styles";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
 import SearchIcon from "@mui/icons-material/Search";
+import BugReportIcon from "@mui/icons-material/BugReport";
 import { Finding } from "../types";
 import { colors, SEVERITY, SeverityKey } from "../theme";
 
@@ -35,7 +36,53 @@ function SeverityBadge({ severity }: { severity: string }) {
   );
 }
 
-function ExpandRow({ finding }: { finding: Finding }) {
+function confidenceColor(conf: number): string {
+  if (conf >= 0.8) return colors.success;
+  if (conf >= 0.5) return colors.warning;
+  return colors.error;
+}
+
+function ConfidenceBadge({ confidence }: { confidence: number }) {
+  const c = confidenceColor(confidence);
+  return (
+    <Tooltip title={`Confidence ${(confidence * 100).toFixed(0)}%`}>
+      <Box display="inline-flex" alignItems="center" gap={0.75}>
+        <Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: c }} />
+        <Typography variant="body2" sx={{ color: c, fontWeight: 600 }}>
+          {(confidence * 100).toFixed(0)}%
+        </Typography>
+      </Box>
+    </Tooltip>
+  );
+}
+
+function ValidationChip({ finding }: { finding: Finding }) {
+  const status = finding.validation_status;
+  if (!status || status === "unvalidated") {
+    return <Typography variant="caption" color={colors.textMuted}>—</Typography>;
+  }
+  const isReview = status === "needs_review";
+  const color = isReview ? colors.warning : colors.success;
+  const variance =
+    finding.validation_variance_pct != null
+      ? ` ${finding.validation_variance_pct > 0 ? "+" : ""}${finding.validation_variance_pct.toFixed(0)}%`
+      : "";
+  return (
+    <Tooltip title={isReview ? "Estimate deviates from actual cost — review" : "Validated vs actual cost"}>
+      <Chip
+        size="small"
+        label={`${isReview ? "Review" : "OK"}${variance}`}
+        sx={{
+          bgcolor: alpha(color, 0.15),
+          color,
+          border: `1px solid ${alpha(color, 0.3)}`,
+        }}
+      />
+    </Tooltip>
+  );
+}
+
+function ExpandRow({ finding, showDebug }: { finding: Finding; showDebug: boolean }) {
   const [open, setOpen] = React.useState(false);
   return (
     <>
@@ -78,9 +125,15 @@ function ExpandRow({ finding }: { finding: Finding }) {
         <TableCell align="right" sx={{ fontWeight: 600, color: colors.accentBlue }}>
           {fmt(finding.estimated_savings_annual)}
         </TableCell>
+        <TableCell align="center">
+          <ConfidenceBadge confidence={finding.confidence} />
+        </TableCell>
+        <TableCell align="center">
+          <ValidationChip finding={finding} />
+        </TableCell>
       </TableRow>
       <TableRow>
-        <TableCell colSpan={7} sx={{ py: 0, borderBottom: open ? undefined : "none" }}>
+        <TableCell colSpan={9} sx={{ py: 0, borderBottom: open ? undefined : "none" }}>
           <Collapse in={open} timeout="auto" unmountOnExit>
             <Box
               sx={{
@@ -117,6 +170,38 @@ function ExpandRow({ finding }: { finding: Finding }) {
                   </Typography>
                 </>
               )}
+              {finding.advisor_recommendation_id && (
+                <Typography variant="caption" color={colors.textMuted} display="block" mt={1}>
+                  Correlated Azure Advisor recommendation: {finding.advisor_recommendation_id}
+                </Typography>
+              )}
+              {/* DEV-ONLY debug reasoning — visible only when the "Show debug info" toggle is on
+                  AND the backend populated debug_reason (DEBUG_FINDINGS_REASONING=true).
+                  TODO: remove or gate behind admin-only role before prod. */}
+              {showDebug && finding.debug_reason && (
+                <Box
+                  mt={2}
+                  p={1.5}
+                  sx={{
+                    bgcolor: alpha(colors.warning, 0.08),
+                    border: `1px dashed ${alpha(colors.warning, 0.4)}`,
+                    borderRadius: 1.5,
+                  }}
+                >
+                  <Box display="flex" alignItems="center" gap={0.75} mb={0.5}>
+                    <BugReportIcon sx={{ fontSize: 16, color: colors.warning }} />
+                    <Typography variant="subtitle2" fontWeight={700} color={colors.warning}>
+                      Why this finding triggered (debug)
+                    </Typography>
+                  </Box>
+                  <Typography
+                    variant="body2"
+                    sx={{ fontFamily: "monospace", color: colors.textSecondary, whiteSpace: "pre-wrap" }}
+                  >
+                    {finding.debug_reason}
+                  </Typography>
+                </Box>
+              )}
             </Box>
           </Collapse>
         </TableCell>
@@ -133,6 +218,8 @@ interface Props {
 
 export default function FindingsTable({ findings }: Props) {
   const [search, setSearch] = React.useState("");
+  const [showDebug, setShowDebug] = React.useState(false);
+  const hasDebug = React.useMemo(() => findings.some((f) => f.debug_reason), [findings]);
   const [severityFilter, setSeverityFilter] = React.useState("all");
   const [categoryFilter, setCategoryFilter] = React.useState("all");
   const [page, setPage] = React.useState(0);
@@ -198,23 +285,41 @@ export default function FindingsTable({ findings }: Props) {
               ({filtered.length})
             </Box>
           </Typography>
-          <TextField
-            size="small"
-            placeholder="Search findings…"
-            value={search}
-            onChange={(e) => {
-              setSearch(e.target.value);
-              setPage(0);
-            }}
-            sx={{ minWidth: 260 }}
-            InputProps={{
-              startAdornment: (
-                <InputAdornment position="start">
-                  <SearchIcon fontSize="small" sx={{ color: colors.textMuted }} />
-                </InputAdornment>
-              ),
-            }}
-          />
+          <Stack direction="row" spacing={2} alignItems="center">
+            {hasDebug && (
+              <FormControlLabel
+                control={
+                  <Switch
+                    size="small"
+                    checked={showDebug}
+                    onChange={(e) => setShowDebug(e.target.checked)}
+                  />
+                }
+                label={
+                  <Typography variant="body2" color={colors.textSecondary}>
+                    Show debug info
+                  </Typography>
+                }
+              />
+            )}
+            <TextField
+              size="small"
+              placeholder="Search findings…"
+              value={search}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setPage(0);
+              }}
+              sx={{ minWidth: 260 }}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <SearchIcon fontSize="small" sx={{ color: colors.textMuted }} />
+                  </InputAdornment>
+                ),
+              }}
+            />
+          </Stack>
         </Box>
 
         {/* Severity filter chips */}
@@ -307,17 +412,19 @@ export default function FindingsTable({ findings }: Props) {
                     Annual
                   </TableSortLabel>
                 </TableCell>
+                <TableCell align="center">Confidence</TableCell>
+                <TableCell align="center">Validation</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
               {paginated.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} align="center" sx={{ py: 5, color: colors.textMuted }}>
+                  <TableCell colSpan={9} align="center" sx={{ py: 5, color: colors.textMuted }}>
                     No findings match the current filters.
                   </TableCell>
                 </TableRow>
               ) : (
-                paginated.map((f) => <ExpandRow key={f.id} finding={f} />)
+                paginated.map((f) => <ExpandRow key={f.id} finding={f} showDebug={showDebug} />)
               )}
             </TableBody>
           </Table>

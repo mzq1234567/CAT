@@ -10,7 +10,7 @@ import DashboardIcon from "@mui/icons-material/Dashboard";
 import AssessmentIcon from "@mui/icons-material/Assessment";
 import AddCircleOutlineIcon from "@mui/icons-material/AddCircleOutline";
 import LogoutIcon from "@mui/icons-material/Logout";
-import { colors } from "../theme";
+import { colors, gradients } from "../theme";
 
 const SIDEBAR_WIDTH = 240;
 
@@ -71,7 +71,7 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
         sx={{
           width: SIDEBAR_WIDTH,
           flexShrink: 0,
-          bgcolor: colors.bg,
+          bgcolor: colors.surface,
           borderRight: `1px solid ${colors.border}`,
           display: "flex",
           flexDirection: "column",
@@ -96,7 +96,7 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
               width: 38,
               height: 38,
               borderRadius: 2,
-              background: "linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)",
+              background: gradients.brand,
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
@@ -170,9 +170,9 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
             <Box
               sx={{
                 p: 1.5,
-                borderRadius: 2,
+                borderRadius: 2.5,
                 border: `1px solid ${colors.border}`,
-                bgcolor: colors.surface,
+                bgcolor: colors.surfaceElevated,
               }}
             >
               <Box display="flex" alignItems="center" gap={1.25} mb={1.25}>
@@ -181,7 +181,7 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
                     width: 34,
                     height: 34,
                     fontSize: 13,
-                    background: "linear-gradient(135deg, #3B82F6 0%, #6366F1 100%)",
+                    background: gradients.brand,
                   }}
                 >
                   {initials}
