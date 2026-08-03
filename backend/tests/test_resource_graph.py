@@ -62,12 +62,15 @@ def test_registry_has_all_buckets():
     buckets = set(kql.filtered_inventory_queries())
     assert buckets == {
         "unattached_disks", "orphaned_public_ips", "idle_app_service_plans",
+        "active_app_service_plans", "rightsizable_sql_databases",
+        "rightsizable_sql_managed_instances", "rightsizable_premium_disks",
+        "sql_virtual_machines",
         "deallocated_vms", "paused_sql_databases", "stopped_sql_managed_instances",
         "running_vms",
         # broader coverage — cost-bearing only
         "orphaned_snapshots", "empty_load_balancers", "idle_nat_gateways", "bastion_hosts",
         # commitments / licensing / backup
-        "windows_vms_without_ahb", "geo_redundant_vaults",
+        "windows_vms_without_ahb", "sql_ahb_eligible", "geo_redundant_vaults",
     }
 
 
@@ -79,6 +82,15 @@ def test_broad_coverage_queries_filter_server_side():
     assert "'Windows'" in kql.windows_vms_without_ahb_query()
     assert "Windows_Server" in kql.windows_vms_without_ahb_query()
     assert "recoveryservices/vaults" in kql.geo_redundant_vaults_query()
+
+
+def test_sql_ahb_query_targets_vcore_license_included():
+    q = kql.sql_ahb_eligible_query()
+    assert "microsoft.sql/servers/databases" in q
+    assert "microsoft.sql/managedinstances" in q
+    assert "LicenseIncluded" in q          # only resources paying the SQL Server licence
+    assert "'_S_'" in q                     # serverless SKUs excluded (AHB is vCore-provisioned only)
+    assert "vcores" in q
 
 
 def test_all_resources_summary_excludes_child_extensions():

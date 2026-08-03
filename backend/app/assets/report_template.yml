@@ -76,10 +76,13 @@ table:
   grid_width: 0.75
 
 # ── Three-year projection scenarios ──────────────────────────────────────────────────
-# `growth` is the assumed annual growth rate applied to the assessed run-rate. Bars are
-# cumulative over three years. Year labels are derived from the assessment date, never
-# hardcoded: `base_year_offset` shifts year 1 relative to the report's year (-1 labels
-# year 1 as the trailing twelve months the run-rate was measured over).
+# Growth is applied LINEARLY (spend rises by the same amount each year) and cumulated over three
+# years. Year labels derive from the assessment date, never hardcoded (`base_year_offset` shifts
+# year 1). Growth per scenario is either fixed (`growth`) or derived from the environment's own
+# spend trend (`growth_source`):
+#   * measured      — a best-fit line through the last ~6 months of actual spend (per-environment).
+#   * half_measured — half of that measured trend (the Conservative view).
+# `growth_source` scenarios are SKIPPED when there's too little billing history to measure a trend.
 projections:
   base_year_offset: -1
   year_label: "{ordinal} Year ({start}-{end})"
@@ -92,16 +95,16 @@ projections:
         three years, showing cumulative projected spend, cumulative savings, and net cost after
         optimization.
     - title: "Linear Growth ACR - 3 Years"
-      growth: 0.15
+      growth_source: measured
       caption: >-
-        Represents a scenario where the current annual growth rate is assumed to continue linearly
-        for the next three years, highlighting cumulative projected spend, savings, and
+        Projects the environment's own spend trend, measured from recent monthly billing, forward
+        linearly over three years — highlighting cumulative projected spend, savings, and
         post-optimization costs.
     - title: "Conservative Growth ACR - 3 Years"
-      growth: 0.07
+      growth_source: half_measured
       caption: >-
-        Depicts a conservative scenario with minimal annual growth assumed over three years,
-        presenting cumulative projected spend, potential savings, and optimized costs.
+        A cautious view at half the measured spend trend, presenting cumulative projected spend,
+        potential savings, and optimized costs.
     - title: "Civo's Report 2024 based Theoritical ACR - 3 Years"
       growth: 0.25
       caption: >-

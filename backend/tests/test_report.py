@@ -1,13 +1,10 @@
 """Tests for report generation with validation + confidence (Step 9)."""
 from __future__ import annotations
 
-import io
 from datetime import datetime
 
-import openpyxl
-
 from app.models.db import Assessment, Finding
-from app.services.report import generate_excel, generate_pdf
+from app.services.report import generate_pdf
 
 
 def _assessment():
@@ -49,31 +46,6 @@ def test_generate_pdf_is_valid():
     assert len(pdf) > 1000
 
 
-def test_generate_excel_has_validation_and_confidence():
-    xlsx = generate_excel(_assessment(), _findings())
-    assert xlsx[:2] == b"PK"  # xlsx is a zip
-
-    wb = openpyxl.load_workbook(io.BytesIO(xlsx))
-    assert set(wb.sheetnames) == {"Summary", "Findings", "Validation"}
-
-    # Summary carries the as-of snapshot + validation counts.
-    summary = {wb["Summary"].cell(r, 1).value: wb["Summary"].cell(r, 2).value
-               for r in range(1, wb["Summary"].max_row + 1)}
-    assert summary["Data as of (snapshot)"] == "2025-01-15 10:01 UTC"
-    assert summary["Needs Review"] == 1
-
-    # Findings sheet exposes Confidence + Validation columns.
-    header = [c.value for c in wb["Findings"][1]]
-    assert "Confidence" in header
-    assert "Validation" in header
-    assert "Variance %" in header
-
-    # Validation sheet lists the one needs-review finding.
-    val = wb["Validation"]
-    assert val.max_row == 2  # header + 1 flagged finding
-    assert val.cell(2, 2).value == "disk-1"
-
-
 def test_pdf_handles_missing_snapshot():
     a = _assessment()
     a.snapshot_at = None
@@ -93,6 +65,7 @@ def _rich_assessment():
     a.current_annual_spend = 63391.92
     a.total_savings_monthly = 227.19
     a.total_savings_annual = 2726.32
+    a.observed_annual_growth = 0.12  # drives the Linear (12%) + Conservative (6%) projections
     return a
 
 
@@ -144,6 +117,15 @@ def _rich_findings():
 def test_pdf_full_template_renders():
     """The full TPT template (cover, TOC, exec + projections, pillar tables) builds without error."""
     pdf = generate_pdf(_rich_assessment(), _rich_findings())
+    assert pdf[:4] == b"%PDF"
+
+
+def test_projections_render_without_measured_growth():
+    """With too little history (no measured growth), the trend-based charts are skipped but the
+    report still builds — the Fixed and Civo scenarios remain."""
+    a = _rich_assessment()
+    a.observed_annual_growth = None
+    pdf = generate_pdf(a, _rich_findings())
     assert pdf[:4] == b"%PDF"
     assert len(pdf) > 5000  # multi-page branded report, not a stub
 

@@ -1,15 +1,18 @@
 import React from "react";
-import { Box, Card, CardContent, Chip, Collapse, Grid, IconButton, Typography } from "@mui/material";
+import { Box, Button, Card, CardContent, Chip, Collapse, Grid, IconButton, Typography } from "@mui/material";
 import { alpha } from "@mui/material/styles";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import LightbulbOutlinedIcon from "@mui/icons-material/LightbulbOutlined";
 import SettingsSuggestOutlinedIcon from "@mui/icons-material/SettingsSuggestOutlined";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
+import VisibilityOffOutlinedIcon from "@mui/icons-material/VisibilityOffOutlined";
 import { colors } from "../../theme";
 import type { Finding } from "../../types";
+import { useApi } from "../../services/api";
 import { areaForCategory } from "./area";
-import { AreaTag, ImpactChip, ConfidenceChip, ValidationChip } from "./badges";
+import { AreaTag, ImpactChip, ValidationChip } from "./badges";
 import FindingEvidence from "./FindingEvidence";
 import { SAVINGS_COLOR, fmtCompact, fmtUSD } from "./tokens";
 
@@ -47,10 +50,23 @@ function DetailBlock({
   );
 }
 
-export default function RecommendationCard({ finding }: { finding: Finding }) {
+export default function RecommendationCard({
+  finding,
+  assessmentId,
+}: {
+  finding: Finding;
+  assessmentId: number;
+}) {
   const [open, setOpen] = React.useState(false);
   const area = areaForCategory(finding.category);
   const memoryUnverified = (finding.details as { memory_verified?: boolean } | null)?.memory_verified === false;
+
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const dismiss = useMutation({
+    mutationFn: () => api.dismissFinding(assessmentId, finding.id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["assessment", assessmentId] }),
+  });
 
   return (
     <Card sx={{ "&:hover": { borderColor: alpha(colors.accentBlue, 0.4) } }}>
@@ -167,8 +183,7 @@ export default function RecommendationCard({ finding }: { finding: Finding }) {
             </Grid>
           </Grid>
 
-          <Box display="flex" gap={1} mt={2} flexWrap="wrap">
-            <ConfidenceChip confidence={finding.confidence} />
+          <Box display="flex" gap={1} mt={2} flexWrap="wrap" alignItems="center">
             <ValidationChip finding={finding} />
             {memoryUnverified && (
               <Chip
@@ -187,6 +202,16 @@ export default function RecommendationCard({ finding }: { finding: Finding }) {
                 sx={{ color: colors.textSecondary, borderColor: colors.border }}
               />
             )}
+            <Box flex={1} />
+            <Button
+              size="small"
+              startIcon={<VisibilityOffOutlinedIcon sx={{ fontSize: 16 }} />}
+              onClick={() => dismiss.mutate()}
+              disabled={dismiss.isPending}
+              sx={{ color: colors.textMuted, textTransform: "none", "&:hover": { color: colors.textSecondary } }}
+            >
+              {dismiss.isPending ? "Dismissing…" : "Dismiss"}
+            </Button>
           </Box>
         </Box>
       </Collapse>

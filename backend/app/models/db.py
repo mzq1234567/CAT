@@ -31,6 +31,9 @@ class Assessment(Base):
     spend_by_area = Column(JSON, nullable=True)  # {area: monthly_cost}
     cost_data_available = Column(Integer, default=0)  # 0/1 — did we get any cost data?
     currency = Column(String, default="USD")  # billing currency (from Cost Management)
+    # Annual spend-growth rate from a best-fit line through recent monthly spend (e.g. 0.12 = +12%/yr).
+    # Drives the report's Linear/Conservative growth projections; null when there's too little history.
+    observed_annual_growth = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     snapshot_at = Column(DateTime, nullable=True)  # "as of" inventory time (Step 5)
     completed_at = Column(DateTime, nullable=True)

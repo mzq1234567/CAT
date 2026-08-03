@@ -27,6 +27,7 @@ class FindingResponse(BaseModel):
     validation_status: Optional[str] = None
     validation_variance_pct: Optional[float] = None
     actual_monthly_cost: Optional[float] = None
+    dismissed: bool = False
     # DEV-ONLY; null unless DEBUG_FINDINGS_REASONING is enabled.
     debug_reason: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
@@ -76,6 +77,8 @@ class AssessmentSummary(BaseModel):
     spend_by_area: Optional[Dict[str, float]] = None
     cost_data_available: bool = False
     currency: str = "USD"
+    # Annual spend-growth rate from the recent trend (e.g. 0.12 = +12%/yr); null if too little history.
+    observed_annual_growth: Optional[float] = None
     error_message: Optional[str] = None
     created_at: datetime
     snapshot_at: Optional[datetime] = None

@@ -1126,6 +1126,220 @@ User feedback on live dashboard screenshots: redundant panes, no interactive gra
   concise single sentences (left as-is).
 - Verify: backend **212 passing**; frontend `npm run build` clean.
 
+### Post-ship 19 — removed the Excel export entirely (2026-07-31)
+User: "kill the excel switch entirely. its not needed at all." Removed the whole XLSX path end-to-end,
+PDF is now the only report format:
+- Frontend: dropped the "Download Excel" button + `TableChartIcon` in `Results.tsx`; `downloading`
+  state simplified from `"pdf" | "excel" | null` to a boolean; `handleDownload` takes no format;
+  `api.ts` `downloadReport(id)` is PDF-only (no format arg); Login.tsx marketing line "PDF and Excel"
+  → "PDF reports".
+- Backend: deleted the `GET /{id}/report/excel` route (`assessments.py`) and `generate_excel` +
+  its helpers (`_confidence_label`/`_as_of`/`_validation_counts`) and the openpyxl imports from
+  `report.py`; module docstring updated to "PDF" only. Dropped `openpyxl==3.1.2` from
+  `requirements.txt` (nothing else used it).
+- Tests: removed `test_generate_excel_*` and the `io`/`openpyxl` imports from `test_report.py`;
+  replaced `test_download_excel` with `test_excel_route_removed` (asserts the route now 404s).
+- Docs: README, SETUP, CODEBASE_BRIEF all de-referenced Excel.
+- Verify: backend **211 passing** (was 212; net −1 excel test); frontend build clean.
+
+### Post-ship 20 — filter out ₹0-savings findings (2026-07-31)
+User (screenshot): an "Azure Advisor Cost Recommendation" showing ₹0/yr ("Disable Front Door health
+probes…") — "whys this here". Root cause: Azure Advisor returns some Category=Cost recs with no
+`savingsAmount`, so `_extract_savings` yields 0 and `advisor_findings` surfaced them anyway; deallocated
+VMs also emit 0.0 (residual disk cost unquantified). No filter dropped them. Fix: in `_detect_all`,
+`findings = [f for f in findings if (f.get("estimated_savings_monthly") or 0) > 0]` right before
+`_dedupe` — single choke point, so a zero-value line never reaches persist/report/findings_count.
+Also removes deallocated-VM ₹0 lines (same noise). Added `test_zero_savings_findings_are_filtered_from_pipeline`.
+Verify: backend **212 passing**. NOTE: deallocated VMs now suppressed entirely — if we later want them
+back, quantify their disk cost into a real saving rather than emitting 0.0.
+
+### Post-ship 21 — report growth projections now derived from the environment's real spend trend (2026-07-31)
+User: the report's 3-year trajectory charts (Linear / Conservative growth) must NOT use hardcoded 7/15%
+— in their manual method those come from the delta (actual spend trend); only Civo's 25% is a fixed
+hypothetical. Chosen method (user: "go with the most accurate"): **best-fit straight line** through
+recent monthly spend; Conservative = **half** of Linear.
+- `cost_management.py`: `parse_monthly_totals(payload)` → {month: total across resources} (month-labelled
+  so multi-sub merges align); `linear_growth_rate(monthly_totals)` → least-squares slope annualised vs
+  the line's latest month → yearly growth fraction. Returns None if <3 complete months (hide charts),
+  0.0 if flat/declining, clamped to [0,1.0]. `get_cost_map_and_consistency` now returns a 3-tuple
+  (adds monthly_totals); the monthly-history query already excludes the current partial month.
+- `assessment.py`: `_gather_cost_and_consistency` fetches **6 months**, sums per-sub monthly totals by
+  month, computes one growth rate, returns (cost_map, consistency, growth); persisted via
+  `_persist_findings_and_totals(observed_growth=...)`.
+- `db.py` + alembic **009**: new nullable `observed_annual_growth` column (applied to cat.db).
+- `report.py`: `_projection` is now **LINEAR (simple)** not compound (`spend*(1+growth*year)`) — matches
+  the "Linear Growth" label (was a latent bug). `_scenario_growth` resolves per-scenario growth:
+  `growth_source: measured` → the trend, `half_measured` → half, else fixed `growth`; None ⇒ skip that
+  chart. `ctx["_growth"]` carries the measured rate.
+- `report_template.yml`: Linear scenario → `growth_source: measured`, Conservative → `half_measured`;
+  Fixed stays 0, Civo stays fixed 0.25. Captions updated.
+- Per-environment by construction: a $1k-ACR env and a $12k-ACR env get entirely different charts.
+- NOTE: the dashboard `SavingsProjection.tsx` is still a simple monthly run-rate (no growth) — NOT yet
+  aligned to this measured-growth method. Align later if web/PDF consistency matters.
+- Verify: backend **216 passing**; `alembic upgrade head` clean.
+
+### Post-ship 22 — SQL Server Azure Hybrid Benefit detector (2026-07-31)
+Closing the biggest quick-win gap (user picked "just SQL AHB for now" over storage). Grounded in MS
+docs: AHB applies only to vCore *provisioned* SQL DB/MI (not DTU/serverless), toggling licenseType
+LicenseIncluded→BasePrice; it removes only the SQL Server *licence* component, a fixed ~$0.1534/vCore-hr
+(≈$112/vCore-month) that is the SAME dollar amount across GP/BC/Hyperscale. So the saving is
+**vCores × per-vCore licence, capped at the resource's actual cost** — isolating the licence means it
+never inflates on storage/backup.
+- `kql.py`: `sql_ahb_eligible_query()` (DB+MI union, licenseType=LicenseIncluded, excludes serverless
+  `_S_` SKUs, excludes paused/stopped, vCores = coalesce(properties.vCores, sku.capacity)); registered
+  as bucket `sql_ahb_eligible`.
+- `findings.py`: const `SQL_AHB_LICENCE_PER_VCORE_MONTHLY_USD = 112.0`; `detect_sql_ahb()` mirrors
+  `detect_windows_ahb` — resource-less aggregate (escapes dedupe, additive with reservations), skips
+  non-billing resources when cost data present, `from_usd()` for currency, reuses `eligible_vms` details
+  key + `licence_kind="SQL Server"`. Category `sql_ahb`, display "SQL Server Azure Hybrid Benefit".
+- `assessment.py` `_detect_all`: excludes paused-DB/stopped-MI ids, calls `detect_sql_ahb`.
+- Report `_PILLAR`: sql_ahb→Compute (not _DEDICATED → renders as a row in the Compute table via
+  `_pillar_rows` display_name fallback). Frontend `area.ts`: sql_ahb→**Databases**. `FindingEvidence.tsx`:
+  AHB panel now category-aware (noun "SQL resource"/"VM", caveat "SQL Server"/"Windows Server licences").
+- Tests: KQL query test, `detect_sql_ahb` grounding+cap test, skip/exclude test, registry bucket set
+  updated. Backend **219 passing**; frontend build clean.
+- Coverage verdict given: tool now covers ~85%+ of the standard Azure quick-win checklist. Remaining
+  gaps flagged, NOT built (user deferred): storage-account redundancy GRS→LRS, disk Premium→Standard
+  (needs per-disk IOPS metrics). True blob hot/cool/archive tiering is INFEASIBLE accurately (needs
+  per-blob access data ARG doesn't expose) — explicitly out of scope.
+
+### Post-ship 23 — AHB robustness, deallocated-VM quantification, confidence chip removed (2026-07-31)
+Pre-demo hardening. User flagged AHB findings looked wrong + confidence % shouldn't be client-facing.
+- **Confidence chip removed** from `RecommendationCard.tsx` (client dashboard). Backend `confidence` still
+  drives sorting; just not shown. `ConfidenceChip` still exists in badges.tsx (unused there) + FindingsTable
+  (internal/debug view).
+- **SP vs RI verified**: `detect_vm_commitments` sorts each VM into ri_items XOR sp_items (if/elif on
+  RI availability) — never both, so totals aren't double-counted. AHB (licence) + commitment (compute,
+  licence stripped via compute_fraction) are additive, non-overlapping. Confirmed, no change needed.
+- **Windows AHB bug found + fixed**: DB inspection of assessment 44 showed D-series all give a
+  consistent ₹3,169.7/vCore licence (correct) but B2ms gave ₹275/vCore (~11x low) — `get_vm_windows_
+  monthly_price` under-fetches B-series. Fix: the Windows licence is a flat per-vCore charge, so
+  `detect_windows_ahb` now (1) samples (windows−linux)/vCPU per VM, (2) takes the **MEDIAN** as the
+  per-vCore rate, (3) applies `licence = vCPU × median`, `windows_eff = linux + licence`,
+  `fraction = licence/windows_eff`, saving = actual × fraction. Robust to a bad per-SKU fetch; single-VM
+  and consistent-fleet cases are unchanged (median = the sample) so the golden test still passes. New
+  helpers `_median`, `_vcpus` (get_spec else first-digit parse of SKU); added `vcpu` to eligible_vms.
+- **Deallocated VMs re-quantified** (they were suppressed as ₹0 by the zero-filter): KQL now projects
+  `osDiskId` + `dataDisks`; `detect_deallocated_vms` sums the attached disks' actual cost from cost_map
+  (the disks keep billing; they're attached so the unattached-disk detector misses them). Saving =
+  disk cost, grounded. Added `actual_cost_override` param to `_finding` so the per-VM cap uses the
+  DISKS' cost basis, not the VM's ~0 compute (which would wrongly clamp it to 0). 0 without cost data →
+  dropped by the zero-filter (acceptable).
+- Verify: backend **222 passing** (+3 net: median-correction test, 2 deallocated tests; rewrote the
+  2-VM AHB aggregate test to use realistic consistent per-vCore prices); frontend build clean.
+- User re-runs the assessment tomorrow to see corrected AHB + deallocated VMs populate.
+
+### Post-ship 24 — de-hardcoded prices: live retail for LB/NAT/Bastion/ASP + dated estimates table (2026-07-31)
+Also aligned dashboard chart to PDF (Post-ship 24a below).
+- **New `estimates.py`**: single dated table (`ESTIMATES_VERIFIED = "2026-07-31"`). Holds the genuinely-
+  can't-fetch-live values (snapshot $/GB, GRS vault, SQL-AHB per-vCore — moved here from findings.py)
+  AND the USD fallbacks for the now-live-priced items (LB/NAT/Bastion/ASP table). Comment explains they
+  only feed "Estimate"-badged findings, never grounded headlines.
+- **`pricing.py`**: new `_flat_hourly_monthly()` (serviceName+region+Consumption+'Hour' filter, min×730)
+  and `_live_or_fallback()` — a **sanity band [0.25×,4×] around the dated fallback** so a wrong meter
+  match (I can't test live meters from here) can NEVER produce a bad number; it degrades to the verified
+  estimate and logs. Methods: `get_load_balancer_monthly_price`, `get_nat_gateway_monthly_price`,
+  `get_bastion_monthly_price`, `get_app_service_plan_monthly_price` (normalises RG 'P1v2'→retail 'P1 v2').
+- **`findings.py`**: `detect_orphans` + `detect_idle_app_service_plans` are now **async**; LB/NAT/Bastion
+  call the live pricing methods, snapshot/vault stay static (via estimates). Removed `_SNAPSHOT_PER_GB`,
+  `_ASP_COST`, the SQL constant (now imported from estimates). `_LIVE_PRICED_ORPHANS` set documents which.
+- **`assessment.py`**: `await` the two now-async detectors.
+- Tests: `FakePricing` gained `currency` + the 4 flat-rate methods (return `from_usd(fallback, currency)`);
+  all `detect_orphans`/ASP callers now `await`; INR conversion test uses `FakePricing(currency="INR")`
+  (conversion moved from the detector into the pricing engine). New `test_pricing.py` cases: live price
+  accepted, empty→fallback, out-of-band→fallback. Backend **225 passing**.
+- STILL hardcoded on purpose (documented as fine): tuning thresholds (IDLE/DOWNSIZE/METRIC_WINDOW),
+  tolerance/cv, HOURS_PER_MONTH, API versions, Civo 25%, FX table (low-impact — severity + estimates only).
+
+### Post-ship 24a — dashboard projection chart aligned to the PDF (2026-07-31)
+Exposed `observed_annual_growth` in `AssessmentSummary` schema + frontend `Assessment` type. Reworked
+`SavingsProjection.tsx` to project spend LINEARLY at the measured growth (same method as report's Linear
+scenario) instead of a flat run-rate; flat when no growth measured (= report's Fixed scenario). Passes
+`annualGrowth={assessment.observed_annual_growth}` from ExecutiveSummary. Confidence chip already removed
+(Post-ship 23). Frontend build clean.
+
+### Post-ship 25 — App Service Plan rightsizing detector (first of the rightsizing suite, 2026-07-31)
+First of the "shrink it" detectors from the TPT template. Built conservatively (rightsizing can break
+prod), mirroring the VM oversized pattern exactly.
+- `kql.py`: `active_app_service_plans_query()` (numberOfSites>0, tier not Free/Shared/Dynamic);
+  registered bucket `active_app_service_plans`.
+- `metrics.py`: `enrich_asps_with_metrics` + `get_asp_utilisation` — peak (Maximum) `CpuPercentage` +
+  `MemoryPercentage` over 30d, bounded concurrency (reuses `_METRIC_CONCURRENCY`).
+- `findings.py`: `_ASP_SPECS` (sku→series,cores,mem_gb), `find_asp_downsize_target` (smallest same-series
+  SKU where BOTH projected CPU AND mem clear the 70% `DOWNSIZE_HEADROOM_CEILING`; halving cores ~doubles
+  util), `detect_app_service_rightsizing` (async). Saving = live price(current) − live price(target)
+  via the ASP pricing method; skips if either price missing (no guessing); requires both CPU+mem (mem
+  missing → CPU-only at reduced confidence, like VMs). Reuses the VM resize evidence panel by emitting
+  `current_sku`/`recommended_sku`/`current_vcpu`/`recommended_vcpu`/`*_memory_gb`. Category
+  `app_service_plan_rightsizing`.
+- `assessment.py`: enrich active ASPs with metrics (step 2), `_detect_all` gains `active_asps` param +
+  calls the detector. `report.py` `_PILLAR`: →Compute. Frontend `area.ts` already mapped it →Compute.
+- Tests: `find_asp_downsize_target` headroom cases + `detect_app_service_rightsizing` (grounded price
+  delta, skips busy/unmetered); registry bucket set updated. Backend **228 passing**.
+- REMAINING rightsizing (same pattern, NOT yet built): SQL DB, SQL MI (metric cpu_percent/vcore; SQL
+  vCore pricing + ladder), and disk Premium→Standard (needs per-disk IOPS metrics — different metric).
+
+### Post-ship 26 — SQL Database rightsizing detector (2026-07-31)
+Second of the rightsizing suite. Extra-cautious because SQL is stateful/performance-sensitive.
+- `kql.py`: `rightsizable_sql_databases_query()` (vCore GP/BC/Hyperscale, not DTU/serverless, online,
+  vCores>2); bucket `rightsizable_sql_databases`.
+- `metrics.py`: `enrich_sql_dbs_with_metrics` + `get_sql_db_utilisation` — peak `cpu_percent`,
+  `physical_data_read_percent`, `log_write_percent` (a SQL DB can be CPU-light but IO-bound, so all
+  three, not CPU alone).
+- `findings.py`: `_SQL_VCORE_LADDER` (GP/BC Gen5: 2..80), `find_sql_vcore_target` (smallest vCore < current
+  where EVERY measured peak × (current/target) ratio clears the 70% ceiling), `detect_sql_db_rightsizing`
+  (async). **Grounded-only** (returns [] if no cost_map — never guesses a downsize on a stateful DB);
+  saving = `actual cost × (removed vCores / current vCores)`, capped at actual (self-calibrating on the
+  real bill, no fragile SQL retail pricing needed). Confidence ×0.85 (extra caution). Reuses the resize
+  panel via current_sku/recommended_sku/current_vcpu. Category `sql_db_rightsizing`.
+- `assessment.py`: enrich SQL DBs (step 2), `_detect_all` gains `active_sql_dbs`. `report.py` _PILLAR
+  →Compute. Frontend `area.ts` already had `sql_db_rightsizing: "Databases"`.
+- Tests: ladder headroom cases, grounded saving (800×6/8=600, validated), requires-cost-data. Backend
+  **231 passing**. NOTE: the run-from-CAT-root gotcha caused a spurious 111-fail run; must `cd backend`.
+- REMAINING rightsizing: SQL Managed Instance (same pattern, MI `avg_cpu_percent` + vCores from
+  properties.vCores) and disk Premium→Standard (needs per-disk IOPS metrics — different metric).
+
+### Post-ship 27 — SQL MI + Disk Premium→Standard rightsizing (rightsizing suite COMPLETE, 2026-07-31)
+Finished the 4-detector rightsizing suite (ASP, SQL DB done in 25/26; MI + disk here).
+- **SQL MI** (`sql_mi_rightsizing`): `rightsizable_sql_managed_instances_query` (vCore, running, vCores>4);
+  `enrich_sql_mis_with_metrics` (peak `avg_cpu_percent` only — MI has no per-DB IO-percent metrics);
+  `find_sql_vcore_target` generalised to take a `ladder` param, MI uses `_SQL_MI_VCORE_LADDER` [4,8,16,24,
+  32,40,64,80]; `detect_sql_mi_rightsizing` — grounded-only, saving = actual×(removed/current) capped.
+- **Disk** (`disk_rightsizing`): metric names VERIFIED via MS Learn — `Composite Disk Read/Write
+  Operations/sec` + `Composite Disk Read/Write Bytes/sec` at the `microsoft.compute/disks` resource
+  level. `rightsizable_premium_disks_query` (attached Premium_LRS/ZRS, sizeGB>0); `enrich_disks_with_iops`
+  (peak IOPS=read+write ops, peak MB/s=read+write bytes/1e6, upper-bound = safe direction);
+  `detect_disk_rightsizing` — Premium→StandardSSD when peak IOPS≤350 AND peak MB/s≤42 (70% of Standard
+  SSD's ~500 IOPS/60 MB/s baseline; `_STANDARD_SSD_BASELINE_*` consts); saving = price(Premium,size) −
+  price(StandardSSD,size), capped at actual. Requires BOTH I/O signals (missing → skip; a wrong downgrade
+  throttles I/O). Report already had disk_rightsizing scaffolding (_DEDICATED + `_disk_sku_items`, Storage
+  pillar); area.ts already mapped it. Just added CATEGORY_DISPLAY.
+- Pipeline: `_detect_all` now takes `active_sql_mis` + `premium_disks`; both enriched in step 2.
+- Tests: MI ladder/CPU grounded test; disk premium→standard delta + skip-busy/unmetered. Backend **234
+  passing**; frontend build clean.
+- ALL FOUR rightsizing detectors now live: app_service_plan_rightsizing, sql_db_rightsizing,
+  sql_mi_rightsizing, disk_rightsizing. CAVEAT for the real run: disk metrics are resource-level and
+  aggregation support can vary — if disk findings never appear, the metric may only emit on the VM; if
+  they do appear, spot-check IOPS against the portal. All grounded/capped, conservative 70% ceilings.
+
+### Post-ship 28 — disk rightsizing latency safety + dismiss button wired (2026-07-31)
+User caught a real flaw in the disk detector + asked to finish the dismiss button.
+- **Disk latency safety**: low IOPS ≠ safe to downgrade — SQL/DBs need Premium's low, consistent LATENCY
+  even at trivial IOPS (a SQL log disk commits txns on it), which the IOPS/throughput check missed. Fix:
+  (1) `sql_virtual_machines_query()` → SQL-VM VM ids (bucket `sql_virtual_machines`); premium-disk query
+  now projects `managedBy` (owning VM); `detect_disk_rightsizing(disks, exclude_vm_ids)` skips disks on
+  SQL VMs; `_detect_all` builds sql_vm_ids and passes them. (2) Recommendation now carries an explicit
+  "NOT for latency-sensitive workloads (databases/logs need Premium even at low IOPS) — verify the
+  workload first" caveat for the undetectable cases. Test: SQL-VM disk excluded.
+- **Dismiss button** (backend API + model already existed): exposed `dismissed` on `FindingResponse`
+  schema + frontend `Finding` type. Dismiss endpoint now **re-rolls assessment totals** from surviving
+  findings (total_savings_monthly/annual + findings_count) so the headline stays consistent (captured
+  `assessment` from `_owned_assessment`). Frontend: `RecommendationCard` gains `assessmentId` + a
+  "Dismiss" button (useMutation → api.dismissFinding → invalidate ["assessment", id]); `AssessmentDashboard`
+  filters `!f.dismissed` at source so every view (rollups/donut/area/list) drops it. Test: dismiss sets
+  flag + zeroes totals + response shows dismissed:true.
+- Backend **235 passing**; frontend build clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD

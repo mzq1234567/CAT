@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from app.models.db import Finding
+from app.services import assessment as pipeline
+from app.services import estimates
+from app.services.currency import from_usd
 from app.services.findings import (
     FindingsEngine,
     build_advisor_index,
@@ -33,19 +36,32 @@ DEFAULT_WIN = {"Standard_D2s_v3": 137.24, "Standard_D16s_v3": 900.0}
 class FakePricing:
     """Deterministic stand-in for PricingEngine (no network). VM price is per-SKU so the engine's
     'price current vs price target' downsize math can be tested against real deltas."""
-    def __init__(self, disk=19.71, pip=3.65, vm_prices=None, ri=None, sp=None, win=None):
+    def __init__(self, disk=19.71, pip=3.65, vm_prices=None, ri=None, sp=None, win=None, currency="USD"):
         self.disk = disk
         self.pip = pip
         self.vm_prices = dict(DEFAULT_VM_PRICES if vm_prices is None else vm_prices)
         self.ri = dict(DEFAULT_RI if ri is None else ri)
         self.sp = dict(DEFAULT_SP if sp is None else sp)
         self.win = dict(DEFAULT_WIN if win is None else win)
+        self.currency = currency  # flat-rate methods return in this currency (like the real engine)
 
     async def get_managed_disk_monthly_price(self, region, sku, size):
         return self.disk
 
     async def get_public_ip_monthly_price(self, region, sku="Standard"):
         return self.pip
+
+    async def get_load_balancer_monthly_price(self, region):
+        return from_usd(estimates.LOAD_BALANCER_MONTHLY_USD, self.currency)
+
+    async def get_nat_gateway_monthly_price(self, region):
+        return from_usd(estimates.NAT_GATEWAY_MONTHLY_USD, self.currency)
+
+    async def get_bastion_monthly_price(self, region, sku="Basic"):
+        return from_usd(estimates.BASTION_MONTHLY_USD, self.currency)
+
+    async def get_app_service_plan_monthly_price(self, region, sku):
+        return from_usd(estimates.APP_SERVICE_PLAN_MONTHLY_USD.get((sku or "").lower(), 0.0), self.currency)
 
     async def get_vm_monthly_price(self, region, sku):
         return self.vm_prices.get(sku)
@@ -96,8 +112,8 @@ def test_severity_bands_are_currency_normalised():
 
 async def test_orphan_estimate_converts_to_billing_currency():
     # The $32/mo NAT-gateway estimate must read as ~₹2,667 (not ₹32) on an INR assessment.
-    engine = FindingsEngine(pricing=FakePricing(), currency="INR")
-    f = engine.detect_orphans("idle_nat_gateways", [{"id": "/s/nat", "name": "nat"}])[0]
+    engine = FindingsEngine(pricing=FakePricing(currency="INR"), currency="INR")
+    f = (await engine.detect_orphans("idle_nat_gateways", [{"id": "/s/nat", "name": "nat"}]))[0]
     assert f["estimated_savings_monthly"] == round(32.0 / 0.012, 2)   # USD → INR
     assert f["severity"] == "medium"                                   # ~$32 → medium, not critical
 
@@ -364,21 +380,47 @@ async def test_commitment_burstable_falls_back_to_savings_plan():
 # ── Windows Azure Hybrid Benefit (aggregated into one finding) ───────────────────
 
 async def test_windows_ahb_aggregates_eligible_vms():
+    # Consistent per-vCore prices (33.58/vCore): D2s_v3 (2) → 67.16, D16s_v3 (16) → 537.28.
+    pricing = FakePricing(
+        vm_prices={"Standard_D2s_v3": 70.08, "Standard_D16s_v3": 560.64},
+        win={"Standard_D2s_v3": 137.24, "Standard_D16s_v3": 1097.92},
+    )
     vms = [
-        _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/vm-a"),   # win 137.24, linux 70.08 → 67.16
-        _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/vm-b"),  # win 900, linux 560.64 → 339.36
+        _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/vm-a"),
+        _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/vm-b"),
     ]
     for i, vm in enumerate(vms):
         vm["name"] = f"win-{i}"
-    engine = FindingsEngine(pricing=FakePricing())
-    out = await engine.detect_windows_ahb(vms)
+    out = await FindingsEngine(pricing=pricing).detect_windows_ahb(vms)
     assert len(out) == 1                       # ONE classified finding, not one per VM
     f = out[0]
     assert f["category"] == "windows_ahb"
     assert f["resource_id"] is None            # resource-less → escapes per-resource dedupe
-    assert f["estimated_savings_monthly"] == round(67.16 + 339.36, 2)
+    assert f["estimated_savings_monthly"] == round(67.16 + 537.28, 2)
     assert f["details"]["eligible_count"] == 2
-    assert len(f["details"]["eligible_vms"]) == 2
+
+
+async def test_windows_ahb_median_corrects_a_bad_price_fetch():
+    # The Windows licence is a flat per-vCore charge, so it must be identical per vCore on every VM.
+    # Two VMs price correctly (33.58/vCore); a third (like some B-series) returns a Windows price
+    # barely above Linux — a bad fetch. The fleet MEDIAN must correct it, not understate its AHB.
+    pricing = FakePricing(
+        vm_prices={"Standard_D2s_v3": 70.08, "Standard_D4s_v3": 140.16, "Standard_B2ms": 60.0},
+        win={"Standard_D2s_v3": 137.24,     # (137.24-70.08)/2  = 33.58/vCore  (good)
+             "Standard_D4s_v3": 274.48,     # (274.48-140.16)/4 = 33.58/vCore  (good)
+             "Standard_B2ms": 65.0},        # (65-60)/2 = 2.5/vCore            (bad fetch)
+    )
+    vms = []
+    for i, sku in enumerate(("Standard_D2s_v3", "Standard_D4s_v3", "Standard_B2ms")):
+        vm = _vm(max_cpu=40.0, sku=sku, rid=f"/s/vm-{i}")
+        vm["name"] = f"win-{i}"
+        vms.append(vm)
+    out = await FindingsEngine(pricing=pricing).detect_windows_ahb(vms)
+    items = {v["name"]: v for v in out[0]["details"]["eligible_vms"]}
+    # B2ms's bad fetch alone would give ~₹5; the median corrects it to the fleet per-vCore rate.
+    assert items["win-2"]["licence_charge"] > 50
+    # Every VM ends up at the SAME per-vCore licence — that's the whole point of the fix.
+    assert len({round(v["licence_charge"] / v["vcpu"], 1) for v in items.values()}) == 1
 
 
 async def test_windows_ahb_empty_when_no_eligible_vms():
@@ -430,6 +472,161 @@ async def test_windows_ahb_excludes_deleted_vms():
     engine = FindingsEngine(pricing=FakePricing())  # no cost_map → retail path, both otherwise eligible
     out = await engine.detect_windows_ahb([keep, dele], exclude_ids={"/s/idle"})
     assert [v["name"] for v in out[0]["details"]["eligible_vms"]] == ["keep"]
+
+
+def test_deallocated_vm_quantifies_attached_disk_cost():
+    # A stopped VM's disks keep billing; deleting the VM+disks saves their real cost (from Cost Mgmt).
+    disk_os = "/subscriptions/s/rg/providers/microsoft.compute/disks/osdisk"
+    disk_data = "/subscriptions/s/rg/providers/microsoft.compute/disks/datadisk"
+    vm = {
+        "id": "/s/vm-dealloc", "name": "old-vm", "subscriptionId": "s", "location": "eastus",
+        "vmSize": "Standard_D2s_v3", "powerState": "VM deallocated",
+        "osDiskId": disk_os, "dataDisks": [{"managedDisk": {"id": disk_data}}],
+    }
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={disk_os.lower(): 12.5, disk_data.lower(): 30.0})
+    out = engine.detect_deallocated_vms([vm])
+    assert len(out) == 1
+    f = out[0]
+    assert f["category"] == "deallocated_vms"
+    assert f["estimated_savings_monthly"] == 42.5          # 12.5 + 30.0 (the two attached disks)
+    assert f["validation_status"] == "validated"           # grounded in the disks' actual cost
+    assert f["details"]["attached_disk_count"] == 2
+    assert f["details"]["disk_monthly_cost"] == 42.5
+
+
+def test_deallocated_vm_is_zero_without_cost_data():
+    # No per-resource billing → can't quantify the disk cost → 0 (dropped by the zero-savings filter).
+    vm = {"id": "/s/vm", "name": "vm", "vmSize": "Standard_D2s_v3", "powerState": "VM deallocated",
+          "osDiskId": "/s/disk", "dataDisks": []}
+    f = FindingsEngine(pricing=FakePricing()).detect_deallocated_vms([vm])[0]
+    assert f["estimated_savings_monthly"] == 0.0
+
+
+def test_asp_downsize_target_respects_headroom():
+    from app.services.findings import find_asp_downsize_target
+    # S3 (4 cores) @ 12% CPU / 15% mem → S1: projected 48% CPU, 60% mem ≤ 70% → smallest safe = S1.
+    assert find_asp_downsize_target("S3", 12.0, 15.0)[0] == "s1"
+    # @ 25% CPU, S1 would project 100% (unsafe) → next up S2 (50%) is the smallest safe.
+    assert find_asp_downsize_target("S3", 25.0, 10.0)[0] == "s2"
+    assert find_asp_downsize_target("S2", 60.0, 20.0) is None   # busy → no downsize
+    assert find_asp_downsize_target("S1", 5.0, 5.0) is None     # already smallest in series
+    assert find_asp_downsize_target("Y99", 5.0, 5.0) is None    # unknown SKU
+
+
+async def test_detect_app_service_rightsizing_grounded_in_price_delta():
+    engine = FindingsEngine(pricing=FakePricing())
+    plan = {"id": "/s/asp-1", "name": "web-plan", "subscriptionId": "s", "location": "eastus",
+            "skuName": "S3", "max_cpu_pct": 12.0, "max_memory_pct": 15.0,
+            "metric_datapoints": 30, "metric_window_days": 30}
+    out = await engine.detect_app_service_rightsizing([plan])
+    assert len(out) == 1
+    f = out[0]
+    assert f["category"] == "app_service_plan_rightsizing"
+    assert f["estimated_savings_monthly"] == round(227.76 - 56.94, 2)  # S3 → S1 price delta
+    assert f["details"]["current_sku"] == "S3" and f["details"]["recommended_sku"] == "s1"
+
+
+async def test_app_service_rightsizing_skips_busy_and_unmetered():
+    engine = FindingsEngine(pricing=FakePricing())
+    busy = {"id": "/s/a", "skuName": "S2", "location": "eastus", "max_cpu_pct": 65.0,
+            "max_memory_pct": 30.0, "metric_datapoints": 30}
+    unmetered = {"id": "/s/b", "skuName": "S3", "location": "eastus", "max_cpu_pct": None,
+                 "metric_datapoints": 0}
+    assert await engine.detect_app_service_rightsizing([busy, unmetered]) == []
+
+
+def test_sql_vcore_target_needs_all_metrics_under_ceiling():
+    from app.services.findings import find_sql_vcore_target
+    # 8 vCores, all peaks ~15% → 2 vCores projects 60% ≤ 70% → smallest safe = 2.
+    assert find_sql_vcore_target(8, [15.0, 12.0, 10.0]) == 2
+    # log IO 40% blocks the 4x jump to 2 (would be 160%); 4 vCores (2x → 80%) also fails; none safe?
+    # 40 at 8→4 (×2)=80>70 fail; 8→6(×1.33)=53<=70 but data/cpu must also clear: cpu 20×1.33=27 ok → 6.
+    assert find_sql_vcore_target(8, [20.0, 20.0, 40.0]) == 6
+    assert find_sql_vcore_target(4, [50.0, 10.0, 10.0]) is None   # CPU too high to shrink
+    assert find_sql_vcore_target(2, [5.0, 5.0, 5.0]) is None      # already smallest
+    assert find_sql_vcore_target(8, [None, None, None]) is None   # no metrics at all
+
+
+async def test_detect_sql_db_rightsizing_grounded_in_actual_cost():
+    rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={rid.lower(): 800.0})
+    db = {"id": rid, "name": "db1", "subscriptionId": "s", "location": "eastus",
+          "tier": "GeneralPurpose", "skuName": "GP_Gen5", "vcores": 8,
+          "max_cpu_pct": 12.0, "max_data_io_pct": 10.0, "max_log_io_pct": 8.0,
+          "metric_datapoints": 30, "metric_window_days": 30}
+    out = await engine.detect_sql_db_rightsizing([db])
+    assert len(out) == 1
+    f = out[0]
+    assert f["category"] == "sql_db_rightsizing"
+    # 8 → 2 vCores; saving = 800 × (8-2)/8 = 600, grounded in the DB's real bill.
+    assert f["estimated_savings_monthly"] == 600.0
+    assert f["validation_status"] == "validated"
+    assert f["details"]["current_vcpu"] == 8 and f["details"]["recommended_vcpu"] == 2
+
+
+async def test_sql_db_rightsizing_requires_cost_data():
+    # No Cost Management data → we don't guess a downsize on a stateful DB.
+    db = {"id": "/s/db", "tier": "GeneralPurpose", "skuName": "GP_Gen5", "vcores": 8,
+          "max_cpu_pct": 5.0, "max_data_io_pct": 5.0, "max_log_io_pct": 5.0, "metric_datapoints": 30}
+    assert await FindingsEngine(pricing=FakePricing()).detect_sql_db_rightsizing([db]) == []
+
+
+async def test_detect_disk_rightsizing_premium_to_standard():
+    # FakePricing.disk is flat 19.71 for any sku/size, so premium−standard would be 0 → give a pricier
+    # premium via a custom fake to exercise the delta.
+    class DiskFake(FakePricing):
+        async def get_managed_disk_monthly_price(self, region, sku, size):
+            return 40.0 if "premium" in sku.lower() else 12.0
+    disk = {"id": "/s/disk-1", "name": "data-1", "subscriptionId": "s", "location": "eastus",
+            "skuName": "Premium_LRS", "sizeGB": 256,
+            "peak_iops": 120.0, "peak_mbps": 15.0, "metric_datapoints": 30, "metric_window_days": 30}
+    out = await FindingsEngine(pricing=DiskFake()).detect_disk_rightsizing([disk])
+    assert len(out) == 1
+    f = out[0]
+    assert f["category"] == "disk_rightsizing"
+    assert f["estimated_savings_monthly"] == round(40.0 - 12.0, 2)   # 28.0
+    assert f["details"]["recommended_sku"] == "StandardSSD_LRS"
+
+
+async def test_disk_rightsizing_skips_busy_and_unmetered():
+    class DiskFake(FakePricing):
+        async def get_managed_disk_monthly_price(self, region, sku, size):
+            return 40.0 if "premium" in sku.lower() else 12.0
+    busy = {"id": "/s/a", "skuName": "Premium_LRS", "location": "eastus", "sizeGB": 128,
+            "peak_iops": 900.0, "peak_mbps": 20.0, "metric_datapoints": 30}   # IOPS > 350 → skip
+    unmetered = {"id": "/s/b", "skuName": "Premium_LRS", "location": "eastus", "sizeGB": 128,
+                 "peak_iops": None, "peak_mbps": None, "metric_datapoints": 0}
+    assert await FindingsEngine(pricing=DiskFake()).detect_disk_rightsizing([busy, unmetered]) == []
+
+
+async def test_disk_rightsizing_excludes_sql_vm_disks():
+    # A low-IOPS Premium disk that would otherwise be flagged, but it's attached to a SQL VM → SQL needs
+    # Premium's latency even at low IOPS, so it must NOT be recommended for downgrade.
+    class DiskFake(FakePricing):
+        async def get_managed_disk_monthly_price(self, region, sku, size):
+            return 40.0 if "premium" in sku.lower() else 12.0
+    vm_id = "/subscriptions/s/rg/providers/microsoft.compute/virtualmachines/sqlvm"
+    disk = {"id": "/s/sqldisk", "skuName": "Premium_LRS", "location": "eastus", "sizeGB": 256,
+            "managedBy": vm_id, "peak_iops": 80.0, "peak_mbps": 10.0, "metric_datapoints": 30}
+    out = await FindingsEngine(pricing=DiskFake()).detect_disk_rightsizing(
+        [disk], exclude_vm_ids={vm_id.lower()})
+    assert out == []
+
+
+async def test_detect_sql_mi_rightsizing_uses_mi_ladder_and_cpu():
+    rid = "/subscriptions/s/rg/providers/microsoft.sql/managedinstances/mi1"
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={rid.lower(): 2000.0})
+    mi = {"id": rid, "name": "mi1", "subscriptionId": "s", "location": "eastus",
+          "tier": "GeneralPurpose", "skuName": "GP_Gen5", "vcores": 16,
+          "max_cpu_pct": 12.0, "metric_datapoints": 30, "metric_window_days": 30}
+    out = await engine.detect_sql_mi_rightsizing([mi])
+    assert len(out) == 1
+    f = out[0]
+    assert f["category"] == "sql_mi_rightsizing"
+    # MI ladder: 16 → 4 (ratio 4 → 48% ≤ 70%). saving = 2000 × (16-4)/16 = 1500.
+    assert f["details"]["recommended_vcpu"] == 4
+    assert f["estimated_savings_monthly"] == 1500.0
+    assert f["validation_status"] == "validated"
 
 
 async def test_windows_ahb_grounds_saving_in_actual_cost():
@@ -502,9 +699,9 @@ async def test_commitment_strips_windows_licence_from_base():
 
 async def test_backup_redundancy_rule():
     engine = FindingsEngine(pricing=FakePricing())
-    f = engine.detect_orphans("geo_redundant_vaults", [
+    f = (await engine.detect_orphans("geo_redundant_vaults", [
         {"id": "/s/vault-1", "name": "vault-1", "subscriptionId": "sub-1", "resourceGroup": "rg-a"},
-    ])[0]
+    ]))[0]
     assert f["category"] == "backup_redundancy"
     assert f["estimated_savings_monthly"] == 25.0
 
@@ -518,34 +715,34 @@ def _row(rid, **extra):
 
 async def test_orphan_snapshot_priced_by_size():
     engine = FindingsEngine(pricing=FakePricing())
-    f = engine.detect_orphans("orphaned_snapshots", [_row("/s/snap-1", diskSizeGB=200)])[0]
+    f = (await engine.detect_orphans("orphaned_snapshots", [_row("/s/snap-1", diskSizeGB=200)]))[0]
     assert f["category"] == "orphaned_snapshots"
     assert f["estimated_savings_monthly"] == round(200 * 0.05, 2)  # 10.0
 
 
 async def test_empty_load_balancer_fixed_estimate():
     engine = FindingsEngine(pricing=FakePricing())
-    f = engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1", skuName="Standard")])[0]
+    f = (await engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1", skuName="Standard")]))[0]
     assert f["category"] == "empty_load_balancers"
     assert f["estimated_savings_monthly"] == 18.0
 
 
 async def test_idle_nat_gateway_fixed_estimate():
     engine = FindingsEngine(pricing=FakePricing())
-    f = engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")])[0]
+    f = (await engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")]))[0]
     assert f["category"] == "idle_nat_gateways"
     assert f["estimated_savings_monthly"] == 32.0
 
 
 async def test_orphan_finding_keys_match_model():
     engine = FindingsEngine(pricing=FakePricing())
-    f = engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")])[0]
+    f = (await engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")]))[0]
     assert set(f.keys()) <= FINDING_COLUMNS
 
 
 async def test_unknown_orphan_bucket_returns_empty():
     engine = FindingsEngine(pricing=FakePricing())
-    assert engine.detect_orphans("not_a_bucket", [_row("/s/x")]) == []
+    assert await engine.detect_orphans("not_a_bucket", [_row("/s/x")]) == []
 
 
 # ── Advisor correlation + validation ────────────────────────────────────────────
@@ -572,6 +769,60 @@ async def test_advisor_finding_and_correlation_index():
     assert f["category"] == "advisor_cost"
     assert f["advisor_recommendation_id"] == "ADV-1"
     assert f["severity"] == "high"  # 120/mo is the 100–300 "high" band
+
+
+async def test_sql_ahb_grounds_on_vcores_capped_at_actual_cost():
+    from app.services.findings import SQL_AHB_LICENCE_PER_VCORE_MONTHLY_USD as PVC
+    db_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
+    mi_rid = "/subscriptions/s/rg/providers/microsoft.sql/managedinstances/mi1"
+    tiny_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/tiny"
+    # db: 8 vCores × 112 = 896 < 2000 actual → 896. mi: 16 × 112 = 1792 < 5000 → 1792.
+    # tiny: 4 × 112 = 448 but actual only 100 → capped to 100 (can't save more than you pay).
+    cost_map = {db_rid.lower(): 2000.0, mi_rid.lower(): 5000.0, tiny_rid.lower(): 100.0}
+    engine = FindingsEngine(pricing=FakePricing(), cost_map=cost_map)
+    resources = [
+        {"id": db_rid, "name": "db1", "subscriptionId": "s", "location": "eastus",
+         "skuName": "GP_Gen5", "tier": "GeneralPurpose", "vcores": 8},
+        {"id": mi_rid, "name": "mi1", "subscriptionId": "s", "location": "eastus",
+         "skuName": "GP_Gen5", "tier": "GeneralPurpose", "vcores": 16},
+        {"id": tiny_rid, "name": "tiny", "subscriptionId": "s", "location": "eastus",
+         "skuName": "GP_Gen5", "tier": "GeneralPurpose", "vcores": 4},
+    ]
+    out = await engine.detect_sql_ahb(resources)
+    assert len(out) == 1
+    f = out[0]
+    assert f["category"] == "sql_ahb"
+    assert f["details"]["eligible_count"] == 3
+    assert f["details"]["licence_kind"] == "SQL Server"
+    assert f["estimated_savings_monthly"] == round(8 * PVC + 16 * PVC + 100.0, 2)
+    assert f["validation_status"] == "validated"  # every one grounded in actual cost
+
+
+async def test_sql_ahb_skips_non_billing_and_excluded():
+    db_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
+    dead_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/dead"
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={db_rid.lower(): 2000.0})
+    resources = [
+        {"id": db_rid, "name": "db1", "vcores": 8, "skuName": "GP_Gen5", "location": "eastus"},
+        {"id": dead_rid, "name": "dead", "vcores": 8, "skuName": "GP_Gen5", "location": "eastus"},
+    ]
+    # dead has no measured cost → skipped; db1 is excluded (e.g. paused) → nothing left.
+    out = await engine.detect_sql_ahb(resources, exclude_ids={db_rid.lower()})
+    assert out == []
+
+
+async def test_zero_savings_findings_are_filtered_from_pipeline():
+    """A ₹0/$0 finding (e.g. an Advisor cost rec Azure returns with no savings figure) is noise in a
+    savings report — the pipeline must drop it before persisting, keeping only real opportunities."""
+    recs = [
+        _advisor_rec(VM_RID, monthly=0.0, rec_id="ADV-ZERO"),   # no quantified saving → drop
+        _advisor_rec(DISK_RID, monthly=50.0, rec_id="ADV-KEEP"),  # real saving → keep
+    ]
+    engine = FindingsEngine(pricing=FakePricing(), advisor_index=build_advisor_index(recs))
+    out = await pipeline._detect_all(engine, {}, [], recs)
+    kept = {f["advisor_recommendation_id"] for f in out}
+    assert kept == {"ADV-KEEP"}
+    assert all((f.get("estimated_savings_monthly") or 0) > 0 for f in out)
 
 
 async def test_inventory_finding_correlates_with_advisor_id():

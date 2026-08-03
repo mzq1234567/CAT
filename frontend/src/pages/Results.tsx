@@ -5,7 +5,6 @@ import {
 import { alpha, keyframes } from "@mui/material/styles";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import TableChartIcon from "@mui/icons-material/TableChart";
 import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
 import CloudSyncIcon from "@mui/icons-material/CloudSync";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
@@ -136,7 +135,7 @@ export default function Results() {
   const assessmentId = parseInt(id!, 10);
   const api = useApi();
   const navigate = useNavigate();
-  const [downloading, setDownloading] = React.useState<"pdf" | "excel" | null>(null);
+  const [downloading, setDownloading] = React.useState(false);
 
   const { data: assessment, error } = useQuery({
     queryKey: ["assessment", assessmentId],
@@ -147,12 +146,12 @@ export default function Results() {
     },
   });
 
-  const handleDownload = async (format: "pdf" | "excel") => {
-    setDownloading(format);
+  const handleDownload = async () => {
+    setDownloading(true);
     try {
-      await api.downloadReport(assessmentId, format);
+      await api.downloadReport(assessmentId);
     } finally {
-      setDownloading(null);
+      setDownloading(false);
     }
   };
 
@@ -197,28 +196,14 @@ export default function Results() {
 
   const actions =
     assessment.status === "completed" ? (
-      <>
-        <Button
-          variant="outlined"
-          color="inherit"
-          startIcon={downloading === "pdf" ? <CircularProgress size={16} /> : <PictureAsPdfIcon />}
-          onClick={() => handleDownload("pdf")}
-          disabled={downloading !== null}
-          sx={{ borderColor: colors.border, color: colors.textSecondary }}
-        >
-          Download PDF
-        </Button>
-        <Button
-          variant="contained"
-          startIcon={
-            downloading === "excel" ? <CircularProgress size={16} color="inherit" /> : <TableChartIcon />
-          }
-          onClick={() => handleDownload("excel")}
-          disabled={downloading !== null}
-        >
-          Download Excel
-        </Button>
-      </>
+      <Button
+        variant="contained"
+        startIcon={downloading ? <CircularProgress size={16} color="inherit" /> : <PictureAsPdfIcon />}
+        onClick={handleDownload}
+        disabled={downloading}
+      >
+        Download PDF
+      </Button>
     ) : undefined;
 
   return (

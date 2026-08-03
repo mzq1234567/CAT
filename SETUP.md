@@ -77,4 +77,4 @@ Add `https://your-app.azurewebsites.net` as a redirect URI in the App Registrati
 3. Backend starts background task; returns assessment ID immediately
 4. Frontend polls every 4 s until status = `completed`
 5. Results page shows summary cards + filterable findings table
-6. User downloads PDF or Excel report
+6. User downloads PDF report

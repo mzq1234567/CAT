@@ -276,12 +276,72 @@ def parse_monthly_history(payload: Dict[str, Any]) -> Dict[str, list]:
     return {rid: [c for _, c in sorted(ps, key=lambda p: p[0])] for rid, ps in pairs.items()}
 
 
+def parse_monthly_totals(payload: Dict[str, Any]) -> Dict[str, float]:
+    """Monthly-granularity response → `{month_label: total_spend_that_month}` (summed over resources).
+
+    Keeping the month LABEL (not just a positional list) lets several subscriptions be merged with
+    their months aligned, which the report's spend-trend / growth projection relies on.
+    """
+    props = payload.get("properties", {})
+    columns = [c.get("name") for c in props.get("columns", [])]
+    cost_idx = columns.index("Cost") if "Cost" in columns else 0
+    month_idx = next((columns.index(n) for n in ("BillingMonth", "UsageDate", "BillingPeriod")
+                      if n in columns),
+                     next((i for i, n in enumerate(columns)
+                           if n not in ("Cost", "ResourceId", "Currency")), None))
+    if month_idx is None:
+        return {}
+    totals: Dict[str, float] = {}
+    for row in props.get("rows", []):
+        if cost_idx >= len(row) or month_idx >= len(row):
+            continue
+        try:
+            cost = float(row[cost_idx] or 0)
+        except (TypeError, ValueError):
+            continue
+        month = str(row[month_idx])
+        totals[month] = totals.get(month, 0.0) + cost
+    return totals
+
+
+def linear_growth_rate(monthly_totals: List[float], min_months: int = 3,
+                       max_rate: float = 1.0) -> Optional[float]:
+    """Annual growth rate from a best-fit straight line through monthly spend (oldest → newest).
+
+    A least-squares line uses every month and ignores a single one-off spike, so it reflects the real
+    trend better than comparing two months. The slope (₹/month increase) is annualised against the
+    line's current monthly value → a yearly growth fraction (e.g. 0.12 = +12 %/yr).
+
+    Returns None when there's too little history to draw a trend (< `min_months` complete months),
+    so the caller can hide the trend-based charts rather than guess. A flat or declining trend returns
+    0.0 (no invented growth); the rate is clamped to [0, `max_rate`] to keep projections sane.
+    """
+    n = len(monthly_totals)
+    if n < min_months:
+        return None
+    xs = list(range(n))
+    x_mean = sum(xs) / n
+    y_mean = sum(monthly_totals) / n
+    denom = sum((x - x_mean) ** 2 for x in xs)
+    if denom == 0:
+        return None
+    slope = sum((xs[i] - x_mean) * (monthly_totals[i] - y_mean) for i in range(n)) / denom
+    latest_fitted = y_mean + slope * (n - 1 - x_mean)  # the line's value at the most recent month
+    if latest_fitted <= 0:
+        return 0.0
+    rate = (slope * 12) / latest_fitted
+    if rate <= 0:
+        return 0.0
+    return round(min(rate, max_rate), 4)
+
+
 async def get_cost_map_and_consistency(
     client: AzureClient, subscription_id: str, months: int = 4, now: Optional[datetime] = None,
-) -> tuple[Dict[str, float], Dict[str, Dict]]:
-    """One monthly-history query → BOTH the last-month cost basis AND month-over-month consistency.
+) -> tuple[Dict[str, float], Dict[str, Dict], Dict[str, float]]:
+    """One monthly-history query → the last-month cost basis, month-over-month consistency, AND the
+    per-month spend totals (for the report's growth trend).
 
-    Reading both from a single Cost Management call (instead of two) halves the load on the heavily
+    Reading these from a single Cost Management call (instead of several) keeps load off the heavily
     throttled billing API. `cost_map` = each resource's most recent complete month; if that's empty
     (brand-new subscription) it falls back to month-to-date so cost data is never lost.
     """
@@ -289,12 +349,13 @@ async def get_cost_map_and_consistency(
         subscription_id, build_monthly_history_query(months=months, now=now))
     history = parse_monthly_history(payload)
     consistency = cost_consistency(history)
+    monthly_totals = parse_monthly_totals(payload)
     cost_map = {rid: costs[-1] for rid, costs in history.items() if costs and costs[-1] > 0}
     if not cost_map:  # new subscription with no complete month → current month so far
         mtd = await client.query_cost_management(
             subscription_id, build_cost_query(now=now, month_to_date=True))
         cost_map = parse_cost_rows(mtd)
-    return cost_map, consistency
+    return cost_map, consistency, monthly_totals
 
 
 def cost_consistency(history: Dict[str, list], min_stable_months: int = 2,

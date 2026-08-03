@@ -29,6 +29,7 @@ const CATEGORY_TO_AREA: Record<string, Area> = {
   // Databases
   paused_sql_databases: "Databases",
   stopped_sql_managed_instances: "Databases",
+  sql_ahb: "Databases",
   sql_db_reserved_capacity: "Databases",
   sql_mi_reserved_capacity: "Databases",
   sql_db_rightsizing: "Databases",

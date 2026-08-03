@@ -22,12 +22,19 @@ from .cost_management import (
     NEEDS_REVIEW,
     get_cost_map_and_consistency,
     get_service_costs_and_currency,
+    linear_growth_rate,
     spend_by_area,
 )
 from .findings import ORPHAN_RULES, FindingsEngine, build_advisor_index
 from .inventory import collect_inventory
 from .kql import all_resources_summary_query
-from .metrics import enrich_vms_with_metrics
+from .metrics import (
+    enrich_asps_with_metrics,
+    enrich_disks_with_iops,
+    enrich_sql_dbs_with_metrics,
+    enrich_sql_mis_with_metrics,
+    enrich_vms_with_metrics,
+)
 from .pricing import get_pricing_engine
 from .reservations import parse_reservation_recommendations
 from .state_machine import AssessmentState, ProgressTracker
@@ -59,9 +66,16 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         # Cosmetic report metadata (client name, subscription names) — best-effort, never fatal.
         await _capture_report_metadata(db, assessment_id, client, subscription_ids, major_types)
 
-        # 2. Utilisation metrics for running VM candidates.
+        # 2. Utilisation metrics for running VM candidates + active App Service Plans.
         tracker.advance(AssessmentState.FETCHING_METRICS)
         running_vms = await enrich_vms_with_metrics(client, inventory.get("running_vms", []))
+        active_asps = await enrich_asps_with_metrics(client, inventory.get("active_app_service_plans", []))
+        active_sql_dbs = await enrich_sql_dbs_with_metrics(
+            client, inventory.get("rightsizable_sql_databases", []))
+        active_sql_mis = await enrich_sql_mis_with_metrics(
+            client, inventory.get("rightsizable_sql_managed_instances", []))
+        premium_disks = await enrich_disks_with_iops(
+            client, inventory.get("rightsizable_premium_disks", []))
 
         # 3. Azure Advisor cost recommendations + Azure's own reservation recommendations
         #    (both one call per subscription; the latter is the authoritative RI source).
@@ -76,7 +90,7 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.advance(AssessmentState.CALCULATING_PRICES)
         # One monthly-history query per sub yields BOTH the last-month cost basis and the
         # month-over-month steadiness signal (half the load on the throttled billing API).
-        cost_map, consistency = await _gather_cost_and_consistency(client, subscription_ids)
+        cost_map, consistency, growth = await _gather_cost_and_consistency(client, subscription_ids)
         service_costs, currency = await _gather_service_costs(client, subscription_ids)
         currency = currency or settings.pricing_currency
         pricing = get_pricing_engine(currency)
@@ -95,13 +109,15 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
             currency=currency,
         )
         findings = await _detect_all(
-            engine, inventory, running_vms, advisor_recs, reservation_recs
+            engine, inventory, running_vms, advisor_recs, reservation_recs, active_asps,
+            active_sql_dbs, active_sql_mis, premium_disks
         )
 
         # 6. Persist findings + roll up totals (incl. actual spend when available).
         tracker.advance(AssessmentState.GENERATING_REPORT)
         _persist_findings_and_totals(
-            db, assessment_id, findings, service_costs, total_resources, type_count, currency
+            db, assessment_id, findings, service_costs, total_resources, type_count, currency,
+            observed_growth=growth,
         )
 
         tracker.advance(AssessmentState.COMPLETED)
@@ -127,19 +143,29 @@ async def _gather_advisor(client: AzureClient, subscription_ids: List[str]) -> L
 
 
 async def _gather_cost_and_consistency(client: AzureClient, subscription_ids: List[str]):
-    """Merge (cost_map, consistency) across subscriptions from one monthly-history query each."""
+    """Merge (cost_map, consistency, growth) across subscriptions from one monthly-history query each.
+
+    `growth` is the environment's annual spend-growth rate from a best-fit line through the last
+    ~6 complete months (totals summed across all subscriptions, months aligned). None when there's
+    too little history to trend. Powers the report's Linear/Conservative growth projections.
+    """
     results = await asyncio.gather(
-        *(get_cost_map_and_consistency(client, s) for s in subscription_ids),
+        *(get_cost_map_and_consistency(client, s, months=6) for s in subscription_ids),
         return_exceptions=True,
     )
     cost_map: Dict[str, float] = {}
     consistency: Dict[str, Dict] = {}
+    combined_totals: Dict[str, float] = {}
     for r in results:
         if isinstance(r, tuple):
-            cm, cons = r
+            cm, cons, totals = r
             cost_map.update(cm)
             consistency.update(cons)
-    return cost_map, consistency
+            for month, amount in totals.items():
+                combined_totals[month] = combined_totals.get(month, 0.0) + amount
+    series = [combined_totals[m] for m in sorted(combined_totals)]
+    growth = linear_growth_rate(series)
+    return cost_map, consistency, growth
 
 
 async def _gather_reservation_recs(client: AzureClient, subscription_ids: List[str]) -> List[Dict]:
@@ -192,12 +218,24 @@ async def _gather_service_costs(client: AzureClient, subscription_ids: List[str]
     return totals, currency
 
 
-async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_recs=None) -> List[Dict]:
+async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_recs=None,
+                      active_asps=None, active_sql_dbs=None, active_sql_mis=None,
+                      premium_disks=None) -> List[Dict]:
     reservation_recs = reservation_recs or []
+    active_asps = active_asps or []
+    active_sql_dbs = active_sql_dbs or []
+    active_sql_mis = active_sql_mis or []
+    premium_disks = premium_disks or []
     findings: List[Dict] = []
     findings += await engine.detect_unattached_disks(inventory.get("unattached_disks", []))
     findings += await engine.detect_orphaned_public_ips(inventory.get("orphaned_public_ips", []))
-    findings += engine.detect_idle_app_service_plans(inventory.get("idle_app_service_plans", []))
+    findings += await engine.detect_idle_app_service_plans(inventory.get("idle_app_service_plans", []))
+    findings += await engine.detect_app_service_rightsizing(active_asps)
+    findings += await engine.detect_sql_db_rightsizing(active_sql_dbs)
+    findings += await engine.detect_sql_mi_rightsizing(active_sql_mis)
+    sql_vm_ids = {(r.get("vmId") or "").lower()
+                  for r in inventory.get("sql_virtual_machines", []) if r.get("vmId")}
+    findings += await engine.detect_disk_rightsizing(premium_disks, exclude_vm_ids=sql_vm_ids)
     findings += engine.detect_deallocated_vms(inventory.get("deallocated_vms", []))
     findings += engine.detect_paused_sql_databases(inventory.get("paused_sql_databases", []))
     findings += engine.detect_stopped_sql_managed_instances(
@@ -222,10 +260,22 @@ async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_
     # Windows AHB (licence, additive with reservations) — excludes VMs we'd delete (idle/stopped).
     findings += await engine.detect_windows_ahb(
         inventory.get("windows_vms_without_ahb", []), exclude_ids=delete_ids)
+    # SQL Server AHB — same idea for vCore SQL DB/MI; exclude paused/stopped SQL (no billable compute).
+    sql_delete_ids = {(db.get("id") or "").lower()
+                      for db in inventory.get("paused_sql_databases", []) if db.get("id")}
+    sql_delete_ids |= {(mi.get("id") or "").lower()
+                       for mi in inventory.get("stopped_sql_managed_instances", []) if mi.get("id")}
+    findings += await engine.detect_sql_ahb(
+        inventory.get("sql_ahb_eligible", []), exclude_ids=sql_delete_ids)
     # Broad-coverage rule-driven orphans (snapshots, empty LBs, NAT gw, GRS vaults…).
     for bucket in ORPHAN_RULES:
-        findings += engine.detect_orphans(bucket, inventory.get(bucket, []))
+        findings += await engine.detect_orphans(bucket, inventory.get(bucket, []))
     findings += engine.advisor_findings(advisor_recs)
+    # A cost report lists opportunities worth acting on — drop any finding with no quantified saving.
+    # Azure Advisor returns some "cost" recs without a savings figure (e.g. "disable Front Door health
+    # probes"), and a deallocated VM's residual disk cost isn't quantified here; both surface as ₹0.
+    # A zero-value line is noise in a client deliverable, so it's filtered out before dedupe/persist.
+    findings = [f for f in findings if (f.get("estimated_savings_monthly") or 0) > 0]
     return _dedupe(findings)
 
 
@@ -337,6 +387,7 @@ def _persist_inventory(db, assessment_id: int, inventory: Dict[str, List[Dict]])
 def _persist_findings_and_totals(
     db, assessment_id: int, findings: List[Dict], service_costs: Dict[str, float] | None = None,
     total_resources: int = 0, type_count: int = 0, currency: str | None = None,
+    observed_growth: float | None = None,
 ) -> None:
     total_monthly = 0.0
     total_annual = 0.0
@@ -353,6 +404,7 @@ def _persist_findings_and_totals(
     assessment.total_savings_monthly = round(total_monthly, 2)
     assessment.total_savings_annual = round(total_annual, 2)
     assessment.currency = (currency or "USD").upper()
+    assessment.observed_annual_growth = observed_growth
     assessment.findings_count = len(findings)
     assessment.needs_review_count = needs_review
     if total_resources:

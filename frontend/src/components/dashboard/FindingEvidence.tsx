@@ -56,9 +56,10 @@ interface EvidenceDetails {
   kind?: string;
   reservation_items?: ReservationItem[];
   total_3yr_monthly?: number | null;
-  // aggregated Windows AHB
+  // aggregated AHB (Windows VMs or SQL resources)
   eligible_vms?: EligibleVm[];
   eligible_count?: number;
+  licence_kind?: string; // "Windows Server" (default) | "SQL Server"
 }
 
 function Panel({ children }: { children: React.ReactNode }) {
@@ -276,6 +277,8 @@ export default function FindingEvidence({ finding }: { finding: Finding }) {
   const hasCommitment = options.length > 0;
   const eligible = (d.eligible_vms || []).filter((v) => (v.monthly_savings ?? 0) > 0);
   const hasAhbList = eligible.length > 0;
+  const ahbNoun = finding.category === "sql_ahb" ? "SQL resource" : "VM";
+  const ahbLicence = d.licence_kind || "Windows Server";
   const resItems = (d.reservation_items || []).filter((v) => (v.monthly_savings ?? 0) > 0);
   const hasResItems = resItems.length > 0;
   const commitKind = d.kind || "Reserved Instance";
@@ -364,11 +367,11 @@ export default function FindingEvidence({ finding }: { finding: Finding }) {
         <CommitmentPanel options={options} best={bestOption} items={resItems} kind={commitKind} d={d} />
       )}
 
-      {/* Aggregated Windows AHB — the list of eligible VMs behind the total */}
+      {/* Aggregated AHB — the list of eligible VMs / SQL resources behind the total */}
       {hasAhbList && (
         <Panel>
           <Heading icon={<LayersOutlinedIcon fontSize="small" />}>
-            {eligible.length} VM{eligible.length !== 1 ? "s" : ""} eligible for Azure Hybrid Benefit
+            {eligible.length} {ahbNoun}{eligible.length !== 1 ? "s" : ""} eligible for Azure Hybrid Benefit
           </Heading>
           <Box display="flex" flexDirection="column" gap={0.5}>
             {eligible.slice(0, 20).map((v, i) => (
@@ -398,12 +401,12 @@ export default function FindingEvidence({ finding }: { finding: Finding }) {
             ))}
             {eligible.length > 20 && (
               <Typography variant="caption" color={colors.textMuted} mt={0.5}>
-                +{eligible.length - 20} more eligible VMs
+                +{eligible.length - 20} more eligible {ahbNoun}s
               </Typography>
             )}
           </Box>
           <Typography variant="caption" color={colors.textMuted} mt={1} display="block">
-            Savings assume you hold eligible Windows Server licences with Software Assurance to apply.
+            Savings assume you hold eligible {ahbLicence} licences with Software Assurance to apply.
           </Typography>
         </Panel>
       )}

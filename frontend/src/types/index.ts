@@ -38,6 +38,7 @@ export interface Finding {
   validation_status: "validated" | "needs_review" | "unvalidated" | null;
   validation_variance_pct: number | null;
   actual_monthly_cost: number | null;
+  dismissed: boolean;
   // DEV-ONLY: populated only when backend DEBUG_FINDINGS_REASONING is enabled.
   debug_reason: string | null;
   details: Record<string, unknown> | null;
@@ -62,6 +63,8 @@ export interface AssessmentSummary {
   spend_by_area: Record<string, number> | null;
   cost_data_available: boolean;
   currency: string;
+  // Annual spend-growth rate from the recent trend (e.g. 0.12 = +12%/yr); null if too little history.
+  observed_annual_growth: number | null;
   error_message: string | null;
   created_at: string;
   snapshot_at: string | null;

@@ -1,12 +1,10 @@
 """
-Client-facing cost-assessment report (PDF) + workbook (Excel).
+Client-facing cost-assessment report (PDF).
 
 `generate_pdf` renders the branded TechPlus Talent template. The document's *copy and layout* live
 in `assets/report_template.yml`; this module only supplies the *data* — every figure, table row and
 chart series is derived from the assessment and its findings, so nothing in the report is
 hardcoded. Sections whose findings are absent are skipped rather than printed empty.
-
-`generate_excel` remains the detailed data workbook for analysts.
 """
 from __future__ import annotations
 
@@ -34,9 +32,6 @@ from reportlab.graphics.charts.barcharts import VerticalBarChart
 from reportlab.graphics.charts.legends import Legend
 
 from PIL import Image as PILImage
-
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
 
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 _TEMPLATE_PATH = os.path.join(_ASSET_DIR, "report_template.yml")
@@ -195,10 +190,12 @@ def _place(canvas, name: str, x: float, top: float, width: float = None,
 # Database-style commitments fold into Compute.
 _PILLAR = {
     "ri_vm": "Compute", "savings_plan_vm": "Compute", "windows_ahb": "Compute",
+    "sql_ahb": "Compute",
     "oversized_vms": "Compute", "idle_vms": "Compute", "deallocated_vms": "Compute",
     "vm_rightsizing": "Compute", "idle_app_service_plans": "Compute",
-    "app_service_reserved_capacity": "Compute",
+    "app_service_plan_rightsizing": "Compute", "app_service_reserved_capacity": "Compute",
     "paused_sql_databases": "Compute", "stopped_sql_managed_instances": "Compute",
+    "sql_db_rightsizing": "Compute", "sql_mi_rightsizing": "Compute",
     "sql_db_reserved_capacity": "Compute", "sql_mi_reserved_capacity": "Compute",
     "cosmos_reserved_capacity": "Compute", "mysql_reserved_capacity": "Compute",
     "unattached_managed_disks": "Storage", "orphaned_snapshots": "Storage",
@@ -364,6 +361,7 @@ def _context(assessment, findings: List) -> Dict:
         "no_spend": not spend,
         "_spend": spend or 0.0,
         "_savings": annual,
+        "_growth": getattr(assessment, "observed_annual_growth", None),
         "environment_rows": _environment_rows(assessment, findings),
         "ri_items": _ri_items(findings),
         "ahb_items": _ahb_items(findings),
@@ -425,12 +423,16 @@ def _styles(tpl: Dict) -> Dict[str, ParagraphStyle]:
 # ── Charts ──────────────────────────────────────────────────────────────────────────
 
 def _projection(spend: float, savings: float, growth: float):
-    """Cumulative 3-year (ACR, ACR-after-savings, savings) at annual growth rate `growth`."""
+    """Cumulative 3-year (ACR, ACR-after-savings, savings) at annual growth rate `growth`.
+
+    Growth is LINEAR (simple), not compounded — spend rises by the same amount each year, matching
+    the "Linear Growth" scenario name: year N spend = spend x (1 + growth*N).
+    """
     rate = (savings / spend) if spend else 0.0
     acr, after, saved = [], [], []
     c_acr = c_after = c_saved = 0.0
     for year in range(3):
-        annual = spend * ((1 + growth) ** year)
+        annual = spend * (1 + growth * year)
         s = annual * rate
         c_acr += annual
         c_saved += s
@@ -764,27 +766,54 @@ def _savings_panel(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float) ->
     return panel
 
 
+def _scenario_growth(scenario: Dict, measured: Optional[float]) -> Optional[float]:
+    """Resolve a scenario's annual growth rate. `measured` is the environment's own trend (or None).
+
+    A scenario tagged `growth_source: measured` uses that trend directly; `half_measured` uses half
+    of it (the Conservative view). Returns None to SKIP the scenario — used when a trend-based chart
+    has no measured growth to draw on (too little billing history), so we hide it rather than guess.
+    Untagged scenarios keep their fixed `growth` (e.g. Fixed 0 %, the Civo 25 % hypothetical).
+    """
+    source = scenario.get("growth_source")
+    if source == "measured":
+        return measured
+    if source == "half_measured":
+        return round(measured / 2, 4) if measured is not None else None
+    return float(scenario.get("growth", 0))
+
+
 def _projection_blocks(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float) -> List:
-    """One framed chart + caption per scenario, page-broken every `per_page`."""
+    """One framed chart + caption per scenario, page-broken every `per_page`.
+
+    Linear/Conservative growth come from the environment's actual spend trend
+    (`ctx["_growth"]`); scenarios that need a trend but have none are skipped.
+    """
     cfg = tpl.get("projections") or {}
     family = _fonts(tpl.get("fonts") or {})
     spend, savings = ctx["_spend"], ctx["_savings"]
+    measured = ctx.get("_growth")
 
     base = ctx["_year"] + int(cfg.get("base_year_offset", 0))
     pattern = cfg.get("year_label", "{ordinal} Year ({start}-{end})")
     labels = [pattern.format(ordinal=_ordinal(i + 1), start=base + i, end=str(base + i + 1)[-2:])
               for i in range(3)]
 
-    per_page = int(block.get("per_page", 2))
-    out: List = []
-    scenarios = cfg.get("scenarios") or []
-    for index, scenario in enumerate(scenarios):
-        acr, after, saved = _projection(spend, savings, float(scenario.get("growth", 0)))
+    blocks: List = []
+    for scenario in cfg.get("scenarios") or []:
+        growth = _scenario_growth(scenario, measured)
+        if growth is None:
+            continue  # trend-based scenario with no measured growth → hide rather than guess
+        acr, after, saved = _projection(spend, savings, growth)
         chart = _projection_chart(_text(scenario.get("title", ""), ctx), [acr, after, saved],
                                   labels, tpl, family, avail)
         caption = Paragraph(_text(scenario.get("caption", ""), ctx), st["caption"])
-        out.append(KeepTogether([chart, Spacer(1, 8), caption]))
-        if per_page and (index + 1) % per_page == 0 and index + 1 < len(scenarios):
+        blocks.append(KeepTogether([chart, Spacer(1, 8), caption]))
+
+    per_page = int(block.get("per_page", 2))
+    out: List = []
+    for index, chart_block in enumerate(blocks):
+        out.append(chart_block)
+        if per_page and (index + 1) % per_page == 0 and index + 1 < len(blocks):
             out.append(PageBreak())
     return out
 
@@ -902,137 +931,4 @@ def generate_pdf(assessment, findings: List) -> bytes:
 
     doc.multiBuild(story, onFirstPage=_cover(ctx["client"], when),
                    onLaterPages=_decorate(tpl))
-    return buf.getvalue()
-
-
-# ── Excel workbook (analyst detail) — unchanged shape ────────────────────────────────
-
-def _confidence_label(conf: float) -> str:
-    if conf >= 0.8:
-        return "High"
-    if conf >= 0.5:
-        return "Medium"
-    return "Low"
-
-
-def _as_of(assessment) -> str:
-    if getattr(assessment, "snapshot_at", None):
-        return assessment.snapshot_at.strftime("%Y-%m-%d %H:%M UTC")
-    return "N/A"
-
-
-def _validation_counts(findings: List):
-    counts = {"validated": 0, "needs_review": 0, "unvalidated": 0}
-    for f in findings:
-        status = (getattr(f, "validation_status", None) or "unvalidated").lower()
-        counts[status] = counts.get(status, 0) + 1
-    return counts
-
-
-def generate_excel(assessment, findings: List) -> bytes:
-    wb = openpyxl.Workbook()
-    hdr_fill = PatternFill("solid", fgColor="1565C0")
-    hdr_font = Font(color="FFFFFF", bold=True, size=11)
-
-    ws_sum = wb.active
-    ws_sum.title = "Summary"
-    counts = _validation_counts(findings)
-    summary_rows = [
-        ("Assessment ID", assessment.id),
-        ("Client (Tenant)", getattr(assessment, "tenant_display_name", None) or ""),
-        ("User", assessment.user_email),
-        ("Generated", assessment.created_at.strftime("%Y-%m-%d %H:%M UTC")),
-        ("Data as of (snapshot)", _as_of(assessment)),
-        ("Status", assessment.status.upper()),
-        ("Subscriptions", len(assessment.subscription_ids)),
-        ("Total Findings", assessment.findings_count),
-        ("Current Annual Spend (USD)", getattr(assessment, "current_annual_spend", None)),
-        ("Monthly Savings (USD)", assessment.total_savings_monthly),
-        ("Annual Savings (USD)", assessment.total_savings_annual),
-        ("Validated", counts["validated"]),
-        ("Needs Review", counts["needs_review"]),
-        ("Unvalidated", counts["unvalidated"]),
-    ]
-    for r, (label, value) in enumerate(summary_rows, 1):
-        ws_sum.cell(r, 1, label).font = Font(bold=True)
-        ws_sum.cell(r, 2, value)
-    ws_sum.column_dimensions["A"].width = 26
-    ws_sum.column_dimensions["B"].width = 40
-
-    ws = wb.create_sheet("Findings")
-    headers = [
-        "Category", "Resource Name", "Resource Group", "Subscription ID", "Resource Type",
-        "Monthly Savings (USD)", "Annual Savings (USD)", "Severity", "Confidence",
-        "Confidence Level", "Validation", "Variance %", "Actual Monthly Cost (USD)",
-        "Advisor Rec ID", "Description", "Recommendation",
-    ]
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(1, col, h)
-        cell.fill = hdr_fill
-        cell.font = hdr_font
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-
-    sev_fills = {
-        "critical": PatternFill("solid", fgColor="EF9A9A"),
-        "high": PatternFill("solid", fgColor="FFCDD2"),
-        "medium": PatternFill("solid", fgColor="FFF9C4"),
-        "low": PatternFill("solid", fgColor="E8F5E9"),
-    }
-    review_fill = PatternFill("solid", fgColor="FFE0B2")
-
-    for row, f in enumerate(findings, 2):
-        conf = getattr(f, "confidence", 0.0) or 0.0
-        values = [
-            f.display_name, f.resource_name or "", f.resource_group or "",
-            f.subscription_id or "", f.resource_type or "",
-            round(f.estimated_savings_monthly, 2), round(f.estimated_savings_annual, 2),
-            f.severity.upper(), round(conf, 2), _confidence_label(conf),
-            (getattr(f, "validation_status", None) or "unvalidated"),
-            getattr(f, "validation_variance_pct", None),
-            getattr(f, "actual_monthly_cost", None),
-            getattr(f, "advisor_recommendation_id", None) or "",
-            f.description or "", f.recommendation or "",
-        ]
-        for col, val in enumerate(values, 1):
-            cell = ws.cell(row, col, val)
-            if col in (6, 7, 13):
-                cell.number_format = '#,##0.00'
-            if col == 8:
-                cell.fill = sev_fills.get(f.severity.lower(), PatternFill())
-            if col == 11 and (getattr(f, "validation_status", None) or "") == "needs_review":
-                cell.fill = review_fill
-
-    col_widths = [28, 24, 18, 34, 30, 20, 20, 12, 11, 14, 14, 11, 20, 30, 45, 45]
-    for col, width in enumerate(col_widths, 1):
-        ws.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{openpyxl.utils.get_column_letter(len(headers))}1"
-
-    # ── Validation sheet (needs-review detail) ─────────────────────────────
-    ws_val = wb.create_sheet("Validation")
-    val_headers = ["Category", "Resource Name", "Estimated Monthly (USD)",
-                   "Actual Monthly (USD)", "Variance %", "Note"]
-    for col, h in enumerate(val_headers, 1):
-        cell = ws_val.cell(1, col, h)
-        cell.fill = hdr_fill
-        cell.font = hdr_font
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
-    r = 2
-    for f in findings:
-        if (getattr(f, "validation_status", None) or "") != "needs_review":
-            continue
-        note = (f.details or {}).get("validation_note", "") if getattr(f, "details", None) else ""
-        ws_val.cell(r, 1, f.display_name)
-        ws_val.cell(r, 2, f.resource_name or "")
-        ws_val.cell(r, 3, round(f.estimated_savings_monthly, 2))
-        ws_val.cell(r, 4, getattr(f, "actual_monthly_cost", None))
-        ws_val.cell(r, 5, getattr(f, "validation_variance_pct", None))
-        ws_val.cell(r, 6, note)
-        r += 1
-    for col, width in enumerate([28, 24, 22, 22, 12, 60], 1):
-        ws_val.column_dimensions[openpyxl.utils.get_column_letter(col)].width = width
-    ws_val.freeze_panes = "A2"
-
-    buf = io.BytesIO()
-    wb.save(buf)
     return buf.getvalue()

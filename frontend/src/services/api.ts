@@ -76,23 +76,19 @@ export function useApi() {
       return data;
     },
 
-    async downloadReport(id: number, format: "pdf" | "excel"): Promise<void> {
+    async downloadReport(id: number): Promise<void> {
       const token = await getToken();
-      const ext = format === "pdf" ? "pdf" : "xlsx";
-      const mime =
-        format === "pdf"
-          ? "application/pdf"
-          : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-
-      const response = await http.get(`/assessments/${id}/report/${format}`, {
+      const response = await http.get(`/assessments/${id}/report/pdf`, {
         headers: { Authorization: `Bearer ${token}` },
         responseType: "blob",
       });
 
-      const url = window.URL.createObjectURL(new Blob([response.data as BlobPart], { type: mime }));
+      const url = window.URL.createObjectURL(
+        new Blob([response.data as BlobPart], { type: "application/pdf" })
+      );
       const link = document.createElement("a");
       link.href = url;
-      link.download = `assessment-${id}.${ext}`;
+      link.download = `assessment-${id}.pdf`;
       link.click();
       window.URL.revokeObjectURL(url);
     },

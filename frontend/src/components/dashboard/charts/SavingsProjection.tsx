@@ -12,45 +12,59 @@ import {
   YAxis,
 } from "recharts";
 import { colors } from "../../../theme";
-import { SAVINGS_COLOR, SPEND_COLOR, fmtCompact, fmtUSD } from "../tokens";
+import { SAVINGS_COLOR, SPEND_COLOR, fmtCompact, fmtPct, fmtUSD } from "../tokens";
 
 /**
- * Cumulative-savings projection — the Azure Cost-Management "forecast" view of the report.
- * If you act on the recommendations and save `monthlySavings` every month, this is how much
- * has accumulated by month N (36-month horizon, the length of a 3-year commitment).
+ * Cumulative-savings projection — the on-screen twin of the PDF's "Linear Growth" scenario.
  *
- * Honest by construction: it's a straight run-rate (month N = N × monthly saving), the same
- * arithmetic behind the headline annual figure — no compounding, no invented growth. Hovering
- * any month reveals the exact cumulative amount; the Year 1/2/3 markers anchor the reading.
+ * Uses the SAME method as the report: spend grows LINEARLY at the environment's own measured annual
+ * rate (`annualGrowth`, from the best-fit line through recent monthly spend), so each month's saving
+ * scales with the growing spend. With no measured growth (too little history) it's a flat run-rate —
+ * exactly the report's Fixed scenario. No compounding, no invented growth; hovering reveals the exact
+ * cumulative amount and the Year 1/2/3 markers anchor the reading.
  */
 export function SavingsProjection({
   monthlySavings,
   monthlySpend,
+  annualGrowth,
 }: {
   monthlySavings: number;
   monthlySpend?: number | null;
+  annualGrowth?: number | null;
 }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
 
-  const data = useMemo(
-    () =>
-      Array.from({ length: 37 }, (_, m) => ({
-        month: m,
-        cumulative: Math.round(monthlySavings * m),
-      })),
-    [monthlySavings]
-  );
+  // Linear growth applied to the monthly run-rate: saving at month k = monthlySavings × (1 + g·k/12).
+  const growth = annualGrowth && annualGrowth > 0 ? annualGrowth : 0;
 
-  const total3yr = monthlySavings * 36;
+  const data = useMemo(() => {
+    const out: { month: number; cumulative: number }[] = [];
+    let cumulative = 0;
+    for (let m = 0; m <= 36; m++) {
+      out.push({ month: m, cumulative: Math.round(cumulative) });
+      cumulative += monthlySavings * (1 + (growth * m) / 12); // add month m's saving for the next step
+    }
+    return out;
+  }, [monthlySavings, growth]);
+
   const active = hoverIdx != null ? data[hoverIdx] : null;
   const shown = active ?? data[36];
+  const year1 = data[12].cumulative;
+  const year3 = data[36].cumulative;
 
   return (
     <Box>
       <Box display="flex" alignItems="baseline" justifyContent="space-between" gap={2} flexWrap="wrap" mb={0.5}>
-        <Typography variant="subtitle1" fontWeight={700} color={colors.textPrimary}>
-          Projected cumulative savings
-        </Typography>
+        <Box minWidth={0}>
+          <Typography variant="subtitle1" fontWeight={700} color={colors.textPrimary}>
+            Projected cumulative savings
+          </Typography>
+          <Typography variant="caption" color={colors.textMuted}>
+            {growth > 0
+              ? `Spend trending ${fmtPct(growth * 100)}/yr (measured) — grown linearly`
+              : "Flat run-rate (no growth trend measured)"}
+          </Typography>
+        </Box>
         <Box textAlign="right">
           <Typography variant="caption" color="text.secondary" display="block" lineHeight={1}>
             {active ? `By month ${shown.month}` : "Over 3 years"}
@@ -103,10 +117,6 @@ export function SavingsProjection({
               content={({ active: a, payload }: any) => {
                 if (!a || !payload?.length) return null;
                 const p = payload[0].payload;
-                const runRateNote =
-                  monthlySpend && monthlySpend > 0
-                    ? `${fmtUSD(monthlySavings)} / mo run-rate`
-                    : `${fmtUSD(monthlySavings)} / mo`;
                 return (
                   <Box
                     sx={{
@@ -123,7 +133,7 @@ export function SavingsProjection({
                       {fmtUSD(p.cumulative)} saved
                     </Typography>
                     <Typography variant="caption" color={colors.textMuted}>
-                      {runRateNote}
+                      {growth > 0 ? `at ${fmtPct(growth * 100)}/yr spend growth` : `${fmtUSD(monthlySavings)} / mo`}
                     </Typography>
                   </Box>
                 );
@@ -143,8 +153,8 @@ export function SavingsProjection({
       </Box>
 
       <Box display="flex" gap={3} mt={0.5} flexWrap="wrap">
-        <Marker color={SAVINGS_COLOR} label="Year 1" value={fmtUSD(monthlySavings * 12)} />
-        <Marker color={SAVINGS_COLOR} label="Year 3 total" value={fmtUSD(total3yr)} />
+        <Marker color={SAVINGS_COLOR} label="Year 1" value={fmtUSD(year1)} />
+        <Marker color={SAVINGS_COLOR} label="Year 3 total" value={fmtUSD(year3)} />
         {monthlySpend && monthlySpend > 0 ? (
           <Marker color={SPEND_COLOR} label="Monthly run-rate saved" value={fmtUSD(monthlySavings)} />
         ) : null}

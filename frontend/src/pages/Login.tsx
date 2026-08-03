@@ -16,7 +16,7 @@ export default function Login() {
   const points = [
     "Read-only — uses your existing Azure Reader access",
     "Estimate monthly & annual savings in minutes",
-    "Export investor-ready PDF and Excel reports",
+    "Export investor-ready PDF reports",
   ];
 
   return (

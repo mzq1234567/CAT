@@ -29,6 +29,12 @@ import httpx
 
 from .cache import CacheBackend, InMemoryTTLCache
 from .currency import from_usd
+from .estimates import (
+    APP_SERVICE_PLAN_MONTHLY_USD,
+    BASTION_MONTHLY_USD,
+    LOAD_BALANCER_MONTHLY_USD,
+    NAT_GATEWAY_MONTHLY_USD,
+)
 
 logger = logging.getLogger("cat.pricing")
 
@@ -303,6 +309,71 @@ class PricingEngine:
             return round(min(hourly) * HOURS_PER_MONTH, 2)
         # Static fallback (USD ≈ $3.65 Standard / $2.88 Basic) → billing currency.
         return from_usd(3.65 if sku.lower() == "standard" else 2.88, self._currency)
+
+    # ── Flat-rate resources (Load Balancer / NAT Gateway / Bastion / App Service) ─────
+    async def _flat_hourly_monthly(
+        self, service_name: str, region: str, *,
+        product_contains: Optional[str] = None, meter_contains: Optional[str] = None,
+        sku_equals: Optional[str] = None,
+    ) -> Optional[float]:
+        """Cheapest hourly Consumption price for a flat-rate resource → monthly. None if nothing matches."""
+        filter_str = (
+            f"serviceName eq '{service_name}' and armRegionName eq '{region}' "
+            "and priceType eq 'Consumption'"
+        )
+        if sku_equals:
+            filter_str += f" and skuName eq '{sku_equals}'"
+        try:
+            items = await self.query(filter_str)
+        except PricingUnavailableError:
+            return None
+        prices = [
+            it.get("retailPrice")
+            for it in items
+            if it.get("type") == "Consumption" and it.get("retailPrice")
+            and "Hour" in (it.get("unitOfMeasure") or "")
+            and "Spot" not in (it.get("meterName") or "")
+            and (product_contains is None or product_contains in (it.get("productName") or ""))
+            and (meter_contains is None or meter_contains in (it.get("meterName") or ""))
+        ]
+        if not prices:
+            return None
+        return round(min(prices) * HOURS_PER_MONTH, 2)
+
+    def _live_or_fallback(self, live: Optional[float], fallback_usd: float) -> float:
+        """Accept a live price only if it's in a sane band around the dated fallback, else use the
+        fallback. The band guards against a wrong meter match (Azure prices don't swing 4x), so a
+        misfetch can never produce a bad number — it degrades to the verified estimate."""
+        fb = from_usd(fallback_usd, self._currency)
+        if live is not None and fb > 0 and 0.25 * fb <= live <= 4 * fb:
+            return live
+        if live is not None and fb > 0:
+            logger.warning("Live price %.2f outside sane band around fallback %.2f; using fallback",
+                           live, fb)
+        return fb if fb > 0 else (live or 0.0)
+
+    async def get_load_balancer_monthly_price(self, region: str) -> float:
+        live = await self._flat_hourly_monthly("Load Balancer", region, meter_contains="Rule")
+        return self._live_or_fallback(live, LOAD_BALANCER_MONTHLY_USD)
+
+    async def get_nat_gateway_monthly_price(self, region: str) -> float:
+        live = await self._flat_hourly_monthly("NAT Gateway", region, meter_contains="Gateway")
+        return self._live_or_fallback(live, NAT_GATEWAY_MONTHLY_USD)
+
+    async def get_bastion_monthly_price(self, region: str, sku: str = "Basic") -> float:
+        live = await self._flat_hourly_monthly("Azure Bastion", region, meter_contains="Gateway")
+        return self._live_or_fallback(live, BASTION_MONTHLY_USD)
+
+    async def get_app_service_plan_monthly_price(self, region: str, sku: str) -> float:
+        """Monthly App Service Plan price. Retail `skuName` carries a space before v2/v3 (e.g. the
+        Resource Graph 'P1v2' is 'P1 v2' in the price list), so we normalise before matching."""
+        norm = (sku or "").strip()
+        retail_sku = norm[:-2] + " " + norm[-2:] if norm[-2:].lower() in ("v2", "v3") else norm
+        live = await self._flat_hourly_monthly("Azure App Service", region, sku_equals=retail_sku)
+        fallback = APP_SERVICE_PLAN_MONTHLY_USD.get(norm.lower(), 0.0)
+        if fallback > 0:
+            return self._live_or_fallback(live, fallback)
+        return round(live, 2) if live is not None else 0.0
 
     # ── Maintenance ────────────────────────────────────────────────────────────
 

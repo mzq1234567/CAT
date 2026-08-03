@@ -21,11 +21,17 @@ unit-testable without any network.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .cost_management import UNVALIDATED, VALIDATED, ValidationResult, validate_savings
 from .currency import from_usd, symbol, to_usd
+from .estimates import (
+    GRS_VAULT_MONTHLY_USD,
+    SNAPSHOT_PER_GB_MONTHLY_USD,
+    SQL_AHB_LICENCE_PER_VCORE_MONTHLY_USD,
+)
 from .pricing import PricingEngine, PricingUnavailableError
 from .vm_specs import VmSpec, get_spec, smaller_same_series
 
@@ -40,12 +46,110 @@ IDLE_MAX_MEMORY_PCT = 10.0    # ...AND peak memory used below this → does effe
 DOWNSIZE_HEADROOM_CEILING = 70.0  # a candidate (smaller) SKU must keep BOTH projected peaks ≤ this.
 METRIC_WINDOW_DAYS = 30
 
+
+def _median(values: List[float]) -> Optional[float]:
+    """Median of the positive values (robust central estimate), or None if there are none."""
+    vals = sorted(v for v in values if v is not None and v > 0)
+    if not vals:
+        return None
+    m = len(vals) // 2
+    return vals[m] if len(vals) % 2 else round((vals[m - 1] + vals[m]) / 2, 4)
+
+
+def _vcpus(sku: str) -> Optional[int]:
+    """vCPU count for a VM SKU — from the curated spec table, else parsed from the SKU name.
+
+    Azure encodes the vCPU count as the first number in the size (Standard_D4s_v3 → 4,
+    Standard_B2ms → 2, Standard_DC1ds_v3 → 1), so a simple first-digit parse is a reliable fallback
+    for sizes the curated table doesn't carry.
+    """
+    spec = get_spec(sku)
+    if spec and spec.vcpu:
+        return spec.vcpu
+    m = re.search(r"\d+", sku or "")
+    return int(m.group()) if m else None
+
+
+# App Service Plan specs: sku → (series, cores, memory_gb). Downsizing stays within a series (same
+# feature set), stepping to a smaller instance. Source: Azure App Service pricing (per-instance sizes).
+_ASP_SPECS: Dict[str, tuple] = {
+    "b1": ("B", 1, 1.75), "b2": ("B", 2, 3.5), "b3": ("B", 4, 7.0),
+    "s1": ("S", 1, 1.75), "s2": ("S", 2, 3.5), "s3": ("S", 4, 7.0),
+    "p1v2": ("Pv2", 1, 3.5), "p2v2": ("Pv2", 2, 7.0), "p3v2": ("Pv2", 4, 14.0),
+    "p0v3": ("Pv3", 1, 4.0), "p1v3": ("Pv3", 2, 8.0), "p2v3": ("Pv3", 4, 16.0), "p3v3": ("Pv3", 8, 32.0),
+    "i1v2": ("Iv2", 2, 8.0), "i2v2": ("Iv2", 4, 16.0), "i3v2": ("Iv2", 8, 32.0),
+}
+
+
+def find_asp_downsize_target(
+    sku: str, peak_cpu: Optional[float], peak_mem: Optional[float],
+    ceiling: float = DOWNSIZE_HEADROOM_CEILING,
+):
+    """Smallest same-series ASP SKU where BOTH projected CPU and memory stay under `ceiling`.
+
+    Projecting onto a smaller instance scales utilisation up by the capacity ratio (halving cores
+    roughly doubles CPU %), so a downsize is only safe when the busiest-moment peaks still clear the
+    ceiling on the target. Returns `(sku, cores, memory_gb)` or None (already smallest / no headroom).
+    When memory couldn't be measured, CPU alone is used (the caller lowers confidence for that case).
+    """
+    cur = _ASP_SPECS.get((sku or "").lower())
+    if cur is None or peak_cpu is None:
+        return None
+    series, cur_cores, cur_mem = cur
+    smaller = sorted(
+        ((name, cores, mem) for name, (ser, cores, mem) in _ASP_SPECS.items()
+         if ser == series and cores < cur_cores),
+        key=lambda x: x[1],  # ascending cores → smallest (cheapest) first
+    )
+    for name, cores, mem in smaller:
+        proj_cpu = peak_cpu * (cur_cores / cores)
+        proj_mem = peak_mem * (cur_mem / mem) if peak_mem is not None else 0.0
+        if proj_cpu <= ceiling and proj_mem <= ceiling:
+            return name, cores, mem
+    return None
+
+
+# vCore options. Single Databases (GP/BC Gen5) step in small increments; Managed Instances step in
+# larger ones. Downsizing moves to fewer vCores within the tier.
+_SQL_VCORE_LADDER = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 32, 40, 80]
+_SQL_MI_VCORE_LADDER = [4, 8, 16, 24, 32, 40, 64, 80]
+
+# Standard SSD provides ~500 IOPS / ~60 MB/s baseline on every tier (larger tiers more). A Premium disk
+# whose PEAK stays well under that — the 70% headroom ceiling — runs comfortably on Standard SSD.
+_STANDARD_SSD_BASELINE_IOPS = 500
+_STANDARD_SSD_BASELINE_MBPS = 60
+
+
+def find_sql_vcore_target(
+    current_vcores: int, peaks: List[Optional[float]],
+    ladder: Optional[List[int]] = None, ceiling: float = DOWNSIZE_HEADROOM_CEILING,
+) -> Optional[int]:
+    """Smallest vCore count below `current_vcores` (from `ladder`) where EVERY measured utilisation
+    peak, scaled up by the capacity ratio (halving vCores ~doubles %), still clears `ceiling`. `peaks`
+    may hold None entries (metric unavailable) — those are ignored; at least one real peak is required.
+    None → no safe smaller size."""
+    ladder = ladder or _SQL_VCORE_LADDER
+    usable = [p for p in peaks if p is not None]
+    if not current_vcores or current_vcores <= ladder[0] or not usable:
+        return None
+    for target in ladder:
+        if target >= current_vcores:
+            break
+        ratio = current_vcores / target
+        if all(p * ratio <= ceiling for p in usable):
+            return target
+    return None
+
 SEV_ORDER = ["low", "medium", "high", "critical"]
 
 CATEGORY_DISPLAY = {
     "unattached_managed_disks": "Unattached Managed Disks",
     "orphaned_public_ips": "Orphaned Public IP Addresses",
     "idle_app_service_plans": "Idle App Service Plans",
+    "app_service_plan_rightsizing": "App Service Plan Rightsizing",
+    "sql_db_rightsizing": "SQL Database Rightsizing",
+    "sql_mi_rightsizing": "SQL Managed Instance Rightsizing",
+    "disk_rightsizing": "Disk SKU Rightsizing (Premium → Standard)",
     "deallocated_vms": "Deallocated Virtual Machines",
     "paused_sql_databases": "Paused/Inactive SQL Databases",
     "stopped_sql_managed_instances": "Stopped SQL Managed Instances",
@@ -55,6 +159,7 @@ CATEGORY_DISPLAY = {
     "savings_plan_vm": "Savings Plan (VM)",
     "vm_rightsizing": "VM Rightsizing",
     "windows_ahb": "Windows Azure Hybrid Benefit",
+    "sql_ahb": "SQL Server Azure Hybrid Benefit",
     # Reserved-capacity purchase recs from Azure's own reservation engine (Consumption API).
     "sql_db_reserved_capacity": "SQL Reserved Capacity",
     "sql_mi_reserved_capacity": "SQL MI Reserved Capacity",
@@ -74,10 +179,10 @@ CATEGORY_DISPLAY = {
 
 
 # ── Rule-driven orphan/waste detection (DRY — one rule per resource type) ────────
-# Fixed monthly estimates for resources whose cost isn't easily retail-priced (config-dependent);
-# grounded by the actual-cost cap + validation when Cost Management data is available. Hygiene-only
-# resources (NICs/NSGs/route tables) carry $0 — reported for completeness, not savings.
-_SNAPSHOT_PER_GB = 0.05  # standard incremental snapshot ~$0.05/GB/mo
+# Load Balancer / NAT Gateway / Bastion are priced LIVE (see detect_orphans → PricingEngine); their
+# lambda here is just the dated fallback. Snapshot (size × per-GB) and GRS vault stay estimates
+# because their cost depends on data volume Resource Graph doesn't expose. All values are grounded by
+# the actual-cost cap + validation when Cost Management data is available.
 
 
 @dataclass(frozen=True)
@@ -100,7 +205,7 @@ ORPHAN_RULES: Dict[str, OrphanRule] = {
         "Delete snapshots no longer needed for recovery or compliance.",
         lambda r: (f"Snapshot '{r.get('name')}' ({int(r.get('diskSizeGB') or 0)} GB, created "
                    f"{_short_date(r)}) is retained and accruing storage cost."),
-        lambda r: round(int(r.get("diskSizeGB") or 0) * _SNAPSHOT_PER_GB, 2),
+        lambda r: round(int(r.get("diskSizeGB") or 0) * SNAPSHOT_PER_GB_MONTHLY_USD, 2),
         0.85,
     ),
     "empty_load_balancers": OrphanRule(
@@ -108,21 +213,21 @@ ORPHAN_RULES: Dict[str, OrphanRule] = {
         "Delete the load balancer if it is not routing traffic.",
         lambda r: (f"Standard Load Balancer '{r.get('name')}' has no backend pool — it bills "
                    "without balancing anything."),
-        lambda r: 18.0, 0.85,
+        lambda r: 0.0, 0.85,  # priced live in detect_orphans; this lambda is unused for this bucket
     ),
     "idle_nat_gateways": OrphanRule(
         "idle_nat_gateways", "microsoft.network/natgateways",
         "Delete the NAT gateway if no subnet uses it.",
         lambda r: (f"NAT Gateway '{r.get('name')}' is not associated with any subnet, yet bills a "
                    "fixed hourly rate."),
-        lambda r: 32.0, 0.85,
+        lambda r: 0.0, 0.85,  # priced live in detect_orphans
     ),
     "bastion_hosts": OrphanRule(
         "bastion_hosts", "microsoft.network/bastionhosts",
         "Confirm Bastion is still needed, or deallocate it when not in use.",
         lambda r: (f"Azure Bastion '{r.get('name')}' ({r.get('skuName') or 'Standard'}) is a "
                    "fixed-cost resource that bills whether or not it's used — verify it is still required."),
-        lambda r: 138.0, 0.6,
+        lambda r: 0.0, 0.6,  # priced live in detect_orphans
     ),
     "geo_redundant_vaults": OrphanRule(
         "backup_redundancy", "microsoft.recoveryservices/vaults",
@@ -130,19 +235,13 @@ ORPHAN_RULES: Dict[str, OrphanRule] = {
         "redundant (LRS) to roughly halve backup storage cost.",
         lambda r: (f"Recovery Services vault '{r.get('name')}' uses geo-redundant (GRS) backup "
                    "storage. If a geo-secondary copy isn't required, LRS costs about half."),
-        # Nominal estimate — actual depends on backup volume (not available from Resource Graph).
-        lambda r: 25.0, 0.4,
+        # Estimate — actual depends on backup volume (not available from Resource Graph).
+        lambda r: GRS_VAULT_MONTHLY_USD, 0.4,
     ),
 }
 
-# App Service Plan monthly estimate (USD) — retail-priced ASP is deferred (see memory.md).
-_ASP_COST = {
-    "f1": 0, "d1": 9.49, "b1": 13.14, "b2": 26.28, "b3": 52.56,
-    "s1": 56.94, "s2": 113.88, "s3": 227.76,
-    "p1v2": 73.0, "p2v2": 146.0, "p3v2": 292.0,
-    "p0v3": 37.23, "p1v3": 75.0, "p2v3": 150.0, "p3v3": 300.0,
-    "i1v2": 294.0, "i2v2": 588.0, "i3v2": 1176.0,
-}
+# Buckets whose flat rate is fetched live from the Retail Prices API (falls back to the dated estimate).
+_LIVE_PRICED_ORPHANS = {"empty_load_balancers", "idle_nat_gateways", "bastion_hosts"}
 
 
 # ── Scoring helpers (pure) ───────────────────────────────────────────────────────
@@ -292,12 +391,20 @@ class FindingsEngine:
         base_confidence: float, description: str, recommendation: str,
         *, has_price: bool = True, advisor_impact: str = "",
         debug_reason: Optional[str] = None, extra_details: Optional[Dict] = None,
-        grounded: bool = False,
+        grounded: bool = False, actual_cost_override: Optional[float] = None,
     ) -> Dict:
         monthly = round(monthly or 0.0, 2)
         resource_id = resource.get("id")
         # Validation compares the *original* estimate to actual cost (records the overage).
         validation = validate_savings(monthly, resource_id, self._cost_map) if monthly > 0 else None
+        # When a finding's saving is grounded in a DIFFERENT resource's cost than the one it's attributed
+        # to (e.g. a deallocated VM's saving is the cost of its still-billing DISKS, not the VM's ~0
+        # compute), the caller supplies the right cost basis so the cap below doesn't clamp against the
+        # wrong (near-zero) figure.
+        if actual_cost_override is not None and monthly > 0:
+            validation = ValidationResult(
+                VALIDATED, round(actual_cost_override, 2), 0.0,
+                "Grounded in the attached resources' actual billed cost.")
 
         # Cap FIRST: you can't save more on a resource than it actually costs. Clamp the estimate to the
         # real billed cost so totals never exceed spend — and, since the figure now IS the actual cost,
@@ -406,14 +513,15 @@ class FindingsEngine:
             ))
         return out
 
-    def detect_idle_app_service_plans(self, plans: List[Dict]) -> List[Dict]:
+    async def detect_idle_app_service_plans(self, plans: List[Dict]) -> List[Dict]:
         out = []
         for plan in plans:
-            sku = (plan.get("skuName") or "").lower()
-            monthly = from_usd(_ASP_COST.get(sku, 0.0), self._currency)  # ASP table is USD
+            sku = plan.get("skuName") or ""
+            region = plan.get("location") or "eastus"
+            monthly = await self._pricing.get_app_service_plan_monthly_price(region, sku)
             reason = (
                 f"App Service Plan idle: numberOfSites==0 in Resource Graph as of {self._snapshot}; "
-                f"SKU {sku or 'unknown'} estimated {monthly:.2f}/mo ({self._currency})."
+                f"SKU {sku or 'unknown'} priced {monthly:.2f}/mo ({self._currency})."
             )
             out.append(self._finding(
                 "idle_app_service_plans", plan, "microsoft.web/serverfarms", monthly,
@@ -425,20 +533,291 @@ class FindingsEngine:
             ))
         return out
 
-    def detect_deallocated_vms(self, vms: List[Dict]) -> List[Dict]:
-        out = []
-        for vm in vms:
+    async def detect_app_service_rightsizing(self, plans: List[Dict]) -> List[Dict]:
+        """Downsize an App Service Plan (hosting apps) to a smaller same-series SKU when CPU + memory
+        stay consistently low. Mirrors VM rightsizing: peak (not average) over the window, BOTH signals
+        required (a memory-bound plan mustn't be downsized on CPU alone), a conservative headroom
+        ceiling on the projected target, and the saving = real price(current) − real price(target).
+        Skips when either price is missing rather than guessing.
+        """
+        out: List[Dict] = []
+        for plan in plans:
+            max_cpu = plan.get("max_cpu_pct")
+            max_mem = plan.get("max_memory_pct")
+            dp = int(plan.get("metric_datapoints") or 0)
+            window = int(plan.get("metric_window_days") or METRIC_WINDOW_DAYS)
+            if max_cpu is None or dp == 0:
+                continue  # no metrics → can't classify utilisation
+            sku = plan.get("skuName") or ""
+            region = plan.get("location") or "eastus"
+            target = find_asp_downsize_target(sku, max_cpu, max_mem)
+            if target is None:
+                continue
+            target_sku, t_cores, t_mem = target
+            cur = _ASP_SPECS.get(sku.lower())
+            cur_price = await self._pricing.get_app_service_plan_monthly_price(region, sku)
+            target_price = await self._pricing.get_app_service_plan_monthly_price(region, target_sku)
+            if not cur_price or not target_price:
+                continue  # no real saving without both real prices
+            monthly = round(max(0.0, cur_price - target_price), 2)
+            if monthly <= 0:
+                continue
+
+            mem_available = max_mem is not None
+            base_conf = metrics_confidence(dp, window)
+            if not mem_available:
+                base_conf = round(base_conf * 0.7, 2)
+            mem_str = f"{max_mem}%" if mem_available else "unavailable"
+            mem_caveat = "" if mem_available else " (memory could not be verified)"
             reason = (
-                f"VM deallocated: powerState=='{vm.get('powerState')}' in Resource Graph as of "
-                f"{self._snapshot}; compute stops but OS/data disks still bill."
+                f"App Service Plan peak CPU {max_cpu}% and peak memory {mem_str} over {window} days"
+                f"{mem_caveat} leave headroom to move {sku} → {target_sku} and stay under the "
+                f"{DOWNSIZE_HEADROOM_CEILING}% ceiling; {cur_price:.2f}/mo → {target_price:.2f}/mo."
             )
             out.append(self._finding(
-                "deallocated_vms", vm, "microsoft.compute/virtualmachines", 0.0,
+                "app_service_plan_rightsizing", plan, "microsoft.web/serverfarms", monthly,
+                base_confidence=round(base_conf * 0.9, 2),
+                description=(f"App Service Plan '{plan.get('name')}' ({sku}) peaked at {max_cpu}% CPU and "
+                            f"{mem_str} memory over {window} days{mem_caveat} — it fits a smaller plan."),
+                recommendation=f"Scale the plan down from {sku} to {target_sku}.",
+                has_price=True, debug_reason=reason,
+                extra_details={
+                    "max_cpu": max_cpu, "peak_memory_used_pct": max_mem,
+                    "memory_verified": mem_available, "cpu_datapoints": dp,
+                    # Reuse the VM resize evidence panel (keys off current_sku/recommended_sku/vcpu).
+                    "current_sku": sku, "recommended_sku": target_sku,
+                    "current_monthly_price": cur_price, "recommended_monthly_price": target_price,
+                    "current_vcpu": cur[1] if cur else None,
+                    "current_memory_gb": cur[2] if cur else None,
+                    "recommended_vcpu": t_cores, "recommended_memory_gb": t_mem,
+                    "downsize_ceiling_pct": DOWNSIZE_HEADROOM_CEILING,
+                },
+            ))
+        return out
+
+    async def detect_sql_db_rightsizing(self, dbs: List[Dict]) -> List[Dict]:
+        """Downsize a vCore SQL Database to fewer vCores when CPU, data IO AND log IO all stay low.
+
+        SQL is stateful and performance-sensitive, so this is deliberately cautious: it runs ONLY where
+        per-resource Cost Management data exists (never a list-price guess), requires EVERY measured
+        load dimension to clear the headroom ceiling on the projected smaller size, and grounds the
+        saving as `actual cost × (removed vCores / current vCores)`, capped at actual cost — so it
+        tracks the real bill and can't exceed it. A recommendation to review, not an auto-action.
+        """
+        out: List[Dict] = []
+        if not self._cost_map:
+            return out  # grounded-only: without real cost we won't guess a SQL downsize
+        for db in dbs:
+            cpu = db.get("max_cpu_pct")
+            data_io = db.get("max_data_io_pct")
+            log_io = db.get("max_log_io_pct")
+            dp = int(db.get("metric_datapoints") or 0)
+            window = int(db.get("metric_window_days") or METRIC_WINDOW_DAYS)
+            if cpu is None or dp == 0:
+                continue
+            current_vcores = int(db.get("vcores") or 0)
+            actual = self._cost_map.get((db.get("id") or "").lower())
+            if not actual or actual <= 0:
+                continue
+            target = find_sql_vcore_target(current_vcores, [cpu, data_io, log_io])
+            if target is None:
+                continue
+            monthly = round(actual * (current_vcores - target) / current_vcores, 2)
+            if monthly <= 0:
+                continue
+
+            tier = db.get("tier") or "vCore"
+            current_label = f"{tier} {current_vcores} vCore"
+            target_label = f"{tier} {target} vCore"
+            io_str = (f"data IO {data_io}%, log IO {log_io}%"
+                      if data_io is not None and log_io is not None else "IO metrics partial")
+            base_conf = metrics_confidence(dp, window)
+            reason = (
+                f"SQL DB peak CPU {cpu}%, {io_str} over {window} days all leave headroom to drop "
+                f"{current_vcores}→{target} vCores and stay under {DOWNSIZE_HEADROOM_CEILING}%; "
+                f"saving = actual cost × {current_vcores - target}/{current_vcores}."
+            )
+            out.append(self._finding(
+                "sql_db_rightsizing", db, "microsoft.sql/servers/databases", monthly,
+                base_confidence=round(base_conf * 0.85, 2),  # stateful resource → a touch more cautious
+                description=(f"SQL Database '{db.get('name')}' ({current_label}) peaked at {cpu}% CPU "
+                            f"({io_str}) over {window} days — it fits fewer vCores."),
+                recommendation=f"Scale down from {current_vcores} to {target} vCores after confirming peak workloads.",
+                has_price=True, debug_reason=reason,
+                grounded=True,
+                extra_details={
+                    "max_cpu": cpu, "max_data_io_pct": data_io, "max_log_io_pct": log_io,
+                    "cpu_datapoints": dp,
+                    # Reuse the VM/ASP resize evidence panel.
+                    "current_sku": current_label, "recommended_sku": target_label,
+                    "current_vcpu": current_vcores, "recommended_vcpu": target,
+                    "downsize_ceiling_pct": DOWNSIZE_HEADROOM_CEILING,
+                },
+            ))
+        return out
+
+    async def detect_sql_mi_rightsizing(self, instances: List[Dict]) -> List[Dict]:
+        """Downsize a vCore SQL Managed Instance to fewer vCores when CPU stays consistently low.
+
+        Same cautious, grounded shape as SQL DB rightsizing, but MI exposes CPU (`avg_cpu_percent`) as
+        its primary throttleable load signal (no per-DB IO-percent metrics), so the decision is CPU-based
+        against the larger MI vCore ladder. Grounded-only; saving = actual × (removed / current), capped.
+        """
+        out: List[Dict] = []
+        if not self._cost_map:
+            return out
+        for mi in instances:
+            cpu = mi.get("max_cpu_pct")
+            dp = int(mi.get("metric_datapoints") or 0)
+            window = int(mi.get("metric_window_days") or METRIC_WINDOW_DAYS)
+            if cpu is None or dp == 0:
+                continue
+            current_vcores = int(mi.get("vcores") or 0)
+            actual = self._cost_map.get((mi.get("id") or "").lower())
+            if not actual or actual <= 0:
+                continue
+            target = find_sql_vcore_target(current_vcores, [cpu], ladder=_SQL_MI_VCORE_LADDER)
+            if target is None:
+                continue
+            monthly = round(actual * (current_vcores - target) / current_vcores, 2)
+            if monthly <= 0:
+                continue
+
+            tier = mi.get("tier") or "vCore"
+            current_label = f"{tier} {current_vcores} vCore"
+            target_label = f"{tier} {target} vCore"
+            base_conf = metrics_confidence(dp, window)
+            reason = (
+                f"SQL MI peak CPU {cpu}% over {window} days leaves headroom to drop "
+                f"{current_vcores}→{target} vCores under {DOWNSIZE_HEADROOM_CEILING}%; "
+                f"saving = actual cost × {current_vcores - target}/{current_vcores}."
+            )
+            out.append(self._finding(
+                "sql_mi_rightsizing", mi, "microsoft.sql/managedinstances", monthly,
+                base_confidence=round(base_conf * 0.85, 2),
+                description=(f"SQL Managed Instance '{mi.get('name')}' ({current_label}) peaked at "
+                            f"{cpu}% CPU over {window} days — it fits fewer vCores."),
+                recommendation=f"Scale down from {current_vcores} to {target} vCores after confirming peak workloads.",
+                has_price=True, debug_reason=reason, grounded=True,
+                extra_details={
+                    "max_cpu": cpu, "cpu_datapoints": dp,
+                    "current_sku": current_label, "recommended_sku": target_label,
+                    "current_vcpu": current_vcores, "recommended_vcpu": target,
+                    "downsize_ceiling_pct": DOWNSIZE_HEADROOM_CEILING,
+                },
+            ))
+        return out
+
+    async def detect_disk_rightsizing(
+        self, disks: List[Dict], exclude_vm_ids: Optional[set] = None,
+    ) -> List[Dict]:
+        """Downgrade an attached Premium SSD disk to Standard SSD when its peak IOPS AND throughput
+        both stay well within Standard SSD's baseline (the 70% headroom ceiling). Requires BOTH signals
+        — a wrong downgrade throttles the disk's I/O — so a disk with no metrics is left alone.
+
+        Low IOPS/throughput does NOT by itself make a downgrade safe: databases and other latency-
+        sensitive workloads need Premium's low, consistent latency even at trivial IOPS (a SQL log disk
+        commits transactions on it). So disks on registered SQL VMs (`exclude_vm_ids`) are skipped
+        outright, and the recommendation carries an explicit "not for latency-sensitive workloads" caveat
+        for the cases we can't detect. Saving = real price(Premium, size) − real price(Standard SSD, size),
+        capped at the disk's actual billed cost when known. Skips if either price is missing.
+        """
+        out: List[Dict] = []
+        exclude_vm_ids = exclude_vm_ids or set()
+        ceiling = DOWNSIZE_HEADROOM_CEILING / 100.0
+        iops_ceiling = _STANDARD_SSD_BASELINE_IOPS * ceiling
+        mbps_ceiling = _STANDARD_SSD_BASELINE_MBPS * ceiling
+        for disk in disks:
+            if (disk.get("managedBy") or "").lower() in exclude_vm_ids:
+                continue  # attached to a SQL VM → needs Premium latency, don't recommend a downgrade
+            peak_iops = disk.get("peak_iops")
+            peak_mbps = disk.get("peak_mbps")
+            dp = int(disk.get("metric_datapoints") or 0)
+            window = int(disk.get("metric_window_days") or METRIC_WINDOW_DAYS)
+            size = int(disk.get("sizeGB") or 0)
+            if peak_iops is None or peak_mbps is None or dp == 0 or size <= 0:
+                continue  # both I/O signals required → never a blind downgrade
+            if peak_iops > iops_ceiling or peak_mbps > mbps_ceiling:
+                continue  # too busy for Standard SSD
+            region = disk.get("location") or "eastus"
+            cur_sku = disk.get("skuName") or "Premium_LRS"
+            try:
+                premium_price = await self._pricing.get_managed_disk_monthly_price(region, cur_sku, size)
+                standard_price = await self._pricing.get_managed_disk_monthly_price(
+                    region, "StandardSSD_LRS", size)
+            except PricingUnavailableError:
+                continue
+            if not premium_price or not standard_price:
+                continue
+            monthly = round(max(0.0, premium_price - standard_price), 2)
+            actual = self._cost_map.get((disk.get("id") or "").lower())
+            if actual and actual > 0:
+                monthly = round(min(monthly, actual), 2)  # never claim more than the disk actually costs
+            if monthly <= 0:
+                continue
+
+            base_conf = metrics_confidence(dp, window)
+            reason = (
+                f"Premium disk peaked at {peak_iops:.0f} IOPS / {peak_mbps:.0f} MB/s over {window} days "
+                f"— within Standard SSD's ~{_STANDARD_SSD_BASELINE_IOPS} IOPS / "
+                f"{_STANDARD_SSD_BASELINE_MBPS} MB/s baseline; {premium_price:.2f}/mo → {standard_price:.2f}/mo."
+            )
+            out.append(self._finding(
+                "disk_rightsizing", disk, "microsoft.compute/disks", monthly,
+                base_confidence=round(base_conf * 0.9, 2),
+                description=(f"Managed disk '{disk.get('name')}' ({size} GB Premium SSD) peaked at only "
+                            f"{peak_iops:.0f} IOPS / {peak_mbps:.0f} MB/s over {window} days — a throughput "
+                            "level Standard SSD handles at lower cost."),
+                recommendation=(f"If this disk does NOT back a latency-sensitive workload (databases, "
+                                f"transaction logs, etc. need Premium's low latency even at low IOPS), change "
+                                f"{cur_sku} → StandardSSD_LRS at the same size. Verify the workload first."),
+                has_price=True, debug_reason=reason,
+                grounded=bool(actual and actual > 0),
+                extra_details={
+                    "peak_iops": round(peak_iops, 1), "peak_mbps": round(peak_mbps, 1),
+                    "cpu_datapoints": dp,
+                    "current_sku": cur_sku, "recommended_sku": "StandardSSD_LRS",
+                    "current_monthly_price": premium_price, "recommended_monthly_price": standard_price,
+                    "sizeGB": size,
+                },
+            ))
+        return out
+
+    def detect_deallocated_vms(self, vms: List[Dict]) -> List[Dict]:
+        """Deallocated/stopped VMs: compute stops billing, but the OS + data disks keep billing.
+
+        The saving from removing the VM (and its disks) is the cost of those still-billing disks, read
+        straight from Cost Management (the disks are attached to the VM, so they don't show up in the
+        unattached-disk detector). Without per-resource cost data the disk cost can't be quantified, so
+        the saving is 0 and the finding drops out (a zero-value line is noise in a savings report).
+        """
+        out = []
+        sym = symbol(self._currency)
+        for vm in vms:
+            disk_ids: List[str] = []
+            if vm.get("osDiskId"):
+                disk_ids.append(vm["osDiskId"].lower())
+            for dd in (vm.get("dataDisks") or []):
+                did = ((dd or {}).get("managedDisk") or {}).get("id")
+                if did:
+                    disk_ids.append(did.lower())
+            disk_cost = round(sum(self._cost_map.get(d, 0.0) for d in disk_ids), 2)
+            n_disks = len(disk_ids)
+            state = vm.get("powerState") or "deallocated"
+            reason = (
+                f"VM powerState=='{state}' in Resource Graph as of {self._snapshot}; compute stopped "
+                f"but {n_disks} attached disk(s) still bill {sym}{disk_cost:.2f}/mo (Cost Management)."
+            )
+            out.append(self._finding(
+                "deallocated_vms", vm, "microsoft.compute/virtualmachines", disk_cost,
                 base_confidence=0.9,
-                description=(f"VM '{vm.get('name')}' ({vm.get('vmSize')}) is deallocated; its disks "
-                            "continue to accrue storage cost."),
-                recommendation="Delete the VM and its disks if unneeded, else disregard.",
-                has_price=True, debug_reason=reason, extra_details=vm,
+                description=(f"VM '{vm.get('name')}' ({vm.get('vmSize')}) is {state}. Its {n_disks} "
+                            f"disk{'s' if n_disks != 1 else ''} keep accruing storage cost while it's stopped."),
+                recommendation="Delete the VM and its disks if it's no longer needed.",
+                has_price=disk_cost > 0, debug_reason=reason,
+                # Grounded in the disks' real cost, not the VM's ~0 compute — override the cap basis.
+                grounded=disk_cost > 0, actual_cost_override=disk_cost if disk_cost > 0 else None,
+                extra_details={**vm, "attached_disk_count": n_disks, "disk_monthly_cost": disk_cost},
             ))
         return out
 
@@ -478,14 +857,27 @@ class FindingsEngine:
 
     # -- rule-driven orphan/waste (ARG-authoritative, broad coverage) ---------
 
-    def detect_orphans(self, bucket: str, rows: List[Dict]) -> List[Dict]:
-        """Evaluate a rule-driven orphan bucket (snapshots, empty LBs, NAT gw, NICs, NSGs…)."""
+    async def detect_orphans(self, bucket: str, rows: List[Dict]) -> List[Dict]:
+        """Evaluate a rule-driven orphan bucket (snapshots, empty LBs, NAT gw, GRS vaults…).
+
+        Load Balancer / NAT Gateway / Bastion are priced LIVE from the Retail Prices API (in the
+        billing currency, with the dated estimate as a sanity-checked fallback). Snapshot and GRS
+        vault stay estimates because their cost depends on data volume Resource Graph doesn't expose.
+        """
         rule = ORPHAN_RULES.get(bucket)
         if rule is None:
             return []
         out = []
         for row in rows:
-            monthly = from_usd(rule.monthly_cost(row), self._currency)  # rule estimates are USD
+            region = row.get("location") or "eastus"
+            if bucket == "empty_load_balancers":
+                monthly = await self._pricing.get_load_balancer_monthly_price(region)
+            elif bucket == "idle_nat_gateways":
+                monthly = await self._pricing.get_nat_gateway_monthly_price(region)
+            elif bucket == "bastion_hosts":
+                monthly = await self._pricing.get_bastion_monthly_price(region, row.get("skuName") or "Basic")
+            else:
+                monthly = from_usd(rule.monthly_cost(row), self._currency)  # snapshot / vault estimate
             reason = (
                 f"{CATEGORY_DISPLAY.get(rule.category, rule.category)}: matched by Resource Graph "
                 f"state as of {self._snapshot}; estimated {monthly:.2f}/mo ({self._currency})."
@@ -882,55 +1274,84 @@ class FindingsEngine:
         VMs already recommended for deletion (idle/stopped) so their licence isn't double-counted.
         """
         exclude_ids = exclude_ids or set()
-        eligible: List[Dict] = []
-        total = 0.0
-        sub_id: Optional[str] = None
         cost_available = bool(self._cost_map)  # per-resource Cost Management data present?
+
+        # Pass 1 — gather each eligible VM's prices + vCPUs, and sample the per-vCore licence.
+        rows: List[Dict] = []
+        per_vcore_samples: List[float] = []
         for vm in vms:
             if (vm.get("id") or "").lower() in exclude_ids:
                 continue  # VM is being deleted (idle/stopped) → no licence to save
             sku = vm.get("vmSize") or ""
             region = vm.get("location") or "eastus"
             actual = self._cost_map.get((vm.get("id") or "").lower())
-            # You can't save the Windows licence on a VM you aren't paying for. When we have
-            # per-resource billing, skip VMs that show no measured cost in the window (deallocated /
-            # demo boxes not actually billing) — otherwise AHB inflates on list price. Only when NO
-            # per-resource billing is available do we fall back to the raw retail delta.
+            # You can't save the Windows licence on a VM you aren't paying for. With per-resource
+            # billing, skip VMs showing no measured cost (deallocated / demo boxes); only without it
+            # do we fall back to the raw retail delta.
             if cost_available and (not actual or actual <= 0):
                 continue
             try:
                 windows = await self._pricing.get_vm_windows_monthly_price(region, sku)
-                # Compute-only (post-AHB) rate = a same-size Linux VM: identical hardware, NO Windows
-                # licence. It equals what the VM costs once AHB is applied, so the gap up to the
-                # Windows price is exactly the licence charge. (Linux is only a measuring stick here.)
+                # Compute-only (post-AHB) rate = a same-size Linux VM: identical hardware, no licence.
                 compute_only = await self._pricing.get_vm_monthly_price(region, sku)
             except PricingUnavailableError:
                 continue
-            if not windows or not compute_only:
+            if not compute_only:
                 continue
-            # The licence is the ONLY difference between the Windows price and the compute-only price.
-            # Take it as a fraction of the Windows price, then apply it to the VM's ACTUAL cost so the
-            # saving tracks real, part-time spend instead of full-time list price.
-            lic_fraction = max(0.0, (windows - compute_only) / windows) if windows else 0.0
+            vcpu = _vcpus(sku)
+            rows.append({"vm": vm, "sku": sku, "region": region, "actual": actual,
+                         "windows": windows, "compute_only": compute_only, "vcpu": vcpu})
+            # Sample the per-vCore licence only where the Windows fetch looks sane (clearly > Linux).
+            if windows and vcpu and windows > compute_only:
+                per_vcore_samples.append((windows - compute_only) / vcpu)
+        if not rows:
+            return []
+
+        # The Windows Server licence is a flat per-vCore charge — it should be identical per vCore on
+        # every VM. Estimate it robustly with the MEDIAN of the samples: that neutralises a bad
+        # per-SKU price fetch (some B-series return a Windows price barely above Linux, which would
+        # otherwise understate their AHB) without disturbing the VMs that priced correctly.
+        per_vcore_licence = _median(per_vcore_samples)
+
+        eligible: List[Dict] = []
+        total = 0.0
+        sub_id: Optional[str] = None
+        for r in rows:
+            vm, windows, compute_only = r["vm"], r["windows"], r["compute_only"]
+            vcpu, actual = r["vcpu"], r["actual"]
+            # Licence = vCPUs × the environment's per-vCore rate; fall back to this VM's own retail
+            # delta only when it can't be sized or there's no per-vCore estimate.
+            if per_vcore_licence is not None and vcpu:
+                licence = vcpu * per_vcore_licence
+                windows_eff = compute_only + licence
+            elif windows and windows > compute_only:
+                licence = windows - compute_only
+                windows_eff = windows
+            else:
+                continue
+            lic_fraction = max(0.0, licence / windows_eff) if windows_eff else 0.0
+            if lic_fraction <= 0:
+                continue
+            # Take the licence as a fraction of the full Windows price, then apply it to the VM's ACTUAL
+            # cost so the saving tracks real, part-time spend instead of full-time list price.
             if cost_available:
                 monthly = round(actual * lic_fraction, 2)
                 grounded = True
             else:
-                monthly = round(max(0.0, windows - compute_only), 2)
+                monthly = round(licence, 2)
                 grounded = False
             if monthly <= 0:
                 continue
             sub_id = sub_id or vm.get("subscriptionId")
             eligible.append({
-                "name": vm.get("name"), "sku": sku, "region": region,
+                "name": vm.get("name"), "sku": r["sku"], "region": r["region"],
                 "monthly_savings": monthly, "resource_id": vm.get("id"),
                 "actual_cost_based": grounded,
-                # Audit trail — the exact inputs so the figure is verifiable against the calculator:
-                # licence = windows − compute_only; saving = (grounded ? actual : windows) × fraction.
-                "windows_price": round(windows, 2), "compute_only_price": round(compute_only, 2),
-                "licence_charge": round(windows - compute_only, 2),
-                "licence_fraction": round(lic_fraction, 4),
-                "actual_monthly_cost": round(actual, 2) if actual else None,
+                # Audit trail — verifiable inputs. licence = vCPUs × per-vCore rate (median-calibrated);
+                # windows_price = compute_only + licence; saving = (grounded ? actual : licence) × fraction.
+                "windows_price": round(windows_eff, 2), "compute_only_price": round(compute_only, 2),
+                "licence_charge": round(licence, 2), "licence_fraction": round(lic_fraction, 4),
+                "vcpu": vcpu, "actual_monthly_cost": round(actual, 2) if actual else None,
             })
             total += monthly
         if not eligible:
@@ -948,9 +1369,9 @@ class FindingsEngine:
         }
         grounded_count = sum(1 for e in eligible if e.get("actual_cost_based"))
         reason = (
-            f"{n} running Windows VMs without licenseType=Windows_Server; licence fraction "
-            f"(Windows − compute-only)/Windows applied to actual cost for {grounded_count}/{n} "
-            f"(retail delta fallback for the rest); ${total:.2f}/mo across: {shown}."
+            f"{n} running Windows VMs without licenseType=Windows_Server; licence = vCPUs × per-vCore "
+            f"rate (median-calibrated across the fleet, so a bad per-SKU fetch can't skew it), applied "
+            f"as a fraction of actual cost for {grounded_count}/{n}; ${total:.2f}/mo across: {shown}."
         )
         return [self._finding(
             "windows_ahb", synthetic, "microsoft.compute/virtualmachines", total,
@@ -967,6 +1388,95 @@ class FindingsEngine:
             # Grounded when every eligible VM's saving came from its actual bill (not the retail delta).
             grounded=cost_available and grounded_count == n,
             extra_details={"eligible_vms": eligible, "eligible_count": n},
+        )]
+
+    # -- SQL Server Azure Hybrid Benefit (one classified finding) ---------------
+
+    async def detect_sql_ahb(
+        self, sql_resources: List[Dict], exclude_ids: Optional[set] = None,
+    ) -> List[Dict]:
+        """Roll all AHB-eligible vCore SQL (Databases + Managed Instances) into ONE classified finding.
+
+        Azure Hybrid Benefit lets you apply owned SQL Server licences (with Software Assurance) to vCore
+        SQL, switching licenseType LicenseIncluded → BasePrice. It removes only the SQL Server *licence*
+        component — a fixed per-vCore charge that's the same dollar amount across tiers — so the saving
+        is `vCores × per-vCore licence`, bounded by the resource's actual billed cost. Isolating the
+        licence keeps storage/backup out of the figure so it can't over-state. Resource-less (`id=None`)
+        so it escapes the per-resource dedupe: the licence is additive with any reservation on compute.
+        `exclude_ids` drops paused/stopped SQL (no billable compute → no licence to save).
+        """
+        exclude_ids = exclude_ids or set()
+        per_vcore = from_usd(SQL_AHB_LICENCE_PER_VCORE_MONTHLY_USD, self._currency)
+        eligible: List[Dict] = []
+        total = 0.0
+        sub_id: Optional[str] = None
+        cost_available = bool(self._cost_map)
+        grounded_count = 0
+        for r in sql_resources:
+            rid = (r.get("id") or "").lower()
+            if rid in exclude_ids:
+                continue
+            vcores = int(r.get("vcores") or 0)
+            if vcores <= 0:
+                continue
+            actual = self._cost_map.get(rid)
+            # You can't save the licence on a resource you aren't billing for. With per-resource cost
+            # data, skip SQL that shows no measured spend; only without it do we show the raw estimate.
+            if cost_available and (not actual or actual <= 0):
+                continue
+            licence = round(vcores * per_vcore, 2)
+            if cost_available:
+                monthly = round(min(licence, actual), 2)  # a saving can't exceed what you pay
+                grounded = True
+            else:
+                monthly = licence
+                grounded = False
+            if monthly <= 0:
+                continue
+            grounded_count += 1 if grounded else 0
+            sub_id = sub_id or r.get("subscriptionId")
+            eligible.append({
+                "name": r.get("name"), "sku": r.get("skuName") or r.get("tier"),
+                "region": r.get("location"), "monthly_savings": monthly,
+                "resource_id": r.get("id"), "actual_cost_based": grounded,
+                # Audit trail: saving = vCores × per-vCore licence, capped at actual.
+                "vcores": vcores, "per_vcore_licence": round(per_vcore, 2),
+                "actual_monthly_cost": round(actual, 2) if actual else None,
+            })
+            total += monthly
+        if not eligible:
+            return []
+
+        total = round(total, 2)
+        eligible.sort(key=lambda e: -e["monthly_savings"])
+        shown = ", ".join(e["name"] for e in eligible[:6] if e["name"])
+        if len(eligible) > 6:
+            shown += f", +{len(eligible) - 6} more"
+        n = len(eligible)
+        synthetic = {
+            "id": None, "name": f"{n} SQL resource{'s' if n != 1 else ''} eligible for SQL AHB",
+            "subscriptionId": sub_id, "resourceGroup": None,
+        }
+        reason = (
+            f"{n} vCore SQL resources with licenseType=LicenseIncluded; saving = vCores × "
+            f"${SQL_AHB_LICENCE_PER_VCORE_MONTHLY_USD:.0f}/vCore licence, capped at actual cost for "
+            f"{grounded_count}/{n}; total ${total:.2f}/mo across: {shown}."
+        )
+        return [self._finding(
+            "sql_ahb", synthetic, "microsoft.sql/servers/databases", total,
+            base_confidence=0.7,
+            description=(
+                f"{n} vCore SQL {'resource' if n == 1 else 'resources'} (Databases/Managed Instances) "
+                f"pay Azure's SQL Server licence on top of compute ({shown}). Azure Hybrid Benefit removes "
+                "that charge if you already own SQL Server licences with Software Assurance — the saving "
+                "shown is that licence portion."
+            ),
+            recommendation=("Set licenseType to BasePrice (Azure Hybrid Benefit) on the vCore SQL "
+                            "resources you have spare SQL Server licences (with Software Assurance) for; "
+                            "leave the rest on pay-as-you-go."),
+            has_price=True, debug_reason=reason,
+            grounded=cost_available and grounded_count == n,
+            extra_details={"eligible_vms": eligible, "eligible_count": n, "licence_kind": "SQL Server"},
         )]
 
     # -- Advisor-native recommendations ----------------------------------------

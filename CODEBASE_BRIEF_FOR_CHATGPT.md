@@ -12,7 +12,7 @@
 
 Azure CAT is a **multi-tenant SaaS web app** that scans a customer's Azure subscriptions and finds
 cost-saving opportunities (idle VMs, unattached disks, orphaned IPs, oversized resources, Reserved
-Instance candidates, etc.), then produces a report (PDF/Excel) with estimated monthly/annual savings.
+Instance candidates, etc.), then produces a PDF report with estimated monthly/annual savings.
 
 **Flow:**
 1. User signs in with their own Microsoft/Azure account (delegated auth — no client secrets, the app
@@ -22,7 +22,7 @@ Instance candidates, etc.), then produces a report (PDF/Excel) with estimated mo
    pull Azure Advisor recommendations → pull actual historical costs → calculate live prices →
    detect findings → generate report.
 4. Frontend polls for progress and shows a live status bar, then a results table.
-5. User downloads a PDF or Excel report, or dismisses findings they don't care about.
+5. User downloads a PDF report, or dismisses findings they don't care about.
 
 This is aimed at consultants/MSPs or an internal team running cost assessments for multiple client
 Azure tenants — hence "multi-tenant," "tenant isolation," "audit logging," etc. below.
@@ -37,7 +37,7 @@ Azure tenants — hence "multi-tenant," "tenant isolation," "audit logging," etc
 | Backend | Python 3.14, FastAPI, SQLAlchemy ORM, Alembic (migrations), httpx (async HTTP), pytest |
 | Database | SQLite for dev (`cat.db`), designed to swap to Postgres via `DATABASE_URL` |
 | Auth | Microsoft Entra ID (Azure AD) via MSAL — delegated, multi-tenant, no app secrets |
-| Reports | ReportLab (PDF), openpyxl (Excel) |
+| Reports | ReportLab (PDF) |
 
 No Docker/Kubernetes in this repo. It runs as a plain FastAPI process (serving the built React app as
 static files in production) plus a SQLite file. Deploy target mentioned in docs is Azure App Service.
@@ -87,7 +87,7 @@ CAT/
 │   │       ├── state_machine.py     # Assessment status/progress state machine
 │   │       ├── resilience.py        # Retry-with-backoff + circuit breaker for Azure API calls
 │   │       ├── audit.py             # Writes audit log entries for sensitive actions
-│   │       ├── report.py            # Generates the PDF and Excel report files
+│   │       ├── report.py            # Generates the PDF report file
 │   │       └── cache.py             # Generic in-memory TTL cache (used by pricing.py)
 │   │
 │   ├── alembic/versions/        # Database migration files (001 → 004 so far)

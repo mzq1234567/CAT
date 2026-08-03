@@ -58,6 +58,21 @@ def idle_app_service_plans_query() -> str:
           capacity = toint(sku.capacity), tags"""
 
 
+def active_app_service_plans_query() -> str:
+    """App Service Plans that HOST apps (numberOfSites > 0) on a paid tier — candidates for rightsizing
+    to a smaller SKU in the same series when CPU/memory stay consistently low. Free/Shared/Dynamic
+    (consumption) tiers have nothing to downsize, so they're excluded."""
+    return """Resources
+| where type == 'microsoft.web/serverfarms'
+| where toint(properties.numberOfSites) > 0
+| where tostring(sku.tier) !in ('Free', 'Shared', 'Dynamic')
+| project id, name, subscriptionId, resourceGroup, location,
+          skuName = tostring(sku.name),
+          tier = tostring(sku.tier),
+          numberOfSites = toint(properties.numberOfSites),
+          capacity = toint(sku.capacity), tags"""
+
+
 def deallocated_vms_query() -> str:
     return f"""Resources
 | where type == 'microsoft.compute/virtualmachines'
@@ -65,6 +80,8 @@ def deallocated_vms_query() -> str:
 | where powerState in ('VM deallocated', 'VM stopped')
 | project id, name, subscriptionId, resourceGroup, location,
           vmSize = tostring(properties.hardwareProfile.vmSize),
+          osDiskId = tostring(properties.storageProfile.osDisk.managedDisk.id),
+          dataDisks = properties.storageProfile.dataDisks,
           powerState, tags"""
 
 
@@ -158,6 +175,82 @@ def geo_redundant_vaults_query() -> str:
 | project id, name, subscriptionId, resourceGroup, location, tags"""
 
 
+def rightsizable_premium_disks_query() -> str:
+    """Attached Premium SSD managed disks — candidates to downgrade to Standard SSD when their IOPS +
+    throughput stay well within Standard SSD's baseline. `managedBy` is the owning VM (used to exclude
+    disks on SQL VMs, which need Premium's low latency). Unattached disks are handled by the orphan
+    detector; this is only for in-use Premium disks."""
+    return """Resources
+| where type == 'microsoft.compute/disks'
+| where tostring(sku.name) in ('Premium_LRS', 'Premium_ZRS')
+| where tostring(properties.diskState) == 'Attached'
+| extend sizeGB = toint(properties.diskSizeGB)
+| where sizeGB > 0
+| project id, name, subscriptionId, resourceGroup, location,
+          skuName = tostring(sku.name), sizeGB, managedBy = tostring(managedBy), tags"""
+
+
+def sql_virtual_machines_query() -> str:
+    """SQL Server VMs (the SQL IaaS extension registration). Returns the underlying VM resource id so
+    disks attached to them can be excluded from Premium→Standard downgrade — SQL needs Premium's low,
+    consistent latency even when IOPS/throughput are low."""
+    return """Resources
+| where type == 'microsoft.sqlvirtualmachine/sqlvirtualmachines'
+| project vmId = tolower(tostring(properties.virtualMachineResourceId))"""
+
+
+def rightsizable_sql_databases_query() -> str:
+    """vCore provisioned SQL Databases (not DTU, not serverless) that are online and above the smallest
+    size — candidates for rightsizing to fewer vCores when CPU + data IO + log IO stay consistently low.
+    vCores come from sku.capacity; the 2-vCore floor is the smallest GP/BC size (nothing below to move to).
+    """
+    return """Resources
+| where type == 'microsoft.sql/servers/databases'
+| where name != 'master'
+| where tostring(sku.tier) in ('GeneralPurpose', 'BusinessCritical', 'Hyperscale')
+| where tostring(sku.name) !contains '_S_'
+| where tostring(properties.status) !in ('Paused', 'Disabled', 'Offline', 'Inaccessible')
+| extend vcores = toint(sku.capacity)
+| where vcores > 2
+| project id, name, subscriptionId, resourceGroup, location,
+          tier = tostring(sku.tier), skuName = tostring(sku.name), vcores, tags"""
+
+
+def rightsizable_sql_managed_instances_query() -> str:
+    """vCore SQL Managed Instances (GP/BC) that are running and above the smallest size — candidates
+    for rightsizing to fewer vCores when CPU stays consistently low. vCores from properties.vCores;
+    the 4-vCore floor is the smallest MI size."""
+    return """Resources
+| where type == 'microsoft.sql/managedinstances'
+| where tostring(properties.state) !in ('Stopped', 'Failed', 'Inaccessible')
+| extend vcores = toint(properties.vCores)
+| where vcores > 4
+| project id, name, subscriptionId, resourceGroup, location,
+          tier = tostring(sku.tier), skuName = tostring(sku.name), vcores, tags"""
+
+
+def sql_ahb_eligible_query() -> str:
+    """vCore SQL Databases + Managed Instances paying the SQL Server licence (licenseType=LicenseIncluded).
+
+    Azure Hybrid Benefit applies only to the vCore *provisioned* model — never DTU or serverless — so
+    serverless SKUs (name contains '_S_') and DTU databases (which have no licenseType) fall out
+    naturally. `master` system databases and paused/stopped resources carry no billable compute, so
+    they're excluded too. vCores come from properties.vCores (MI) or sku.capacity (DB).
+    """
+    return """Resources
+| where (type == 'microsoft.sql/servers/databases'
+         and name != 'master'
+         and tostring(sku.name) !contains '_S_'
+         and tostring(properties.status) !in ('Paused', 'Disabled', 'Offline', 'Inaccessible'))
+     or (type == 'microsoft.sql/managedinstances'
+         and tostring(properties.state) !in ('Stopped', 'Failed', 'Inaccessible'))
+| where tostring(properties.licenseType) == 'LicenseIncluded'
+| extend vcores = coalesce(toint(properties.vCores), toint(sku.capacity))
+| where vcores > 0
+| project id, name, type, subscriptionId, resourceGroup, location,
+          tier = tostring(sku.tier), skuName = tostring(sku.name), vcores, tags"""
+
+
 def all_resources_summary_query() -> str:
     """Full inventory: top-level resources counted by type. Powers 'N resources / M types scanned'.
 
@@ -183,6 +276,11 @@ def filtered_inventory_queries() -> Dict[str, str]:
         "unattached_disks": unattached_disks_query(),
         "orphaned_public_ips": orphaned_public_ips_query(),
         "idle_app_service_plans": idle_app_service_plans_query(),
+        "active_app_service_plans": active_app_service_plans_query(),
+        "rightsizable_sql_databases": rightsizable_sql_databases_query(),
+        "rightsizable_sql_managed_instances": rightsizable_sql_managed_instances_query(),
+        "rightsizable_premium_disks": rightsizable_premium_disks_query(),
+        "sql_virtual_machines": sql_virtual_machines_query(),
         "deallocated_vms": deallocated_vms_query(),
         "paused_sql_databases": paused_sql_databases_query(),
         "stopped_sql_managed_instances": stopped_sql_managed_instances_query(),
@@ -194,5 +292,6 @@ def filtered_inventory_queries() -> Dict[str, str]:
         "bastion_hosts": bastion_hosts_query(),
         # Commitments / licensing / backup
         "windows_vms_without_ahb": windows_vms_without_ahb_query(),
+        "sql_ahb_eligible": sql_ahb_eligible_query(),
         "geo_redundant_vaults": geo_redundant_vaults_query(),
     }

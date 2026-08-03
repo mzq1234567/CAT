@@ -152,6 +152,7 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
             <SavingsProjection
               monthlySavings={assessment.total_savings_monthly}
               monthlySpend={assessment.current_monthly_spend}
+              annualGrowth={assessment.observed_annual_growth}
             />
           </CardContent>
         </Card>

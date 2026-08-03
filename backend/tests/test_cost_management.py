@@ -229,6 +229,39 @@ async def test_cost_map_and_consistency_from_one_query():
             "rows": [[100.0, RID, "2025-05-01"], [110.0, RID, "2025-06-01"]]}})  # two months
 
     client = AzureClient("fake-token", transport=httpx.MockTransport(handler))
-    cost_map, cons = await get_cost_map_and_consistency(client, "sub-1")
+    cost_map, cons, totals = await get_cost_map_and_consistency(client, "sub-1")
     assert cost_map[RID.lower()] == 110.0                 # cost basis = most recent complete month
     assert cons[RID.lower()]["billed_months"] == 2        # steadiness from the same single query
+    assert totals == {"2025-05-01": 100.0, "2025-06-01": 110.0}  # per-month totals for the trend
+
+
+def test_parse_monthly_totals_sums_across_resources_by_month():
+    from app.services.cost_management import parse_monthly_totals
+
+    payload = {"properties": {
+        "columns": [{"name": "Cost"}, {"name": "ResourceId"}, {"name": "BillingMonth"}],
+        "rows": [
+            [100.0, "/r/a", "2025-05-01"], [40.0, "/r/b", "2025-05-01"],   # May total 140
+            [120.0, "/r/a", "2025-06-01"], [50.0, "/r/b", "2025-06-01"],   # June total 170
+        ]}}
+    assert parse_monthly_totals(payload) == {"2025-05-01": 140.0, "2025-06-01": 170.0}
+
+
+def test_linear_growth_rate_rising_trend():
+    from app.services.cost_management import linear_growth_rate
+    # +100/mo, line ends at 1500 → (100*12)/1500 = 0.80 annual growth.
+    assert linear_growth_rate([1000, 1100, 1200, 1300, 1400, 1500]) == 0.8
+    # Gentle +20/mo, line ends at 1100 → (20*12)/1100 ≈ 0.218.
+    rate = linear_growth_rate([1000, 1020, 1040, 1060, 1080, 1100])
+    assert 0.2 < rate < 0.24
+    # A steep trend is clamped to the 100 %/yr guardrail so projections stay sane.
+    assert linear_growth_rate([1000, 1300, 1600, 1900, 2200, 2500]) == 1.0
+
+
+def test_linear_growth_rate_edge_cases():
+    from app.services.cost_management import linear_growth_rate
+    assert linear_growth_rate([1000, 1050]) is None          # < 3 months → hide the chart
+    assert linear_growth_rate([1500, 1300, 1100]) == 0.0     # declining → no invented growth
+    assert linear_growth_rate([1000, 1000, 1000]) == 0.0     # flat → 0%
+    # A single one-off spike doesn't dominate a best-fit line (unlike month-over-month averaging).
+    assert linear_growth_rate([1000, 1000, 5000, 1000, 1000, 1000]) is not None

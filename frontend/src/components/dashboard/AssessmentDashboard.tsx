@@ -14,7 +14,8 @@ import RecommendationCard from "./RecommendationCard";
 import { setReportCurrency } from "./tokens";
 
 export default function AssessmentDashboard({ assessment }: { assessment: Assessment }) {
-  const findings = assessment.findings;
+  // Dismissed findings drop out of every view; the backend re-rolls the headline totals on dismiss.
+  const findings = assessment.findings.filter((f) => !f.dismissed);
   const [area, setArea] = React.useState<Area | null>(null);
 
   // Render every figure in the subscription's billing currency (detected from Cost Management).
@@ -107,7 +108,10 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
           title="Recommendations"
           subtitle="Sorted by annual savings. Expand any item to see why it was flagged and what to change."
         />
-        <DetailedFindings findings={filtered} renderCard={(f) => <RecommendationCard key={f.id} finding={f} />} />
+        <DetailedFindings
+          findings={filtered}
+          renderCard={(f) => <RecommendationCard key={f.id} finding={f} assessmentId={assessment.id} />}
+        />
       </Box>
     </Box>
   );

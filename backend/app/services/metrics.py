@@ -95,6 +95,177 @@ async def get_vm_utilisation(
     return VmUtilisation(avg_cpu, max_cpu, cpu_dp, mem_pct, mem_dp, days)
 
 
+# App Service Plans expose CPU + memory as direct percentages at the plan (serverfarm) level.
+ASP_CPU_METRIC = "CpuPercentage"
+ASP_MEMORY_METRIC = "MemoryPercentage"
+
+
+async def get_asp_utilisation(
+    client: AzureClient, resource_id: str, days: int = DEFAULT_WINDOW_DAYS
+):
+    """Return `(peak_cpu_pct, peak_memory_pct, datapoint_count)` for an App Service Plan.
+
+    Peak (Maximum) over the window — a downsize must be safe at the busiest moment. Either metric may
+    be empty (`None`); the caller treats missing data as "unverified", never as 0%.
+    """
+    cpu, mem = await asyncio.gather(
+        client.get_metric(resource_id, ASP_CPU_METRIC, days=days, aggregation="Maximum"),
+        client.get_metric(resource_id, ASP_MEMORY_METRIC, days=days, aggregation="Maximum"),
+    )
+    peak_cpu = round(max(cpu), 2) if cpu else None
+    peak_mem = round(max(mem), 2) if mem else None
+    return peak_cpu, peak_mem, max(len(cpu), len(mem))
+
+
+async def enrich_asps_with_metrics(
+    client: AzureClient, plans: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+) -> List[Dict]:
+    """Attach peak CPU + memory % to each App Service Plan row, fetched in parallel (bounded)."""
+    if not plans:
+        return []
+    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
+
+    async def _bounded(plan_id: str):
+        async with sem:
+            return await get_asp_utilisation(client, plan_id, days)
+
+    results = await asyncio.gather(*[_bounded(p.get("id", "")) for p in plans], return_exceptions=True)
+    enriched: List[Dict] = []
+    for plan, res in zip(plans, results):
+        peak_cpu, peak_mem, dp = res if isinstance(res, tuple) else (None, None, 0)
+        enriched.append({
+            **plan, "max_cpu_pct": peak_cpu, "max_memory_pct": peak_mem,
+            "metric_datapoints": dp, "metric_window_days": days,
+        })
+    return enriched
+
+
+# SQL Database vCore load shows up across several dimensions — a DB can be CPU-light but IO-bound, so a
+# safe downsize needs ALL of them low, not CPU alone.
+SQL_CPU_METRIC = "cpu_percent"
+SQL_DATA_IO_METRIC = "physical_data_read_percent"
+SQL_LOG_IO_METRIC = "log_write_percent"
+
+
+async def get_sql_db_utilisation(
+    client: AzureClient, resource_id: str, days: int = DEFAULT_WINDOW_DAYS
+):
+    """Return `(peak_cpu, peak_data_io, peak_log_io, datapoint_count)` %s for a SQL Database.
+
+    Peaks (Maximum) over the window — a downsize must be safe at the busiest moment. Any metric may be
+    None (no data); the caller only downsizes when every AVAILABLE dimension clears the ceiling.
+    """
+    cpu, data_io, log_io = await asyncio.gather(
+        client.get_metric(resource_id, SQL_CPU_METRIC, days=days, aggregation="Maximum"),
+        client.get_metric(resource_id, SQL_DATA_IO_METRIC, days=days, aggregation="Maximum"),
+        client.get_metric(resource_id, SQL_LOG_IO_METRIC, days=days, aggregation="Maximum"),
+    )
+    return (
+        round(max(cpu), 2) if cpu else None,
+        round(max(data_io), 2) if data_io else None,
+        round(max(log_io), 2) if log_io else None,
+        max(len(cpu), len(data_io), len(log_io)),
+    )
+
+
+async def enrich_sql_dbs_with_metrics(
+    client: AzureClient, dbs: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+) -> List[Dict]:
+    """Attach peak CPU / data-IO / log-IO % to each SQL Database row, fetched in parallel (bounded)."""
+    if not dbs:
+        return []
+    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
+
+    async def _bounded(db_id: str):
+        async with sem:
+            return await get_sql_db_utilisation(client, db_id, days)
+
+    results = await asyncio.gather(*[_bounded(d.get("id", "")) for d in dbs], return_exceptions=True)
+    enriched: List[Dict] = []
+    for db, res in zip(dbs, results):
+        cpu, data_io, log_io, dp = res if isinstance(res, tuple) else (None, None, None, 0)
+        enriched.append({
+            **db, "max_cpu_pct": cpu, "max_data_io_pct": data_io, "max_log_io_pct": log_io,
+            "metric_datapoints": dp, "metric_window_days": days,
+        })
+    return enriched
+
+
+# Managed-disk resource-level I/O metrics (microsoft.compute/disks). Peak IOPS = read+write ops/sec;
+# peak throughput = read+write bytes/sec. Names verified against Azure Monitor supported metrics.
+DISK_READ_OPS_METRIC = "Composite Disk Read Operations/sec"
+DISK_WRITE_OPS_METRIC = "Composite Disk Write Operations/sec"
+DISK_READ_BYTES_METRIC = "Composite Disk Read Bytes/sec"
+DISK_WRITE_BYTES_METRIC = "Composite Disk Write Bytes/sec"
+
+
+async def get_disk_io(client: AzureClient, resource_id: str, days: int = DEFAULT_WINDOW_DAYS):
+    """Return `(peak_iops, peak_mbps, datapoint_count)` for a managed disk, or `(None, None, 0)`.
+
+    Peak IOPS/throughput are the sum of the read+write peaks — an upper bound on real usage, so it
+    makes a downgrade recommendation *less* likely (the safe direction).
+    """
+    ro, wo, rb, wb = await asyncio.gather(
+        client.get_metric(resource_id, DISK_READ_OPS_METRIC, days=days, aggregation="Maximum"),
+        client.get_metric(resource_id, DISK_WRITE_OPS_METRIC, days=days, aggregation="Maximum"),
+        client.get_metric(resource_id, DISK_READ_BYTES_METRIC, days=days, aggregation="Maximum"),
+        client.get_metric(resource_id, DISK_WRITE_BYTES_METRIC, days=days, aggregation="Maximum"),
+    )
+    if not (ro or wo or rb or wb):
+        return None, None, 0
+    peak_iops = (max(ro) if ro else 0) + (max(wo) if wo else 0)
+    peak_mbps = ((max(rb) if rb else 0) + (max(wb) if wb else 0)) / 1_000_000
+    return round(peak_iops, 1), round(peak_mbps, 1), max(len(ro), len(wo), len(rb), len(wb))
+
+
+async def enrich_disks_with_iops(
+    client: AzureClient, disks: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+) -> List[Dict]:
+    """Attach peak IOPS + throughput (MB/s) to each managed-disk row, fetched in parallel (bounded)."""
+    if not disks:
+        return []
+    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
+
+    async def _bounded(disk_id: str):
+        async with sem:
+            return await get_disk_io(client, disk_id, days)
+
+    results = await asyncio.gather(*[_bounded(d.get("id", "")) for d in disks], return_exceptions=True)
+    enriched: List[Dict] = []
+    for disk, res in zip(disks, results):
+        peak_iops, peak_mbps, dp = res if isinstance(res, tuple) else (None, None, 0)
+        enriched.append({
+            **disk, "peak_iops": peak_iops, "peak_mbps": peak_mbps,
+            "metric_datapoints": dp, "metric_window_days": days,
+        })
+    return enriched
+
+
+# SQL Managed Instance exposes CPU as its primary throttleable signal (no per-DB IO-percent metrics).
+SQL_MI_CPU_METRIC = "avg_cpu_percent"
+
+
+async def enrich_sql_mis_with_metrics(
+    client: AzureClient, instances: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+) -> List[Dict]:
+    """Attach peak CPU % to each SQL Managed Instance row (Maximum of avg_cpu_percent over the window)."""
+    if not instances:
+        return []
+    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
+
+    async def _bounded(mi_id: str):
+        async with sem:
+            cpu = await client.get_metric(mi_id, SQL_MI_CPU_METRIC, days=days, aggregation="Maximum")
+            return (round(max(cpu), 2) if cpu else None, len(cpu))
+
+    results = await asyncio.gather(*[_bounded(m.get("id", "")) for m in instances], return_exceptions=True)
+    enriched: List[Dict] = []
+    for mi, res in zip(instances, results):
+        cpu, dp = res if isinstance(res, tuple) else (None, 0)
+        enriched.append({**mi, "max_cpu_pct": cpu, "metric_datapoints": dp, "metric_window_days": days})
+    return enriched
+
+
 async def enrich_vms_with_metrics(
     client: AzureClient, vms: List[Dict], days: int = DEFAULT_WINDOW_DAYS
 ) -> List[Dict]:

@@ -1,252 +1,308 @@
 # Azure Cost Assessment Tool (Azure CAT)
 
-A multi-tenant SaaS platform that produces **consulting-grade Azure cost assessments**. A consultant
-signs in with their own Azure credentials (delegated auth — Reader access, nothing is ever created or
-deleted), points the tool at one or more subscriptions, and gets back a client-ready report of
-concrete, dollar-quantified savings — grounded in the client's **actual bill**, not list price.
+A multi-tenant SaaS **web app** that produces **consulting-grade Azure cost assessments**. A consultant
+(or a client) signs in with their own Azure credentials (delegated auth — **read-only**, nothing is ever
+created, modified, or deleted), points the tool at one or more subscriptions, and gets back a
+client-ready report of concrete, currency-quantified savings — grounded in the client's **actual bill**,
+not list price.
 
-It was built to replace a manual, spreadsheet-driven assessment process, and it mirrors that
-methodology exactly: read last month's real spend, validate it against several months of history, and
-recommend only what Azure genuinely offers for each resource.
+It replaces a manual, spreadsheet-driven assessment process and mirrors that methodology exactly: read
+last month's real spend, validate it against several months of history, and recommend only what Azure
+genuinely offers for each resource.
+
+> **If you are ChatGPT reading this:** this is the complete, current brief. The section most likely being
+> asked about is **Authentication flow** — specifically the "needs admin approval" prompt and whether the
+> app registration / consent can be avoided. Everything needed is in that section.
 
 ---
 
 ## What it finds
 
-Across **every resource type in the subscription** (not just VMs), grouped into the three cost pillars
-**Compute / Storage / Network**:
+Every resource type in the subscription (not just VMs), each a **single classified finding**, grounded
+and quantified:
 
-- **Reserved Instances (1-year & 3-year)** — per VM, only for SKUs Azure actually offers a reservation
-  for; prefers Azure's own usage-based reservation-recommendation engine, falls back to a real-retail
-  estimate.
-- **Savings Plans (1-year & 3-year)** — for compute that a Reserved Instance isn't offered for.
-- **Azure Hybrid Benefit** — the Windows Server licence portion of each Windows VM's bill, that you
-  stop paying by applying a licence you already own.
-- **Right-sizing** — VMs that peak (over 30 days, on **both** CPU and memory) low enough to fit a
-  smaller SKU, with the exact target size and the real price delta.
-- **Idle / deallocated VMs, unattached disks, orphaned public IPs, empty load balancers, idle NAT
-  gateways, orphaned snapshots, geo-redundant backup vaults** — waste that can be removed.
-- **Azure Advisor** cost recommendations, re-scored and validated consistently.
+- **Reserved Instances (1yr & 3yr)** and **Savings Plans (1yr & 3yr)** — from Azure's own usage-based
+  reservation engine (or a real-retail fallback). A VM goes into *either* RI *or* SP, never both.
+- **Azure Hybrid Benefit** — Windows Server AHB (VMs) and SQL Server AHB (vCore SQL DB/MI).
+- **Right-sizing** (metric-driven, conservative, grounded): VMs, App Service Plans, SQL Databases, SQL
+  Managed Instances, and **disk Premium → Standard SSD** (disks on SQL VMs excluded — SQL needs Premium
+  latency even at low IOPS).
+- **Waste / orphans**: idle & deallocated VMs (quantified by their still-billing disks), unattached
+  disks, orphaned public IPs, empty load balancers, idle NAT gateways, orphaned snapshots, GRS backup
+  vaults, idle App Service Plans, paused SQL DBs, stopped SQL MIs, Bastion review.
+- **Azure Advisor** cost recommendations, re-scored and validated.
 
-The output is an **executive dashboard** (interactive, drill-down per finding) and a downloadable
-**PDF/Excel report** styled as a branded client deliverable — cover page, table of contents, executive
-summary with 3-year spend projections, methodology, environment details, and per-optimisation tables.
+Output: an interactive **executive dashboard** (drill-down per finding, dismiss support) and a branded
+**PDF report** with a 3-year spend projection computed from the environment's *measured* growth trend.
 
 ---
 
-## How the numbers are trustworthy (the important part)
+## How the numbers are trustworthy (the differentiator)
 
-A cost-assessment tool is only useful if a client can present its numbers without being wrong. The
-design principle throughout is **never show a fabricated number as if it were real**.
+**Never show a fabricated number as if it were real.**
 
-- **Grounded in actual cost.** Every saving is a *fraction of what the resource really costs you* — the
-  discount % (RI/SP) or licence fraction (AHB) applied to the resource's actual monthly bill from
-  Cost Management. List price is only ever a labelled fallback, never the headline.
-- **Last complete calendar month.** Cost is read from the last *complete* month (never the current,
-  not-yet-fully-billed month), matching how a manual assessment reads "last month's bill." New
-  subscriptions with no complete month fall back to month-to-date.
-- **Month-over-month validation.** The tool pulls the last 4 complete months and flags each VM as
-  *steady* (billed consistently → safe to reserve) or *erratic* (swings → lower confidence).
-- **Savings can never exceed spend.** Because each finding is bounded by its own resource's real cost,
-  the total is ≤ measured spend by construction — no impossible "you'll save more than you pay."
-- **No double-counting.** One action per resource (you don't both delete a VM *and* reserve it); AHB
-  (licence) and RI (compute) are additive but never overlap; a VM recommended for deletion is excluded
-  from AHB.
-- **Only what Azure offers.** RIs are only recommended for SKUs that actually have a reservation;
-  everything else routes to a Savings Plan. Nothing is invented.
-- **Currency-correct.** Figures render in the subscription's billing currency (USD/CAD/INR/GBP/AUD/…),
-  and even severity banding is normalised to a USD-equivalent so an INR run doesn't mark everything
-  "critical."
-- **Reliable retrieval.** The heavily throttled billing APIs use patient, `Retry-After`-honouring
-  retries isolated from the shared circuit breaker, so a transient throttle self-heals within the run
-  instead of silently dropping cost data.
+- **Grounded in actual cost** — every headline saving is a fraction of the resource's real Cost-Management
+  bill (discount % for RI/SP, licence fraction for AHB, vCore-reduction ratio for rightsizing). List
+  price is only a labelled fallback.
+- **Last complete month**, validated against **6 months of history**; **savings can never exceed spend**
+  (each finding is capped at its own resource's cost); **no double-counting** (AHB licence + RI compute
+  are additive but never overlap; deletion candidates excluded from AHB).
+- **Only what Azure offers**, **currency-correct** (USD/CAD/INR/GBP/AUD/…, severity normalised to
+  USD-equivalent), **rightsizing is cautious** (peak not average, all load dimensions under a 70%
+  ceiling, real price deltas only, SQL only where real cost exists).
+- **Validation badges** — "Cost-validated" (grounded) vs "Estimate" (small nominal figures). Confidence
+  is tracked for ranking but **not shown to clients**.
 
-**Azure Hybrid Benefit, plainly:** a Windows VM's price = compute + a Windows Server licence. AHB lets
-you use a licence you already own instead of renting Azure's, so you pay only the compute. The tool
-finds the licence charge by subtracting the same-size **compute-only (Linux) price** from the **Windows
-price** — the exact figure Azure's own pricing calculator shows — and applies it to the VM's real bill.
-It's presented as a saving realised **only if you own (or buy) eligible licences with Software
-Assurance**.
+**AHB, plainly:** a Windows VM's price = compute + a Windows Server licence. The licence is a flat
+per-vCore charge, estimated as the **median across the environment's Windows VMs** (robust to a bad
+per-SKU price fetch) and applied to each VM's real bill — realised only if you own the licence with
+Software Assurance. SQL AHB works the same way (fixed per-vCore SQL licence).
 
 ---
 
-## How it works
+## Project architecture
 
-1. Consultant signs in via Microsoft (MSAL delegated auth).
-2. Selects one or more Azure subscriptions.
-3. The backend runs a background assessment:
-   - Inventory via **Azure Resource Graph** (server-side filtered, paginated).
-   - Utilisation via **Azure Monitor** — peak CPU (Maximum) + peak memory (100 − min Available %) over
-     30 days, concurrency-bounded.
-   - **Azure Advisor** + Azure **reservation-recommendation** (Consumption) engine.
-   - Actual cost via **Cost Management** — last complete month per resource + 4-month history +
-     per-service spend and billing currency.
-   - Live pricing via the public **Azure Retail Prices API**, fetched in the billing currency, cached
-     24h with last-known-good fallback.
-4. The findings engine grounds, validates, dedupes, and scores every opportunity.
-5. Frontend polls until complete, then shows the dashboard.
-6. Download the branded PDF / Excel report.
-
----
-
-## Architecture
+A single-page web app talking to a Python API that orchestrates read-only Azure calls:
 
 ```
-frontend/          React + Vite + MUI + Recharts (light, Turbo360-style UI; currency-aware)
+Browser (React SPA)  ──MSAL login──►  Microsoft Entra ID
+   │  (Azure ARM token, delegated)
+   ▼
+FastAPI backend  ──background job──►  Azure REST APIs (as the user):
+   │                                    Resource Graph, Monitor, Advisor,
+   │                                    Cost Management, Consumption, Retail Prices
+   ├── findings engine (grounding, dedup, scoring)
+   ├── SQLite (assessments, findings, inventory, audit)
+   └── PDF report (reportlab)
+```
+
+- **Stateless per request** on Azure — the user's token is used in-memory for the run, never persisted.
+- **Background assessment** — POST returns `202`; the frontend polls status until `completed`.
+- **Read-only** — verified: only GET/query calls, no writes.
+
+---
+
+## Folder structure
+
+```
+frontend/          React + Vite + MUI + Recharts (currency-aware, interactive charts)
+  src/
+    auth/          MSAL config (msalConfig.ts)
+    services/      api.ts (typed API client + token acquisition)
+    pages/         Login, SelectSubscriptions, Results
+    components/dashboard/   ExecutiveSummary, RecommendationCard, FindingEvidence, charts/
 backend/           FastAPI + SQLAlchemy + SQLite
   app/
-    api/           REST routes (subscriptions, assessments, report download), auth deps
+    main.py        App wiring, routers, CORS, serves built frontend
+    api/
+      routes/      assessments.py, subscriptions.py
+      dependencies.py   Bearer-token extraction + JWKS verification
     services/
-      azure_client.py     Azure ARM/Consumption/Cost-Management client (retry + circuit breaker)
+      azure_client.py     ARM/Consumption/Cost-Management client (retry + circuit breaker)
       inventory.py, kql.py  Resource Graph collection (server-side KQL)
-      metrics.py            Azure Monitor CPU/memory (bounded concurrency)
-      pricing.py            Retail Prices API (currency-aware, cached, fallbacks)
-      cost_management.py    Actual cost (last-month basis), currency, month-over-month consistency
+      metrics.py            Azure Monitor: VM / ASP / SQL DB / SQL MI / disk-IOPS enrichment
+      pricing.py            Retail Prices API (currency-aware, cached; live LB/NAT/Bastion/ASP)
+      estimates.py          Dated table of must-stay estimates (snapshot, GRS vault, SQL licence)
+      cost_management.py    Actual cost, currency, consistency, growth-rate trend
       reservations.py       Parse Azure reservation recommendations
-      findings.py           The findings engine (grounding, dedup, scoring, severity)
-      currency.py           USD↔billing-currency for thresholds + nominal estimates
+      findings.py           The findings engine (all detectors, grounding, dedup, scoring)
+      currency.py           USD<->billing-currency
       assessment.py         Orchestrator (state machine, background task)
-      report.py             Branded PDF (reportlab) + Excel (openpyxl)
-    security/        JWKS RS256 token verification, RBAC, rate limiting, audit log
-    models/          SQLAlchemy DB models + Pydantic schemas
+      report.py             Branded PDF + trend-based 3-year projections
+    security/        JWKS RS256 verification, RBAC, rate limiting, audit log
+    models/          db.py (SQLAlchemy models), schemas.py (Pydantic)
     database.py      SQLite via SQLAlchemy
-  alembic/           Database migrations (001–008)
+  alembic/           Migrations 001–009
+  scripts/           reconcile_assessment.py (per-finding integrity validation harness)
 ```
 
 ---
 
-## Prerequisites
+## Assessment engine
 
-- Python 3.12+ (3.14 works with pinned package versions)
-- Node.js 18+
-- An Azure account with permission to create App Registrations
+`services/findings.py` is the core. For each detector it: (1) reads the resource's utilisation +
+**actual cost**, (2) computes a **grounded** saving (discount/licence/vCore ratio × real cost), (3)
+**caps** it at the resource's actual cost, (4) **dedupes** to one finding per resource, (5) scores
+severity/confidence. Aggregates (AHB, RI, SP) roll many resources into one resource-less finding so they
+escape dedupe and can be additive. `services/assessment.py` is the state machine that fans out inventory
+→ metrics → advisor/reservations → cost, runs every detector, and persists. `scripts/reconcile_assessment.py`
+re-derives every finding and asserts the integrity invariants (Σfindings = total, savings ≤ spend, no
+double-count).
 
 ---
 
-## Setup
+## Authentication flow
 
-### 1. Azure App Registration
+### Today
+Browser web app: a **React SPA + MSAL** signs the user in against a **multi-tenant Entra ID app
+registration**, requesting delegated `https://management.azure.com/user_impersonation` (+ `openid profile
+email`). MSAL acquires an Azure ARM token; the SPA sends it as a Bearer header to FastAPI, which calls
+Azure **as the user**. **Read-only** (verified — only GET/query, no writes). The token is used in-memory
+and **not persisted/logged**. Tenant isolation: the backend verifies the token's **RS256 signature vs
+Entra's JWKS** (blocks `alg=none`/HS256 confusion) and scopes records to the caller's `tid`+`oid`.
 
-Create a **Multi-Tenant** App Registration in Azure Entra ID:
+The app **registration** (client_id) lives in the **developer's** home tenant. When a user from a
+**client** tenant first signs in, Entra **auto-creates a service principal (enterprise app)** in that
+tenant — standard for any multi-tenant app, holds only the consent grant (no standing access, no
+credential), and is admin-revocable.
 
-| Field | Value |
-|-------|-------|
-| Name | Azure Cost Assessment Tool |
-| Supported account types | Accounts in any organizational directory (Multitenant) |
-| Redirect URI (SPA) | `http://localhost:5173` |
+### The "needs admin approval" prompt (and whether it can be removed)
+This is a **tenant policy**, not the tool, and **cannot be turned off app-side.** It's the target tenant's
+**user-consent setting**:
+- *Allow user consent* → user self-consents, no admin needed.
+- *Do not allow user consent* (Microsoft's current default) → because ARM `user_impersonation` is **not**
+  "low-impact," an **admin must consent once**; after that, every user logs in with no prompt on their own
+  **Reader** role. Admin-consent URL:
+  `https://login.microsoftonline.com/<tenant-id>/adminconsent?client_id=<client-id>&redirect_uri=<uri>`
+- Who can consent: an **Entra directory admin** (Global / Cloud App / Application Administrator). A
+  subscription **"Reader" cannot** — that's an Azure RBAC role, unrelated to directory consent.
 
-**API Permissions (delegated):** `https://management.azure.com/user_impersonation`, `openid`,
-`profile`, `email`. Copy the **Application (client) ID**.
+### Two open decisions
+1. **Avoid app registration / consent entirely?** Not for a web app — a browser login *requires* its own
+   client_id, and any multi-tenant app creates the SP + hits the consent policy. The **only** way to zero
+   it out is a different architecture: a **read-only CLI / Cloud Shell script** the user runs in their own
+   Azure (uses **Microsoft's own** built-in identity + their Reader, creates nothing, needs no consent)
+   that exports a JSON this tool **ingests**. (Do **not** "borrow" the Azure CLI's client_id in a web app
+   — unsupported, Microsoft blocks it.)
+2. **The token the backend receives is write-capable** (inherits the user's RBAC — usually Owner). The
+   code only reads, but for **client self-service** a security team will flag it. Structural fix (not
+   built): a **read-only scoped identity** (client grants a service principal only Reader + Cost
+   Management Reader via a Deploy-to-Azure template; the tool auths as *that*), or the agentless route.
 
-For accurate, grounded results the signed-in user needs **Cost Management Reader** (in addition to
-Reader) on the assessed subscriptions — that's what unlocks the actual-bill grounding.
+---
 
-### 2. Backend
+## Azure resources required
+
+The tool **provisions nothing** — it only reads. To run it you need:
+
+- **An Entra ID app registration** (multi-tenant, delegated `user_impersonation` + `openid/profile/email`)
+  — one, created once by you.
+- **Azure RBAC roles** on the assessed subscription(s), held by the **signed-in user**:
+  **Reader** (inventory/metrics/advisor) **+ Cost Management Reader** (the actual-bill grounding). Without
+  Cost Management Reader the tool still runs but falls back to list-price estimates.
+- Azure services *consumed* (read-only, no charge beyond normal API usage): **Resource Graph, Azure
+  Monitor, Azure Advisor, Cost Management, Consumption (reservations)**, and the **public Retail Prices
+  API** (no auth).
+- *(Deployment only)* an **Azure App Service** (or any host) if you deploy it as a hosted web app.
+
+---
+
+## Setup instructions
+
+**App registration:** multi-tenant, SPA redirect `http://localhost:5173`, delegated permissions above.
+Copy the **Application (client) ID** into both `.env` files. `.env` holds only the **public** client ID
+(non-secret) and is gitignored; there are **no client secrets** anywhere (SPA uses PKCE; backend rides on
+the user's delegated token).
+
+## Local development
 
 ```bash
+# Backend
 cd backend
-cp .env.example .env            # set AZURE_CLIENT_ID=<your-client-id>
-
-python -m venv .venv
-.venv\Scripts\activate          # Windows  (source .venv/bin/activate on Linux/macOS)
-
+cp .env.example .env                 # set AZURE_CLIENT_ID=<client-id>
+python -m venv .venv && .venv\Scripts\activate      # (source .venv/bin/activate on *nix)
 pip install -r requirements.txt
-alembic upgrade head            # apply DB migrations (required after pulling changes)
+alembic upgrade head                 # REQUIRED after pulling changes (adds new columns)
 uvicorn app.main:app --reload --port 8000
-```
 
-> **After pulling changes, always run `alembic upgrade head`.** New columns (currency, report
-> metadata, etc.) are added via migrations; skipping this causes a 500 on new assessments.
-
-### 3. Frontend
-
-```bash
+# Frontend (separate terminal)
 cd frontend
-cp .env.example .env            # set VITE_AZURE_CLIENT_ID=<your-client-id>
-npm install
-npm run dev                     # http://localhost:5173
+cp .env.example .env                 # set VITE_AZURE_CLIENT_ID=<client-id>
+npm install && npm run dev           # http://localhost:5173
 ```
 
-### 4. Report branding (optional)
+> After pulling changes, **always run `alembic upgrade head`** — new columns are added via migrations;
+> skipping it 500s new assessments.
 
-Drop the TechPlus Talent logo at `backend/app/assets/tpt_logo.png` to brand the report cover + header
-(a text wordmark is used if absent). Client name on the cover is derived automatically from the Azure
-tenant display name.
+## Deployment
 
----
-
-## Environment Variables
-
-### backend/.env (key settings)
-
-| Variable | Description |
-|----------|-------------|
-| `AZURE_CLIENT_ID` | App Registration client ID |
-| `DATABASE_URL` | SQLite path (default `sqlite:///./cat.db`) |
-| `CORS_ORIGINS` | JSON array of allowed origins |
-| `PRICING_CURRENCY` | Default currency when billing currency can't be detected (default `USD`) |
-| `RESERVATION_BASIS` | `combined` \| `measured` \| `always_on` \| `advisor` |
-| `VERIFY_TOKEN_SIGNATURE` | Keep `true` outside local dev (JWKS signature check / tenant isolation) |
-| `AZURE_MAX_RETRIES`, `AZURE_RETRY_BASE_DELAY` | Retry/backoff tuning |
-
-### frontend/.env
-
-| Variable | Description |
-|----------|-------------|
-| `VITE_AZURE_CLIENT_ID` | Same App Registration client ID |
-| `VITE_API_URL` | Backend base URL (default `http://localhost:8000`) |
-
----
-
-## Authentication
-
-Delegated auth only — no client secrets, no background access. The signed-in user's own Azure token
-calls Azure APIs, so the tool only ever sees what that user already has access to. Tenant isolation is
-enforced by verifying the token's RS256 signature against Azure AD's JWKS (blocks `alg=none`/HS256
-confusion) and scoping every record to the caller's `tid` + `oid`.
-
-### Multi-tenant client onboarding
-
-For clients whose tenants require admin consent, send their IT admin:
-
-```
-https://login.microsoftonline.com/<their-tenant>/adminconsent?client_id=<your-client-id>&redirect_uri=http://localhost:5173
-```
-
----
-
-## Production Deployment (Azure App Service)
+Deploys as a single **Azure App Service** (FastAPI serves the built React app):
 
 ```bash
-cd frontend && npm run build     # outputs to frontend/dist/ (served by FastAPI)
-# Startup command: bash startup.sh
-# App Settings: AZURE_CLIENT_ID, CORS_ORIGINS=["https://your-app.azurewebsites.net"]
-# Run migrations on deploy: alembic upgrade head
+cd frontend && npm run build         # → frontend/dist/ (served by FastAPI)
+# App Service startup command:  bash startup.sh
+# App Settings:  AZURE_CLIENT_ID=<client-id>
+#                CORS_ORIGINS=["https://<your-app>.azurewebsites.net"]
+#                VERIFY_TOKEN_SIGNATURE=true
+# On deploy, run:  alembic upgrade head
 ```
 
-Add `https://your-app.azurewebsites.net` as a redirect URI in the App Registration.
+Add `https://<your-app>.azurewebsites.net` as a redirect URI on the app registration. For scale beyond a
+single instance, swap SQLite for Postgres (`DATABASE_URL`) and move the in-memory cache/rate-limiter to
+Redis.
 
 ---
 
-## Testing
+## Database
 
-```bash
-cd backend && python -m pytest -q      # 210 tests: findings, pricing, cost mgmt, reservations,
-                                       # currency, security, and a full mocked assessment pipeline
-cd frontend && npm run build           # type-check + production build
-```
+**SQLite** (dev; swappable to Postgres via `DATABASE_URL`) via SQLAlchemy, migrated with **Alembic
+(001–009)**. Four tables:
 
-The findings engine, pricing, cost-management, currency, and reservation parsing are all pure and unit-
-tested without network; the end-to-end pipeline test mocks every Azure API behind one transport.
+| Table | Purpose | Key columns |
+|-------|---------|-------------|
+| `assessments` | one per run | status/progress, `total_savings_monthly/annual`, `current_monthly/annual_spend`, `currency`, `cost_data_available`, `observed_annual_growth`, `spend_by_area`, `total_resources` |
+| `findings` | one per opportunity | `category`, `estimated_savings_monthly/annual`, `severity`, `confidence`, `validation_status`, `actual_monthly_cost`, `dismissed`, `details` (JSON) |
+| `inventory_items` | scanned resources | `resource_id`, `resource_type`, `data` (JSON) |
+| `audit_logs` | security trail | `event` (assessment_run / finding_dismissed / report_downloaded), user, timestamp |
 
 ---
 
-## Tech Stack
+## API endpoints
+
+All under `/api`, all require a valid Bearer token (verified vs Entra JWKS).
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET  | `/api/subscriptions/` | List the user's Azure subscriptions |
+| POST | `/api/assessments/` | Start an assessment (returns `202` + summary; runs in background) |
+| GET  | `/api/assessments/` | List the user's assessments |
+| GET  | `/api/assessments/{id}` | Assessment detail (incl. findings) — polled until `completed` |
+| GET  | `/api/assessments/{id}/findings` | Flat list of findings |
+| GET  | `/api/assessments/{id}/findings/by-category` | Findings grouped by category (totals) |
+| POST | `/api/assessments/{id}/findings/{finding_id}/dismiss` | Dismiss a finding (re-rolls totals; audited) |
+| GET  | `/api/assessments/{id}/report/pdf` | Download the branded PDF |
+
+---
+
+## Azure SDKs used
+
+**Backend: none.** It calls the Azure **REST APIs directly via `httpx`** (`management.azure.com` for
+ARM/Consumption/Cost-Management, `prices.azure.com` for Retail Prices). This is deliberate — direct REST
+gives full control over throttling/`Retry-After`/pagination/circuit-breaking, and avoids heavy SDK
+dependencies for what are a handful of endpoints. Token verification uses `PyJWT` + `cryptography`
+against Entra's JWKS.
+
+**Frontend: MSAL only** — `@azure/msal-browser` + `@azure/msal-react` for the login + ARM token
+acquisition. No other Azure SDK.
+
+---
+
+## Future roadmap
+
+- **Auth for client self-service** — the read-only **scoped identity** (Deploy-to-Azure template →
+  Reader + Cost Management Reader SP) and/or the **agentless Cloud Shell** collection script, so clients
+  can run it without handing a write-capable token to the server and without the consent friction.
+- **Scale** — SQLite → Postgres, in-memory cache/rate-limiter → Redis, a real job queue + observability
+  (retry/resume, monitoring) for background assessments.
+- **More coverage** — DTU-model SQL rightsizing (vCore is done), storage-account redundancy (GRS→LRS),
+  a few remaining orphan types (NICs, unused gateways), dev/test auto-shutdown.
+- **Product** — custom logo upload, historical trending across assessments, and one human end-to-end
+  validation against a real steadily-running production environment.
+
+*(Not feasible: true blob hot/cool/archive tiering — it needs per-blob access data Azure Resource Graph
+doesn't expose, so guessing it could raise costs.)*
+
+---
+
+## Tech stack
 
 | Layer | Technology |
 |-------|-----------|
-| Frontend | React 18, Vite, Material UI v5, Recharts, MSAL React, React Query |
-| Backend | FastAPI, Uvicorn, SQLAlchemy, Alembic, httpx |
-| Reporting | reportlab (PDF), openpyxl (Excel) |
+| Frontend | React 18, Vite, Material UI v6, Recharts, MSAL React, React Query |
+| Backend | FastAPI, Uvicorn, SQLAlchemy, Alembic, httpx, PyJWT |
+| Reporting | reportlab (PDF) |
 | Database | SQLite (local), swappable via `DATABASE_URL` |
-| Azure APIs | Resource Graph, Monitor, Advisor, Cost Management, Consumption (reservations), Retail Prices |
+| Azure APIs (raw REST) | Resource Graph, Monitor, Advisor, Cost Management, Consumption, Retail Prices |
+| Auth | Microsoft Entra ID (multi-tenant, delegated), MSAL + PKCE, JWKS RS256 verification |
+
+Backend tests: **235 passing** (`cd backend && python -m pytest -q`). Frontend: `npm run build`.

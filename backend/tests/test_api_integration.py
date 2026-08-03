@@ -94,8 +94,15 @@ def test_dismiss_finding(db_session):
     r = client.post(f"/api/assessments/{a.id}/findings/{a._finding_id}/dismiss")
     assert r.status_code == 200
     assert r.json()["id"] == a._finding_id
+    assert r.json()["dismissed"] is True
     db_session.refresh(db_session.get(Finding, a._finding_id))
     assert db_session.get(Finding, a._finding_id).dismissed == 1
+
+    # Dismissing the only finding re-rolls the headline totals to zero so the dashboard stays consistent.
+    detail = client.get(f"/api/assessments/{a.id}").json()
+    assert detail["findings_count"] == 0
+    assert detail["total_savings_monthly"] == 0.0
+    assert detail["total_savings_annual"] == 0.0
 
 
 def test_dismiss_nonexistent_finding_is_404(db_session):
@@ -116,12 +123,11 @@ def test_download_pdf(db_session):
     assert r.headers["content-type"] == "application/pdf"
 
 
-def test_download_excel(db_session):
+def test_excel_route_removed(db_session):
+    """The Excel export was removed — the endpoint should no longer exist."""
     a = seed_completed(db_session)
     client = build_client(db_session)
-    r = client.get(f"/api/assessments/{a.id}/report/excel")
-    assert r.status_code == 200
-    assert r.content[:2] == b"PK"
+    assert client.get(f"/api/assessments/{a.id}/report/excel").status_code == 404
 
 
 def test_report_rejected_when_not_completed(db_session):

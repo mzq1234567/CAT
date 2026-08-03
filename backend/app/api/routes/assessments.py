@@ -119,13 +119,21 @@ def dismiss_finding(
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _owned_assessment(db, assessment_id, user)
+    assessment = _owned_assessment(db, assessment_id, user)
     finding = db.get(Finding, finding_id)
     if not finding or finding.assessment_id != assessment_id:
         raise HTTPException(status_code=404, detail="Finding not found.")
     finding.dismissed = 1
     finding.dismissed_by = user["email"]
     finding.dismissed_at = datetime.utcnow()
+
+    # Re-roll the headline totals from the surviving findings so the dashboard stays consistent
+    # (a dismissed opportunity no longer counts toward savings).
+    active = [f for f in assessment.findings if not f.dismissed]
+    assessment.total_savings_monthly = round(sum(f.estimated_savings_monthly for f in active), 2)
+    assessment.total_savings_annual = round(sum(f.estimated_savings_annual for f in active), 2)
+    assessment.findings_count = len(active)
+
     db.commit()
     db.refresh(finding)
     record_audit(db, FINDING_DISMISSED, user, resource=f"finding:{finding_id}",
@@ -185,26 +193,4 @@ def download_pdf(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="assessment-{assessment_id}.pdf"'},
-    )
-
-
-@router.get("/{assessment_id}/report/excel")
-def download_excel(
-    assessment_id: int,
-    user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    from ...services.report import generate_excel
-
-    assessment = _owned_assessment(db, assessment_id, user)
-    if assessment.status != "completed":
-        raise HTTPException(status_code=400, detail="Assessment is not yet completed.")
-
-    findings = db.query(Finding).filter(Finding.assessment_id == assessment_id).all()
-    xlsx_bytes = generate_excel(assessment, findings)
-    record_audit(db, REPORT_DOWNLOADED, user, resource=f"assessment:{assessment_id}", format="excel")
-    return Response(
-        content=xlsx_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="assessment-{assessment_id}.xlsx"'},
     )

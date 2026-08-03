@@ -173,3 +173,32 @@ async def test_refresh_tracked_refetches_cached_keys():
     refreshed = await engine.refresh_tracked()
     assert refreshed == 1
     assert counter[0] == 2  # refresh re-fetched the one tracked key
+
+
+# ── Flat-rate live pricing (Load Balancer / NAT / Bastion / ASP) ───────────────────
+
+def _flat_response(retail_price, meter="Standard Included LB Rules"):
+    def handler(_req):
+        return httpx.Response(200, json={"Items": [{
+            "retailPrice": retail_price, "type": "Consumption", "unitOfMeasure": "1 Hour",
+            "meterName": meter, "productName": "Load Balancer",
+        }], "NextPageLink": None})
+    return handler
+
+
+async def test_load_balancer_uses_live_price_when_sane():
+    price = await make_engine(_flat_response(0.025)).get_load_balancer_monthly_price("eastus")
+    assert price == round(0.025 * HOURS_PER_MONTH, 2)  # 18.25 — straight from the live meter
+
+
+async def test_flat_price_falls_back_when_empty():
+    from app.services.estimates import LOAD_BALANCER_MONTHLY_USD
+    empty = lambda _req: httpx.Response(200, json={"Items": [], "NextPageLink": None})
+    assert await make_engine(empty).get_load_balancer_monthly_price("eastus") == LOAD_BALANCER_MONTHLY_USD
+
+
+async def test_flat_price_rejects_out_of_band_meter():
+    # A wrong meter match (10x the fallback) is rejected in favour of the dated estimate.
+    from app.services.estimates import LOAD_BALANCER_MONTHLY_USD
+    price = await make_engine(_flat_response(5.0, meter="Rule")).get_load_balancer_monthly_price("eastus")
+    assert price == LOAD_BALANCER_MONTHLY_USD
