@@ -248,15 +248,14 @@ async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_
                   for f in util_findings if f.get("category") == "idle_vms"}
     delete_ids |= {(vm.get("id") or "").lower()
                    for vm in inventory.get("deallocated_vms", []) if vm.get("id")}
-    # Commitments: prefer Azure's own reservation engine (real usage + real prices, all resource
-    # types). Only fall back to the retail-estimate VM detector when Azure returns no VM rec.
+    # Commitments. Non-VM reserved capacity (SQL/Cosmos/App Service/Files/Disks) comes from Azure's own
+    # reservation engine (real usage + real prices). VMs are handled separately by detect_vm_commitments,
+    # which recommends Reserved Instances for PRODUCTION VMs (Savings Plans removed).
     findings += engine.commitments_from_recommendations(reservation_recs)
-    has_vm_recs = any(g.get("resource_type") == "virtualmachines" for g in reservation_recs)
-    if not has_vm_recs:
-        # VMs still paying the Windows licence (not on AHB) → the commitment base must exclude that
-        # licence so RI/SP savings and AHB savings don't overlap on the same VM.
-        win_ids = {vm["id"].lower() for vm in inventory.get("windows_vms_without_ahb", []) if vm.get("id")}
-        findings += await engine.detect_vm_commitments(running_vms, win_ids)
+    # VMs still paying the Windows licence (not on AHB) → the RI base must exclude that licence so RI and
+    # AHB savings don't overlap on the same VM.
+    win_ids = {vm["id"].lower() for vm in inventory.get("windows_vms_without_ahb", []) if vm.get("id")}
+    findings += await engine.detect_vm_commitments(running_vms, win_ids)
     # Windows AHB (licence, additive with reservations) — excludes VMs we'd delete (idle/stopped).
     findings += await engine.detect_windows_ahb(
         inventory.get("windows_vms_without_ahb", []), exclude_ids=delete_ids)

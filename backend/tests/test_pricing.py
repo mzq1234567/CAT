@@ -71,19 +71,6 @@ async def test_vm_windows_monthly_price_for_ahb():
     assert win == round(0.188 * HOURS_PER_MONTH, 2)  # Windows image (compute + licence)
 
 
-async def test_vm_savings_plan_monthly_price():
-    engine = make_engine(retail_prices_handler())
-    sp1 = await engine.get_vm_savings_plan_monthly_price("eastus", "Standard_D2s_v3", "1 Year")
-    sp3 = await engine.get_vm_savings_plan_monthly_price("eastus", "Standard_D2s_v3", "3 Years")
-    assert sp1 == round(0.06 * HOURS_PER_MONTH, 2)
-    assert sp3 == round(0.05 * HOURS_PER_MONTH, 2)
-
-
-async def test_vm_savings_plan_none_when_absent():
-    engine = make_engine(retail_prices_handler())
-    assert await engine.get_vm_savings_plan_monthly_price("eastus", "Standard_Nonexistent") is None
-
-
 async def test_reserved_price_rejects_bad_term():
     engine = make_engine(retail_prices_handler())
     with pytest.raises(ValueError):

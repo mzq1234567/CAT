@@ -119,6 +119,40 @@ _SQL_MI_VCORE_LADDER = [4, 8, 16, 24, 32, 40, 64, 80]
 _STANDARD_SSD_BASELINE_IOPS = 500
 _STANDARD_SSD_BASELINE_MBPS = 60
 
+# Environment classification for Reserved Instance targeting. A Reserved Instance suits a long-lived
+# workload — which a provisioned production VM almost always is — so we recommend an RI for prod VMs and
+# SKIP dev/test/staging (short-lived, not worth a 1–3 year commitment). Tags are the reliable signal; the
+# VM/RG name is a best-effort fallback. Unclassifiable → assumed production (but flagged for the reviewer).
+_PROD_ENV_KEYWORDS = ("prod", "prd", "production", "live")
+_NONPROD_ENV_KEYWORDS = ("dev", "test", "qa", "uat", "stage", "staging", "stg", "sandbox", "sbx",
+                         "demo", "poc", "lab", "scratch", "temp", "preprod", "nonprod")
+_ENV_TAG_KEYS = ("environment", "env", "tier", "stage", "usage", "deployment")
+
+# Typical Azure VM Reserved Instance discounts — used only when a SKU's retail RI price can't be fetched,
+# so a production VM still gets a (clearly-estimated) recommendation instead of being silently dropped.
+_RI_DEFAULT_DISCOUNT_1YR = 0.40
+_RI_DEFAULT_DISCOUNT_3YR = 0.60
+
+
+def _vm_environment(vm: Dict) -> Tuple[str, str]:
+    """Classify a VM as ('prod' | 'nonprod' | 'unknown', reason) from tags first, then name/RG keywords."""
+    tags = {str(k).lower(): str(v).lower() for k, v in (vm.get("tags") or {}).items()}
+    for key in _ENV_TAG_KEYS:
+        val = tags.get(key)
+        if not val:
+            continue
+        if any(w in val for w in _NONPROD_ENV_KEYWORDS):
+            return "nonprod", f"tag {key}={val}"
+        if any(w in val for w in _PROD_ENV_KEYWORDS):
+            return "prod", f"tag {key}={val}"
+    # Name / resource-group fallback: tokenise so 'test' doesn't match 'latest', etc.
+    tokens = set(re.split(r"[^a-z0-9]+", f"{vm.get('name', '')} {vm.get('resourceGroup', '')}".lower()))
+    if tokens & set(_NONPROD_ENV_KEYWORDS):
+        return "nonprod", "name/resource-group indicates non-production"
+    if tokens & set(_PROD_ENV_KEYWORDS):
+        return "prod", "name/resource-group indicates production"
+    return "unknown", "no environment tag — assumed production"
+
 
 def find_sql_vcore_target(
     current_vcores: int, peaks: List[Optional[float]],
@@ -156,7 +190,6 @@ CATEGORY_DISPLAY = {
     "idle_vms": "Idle Virtual Machines",
     "oversized_vms": "Oversized Virtual Machines",
     "ri_vm": "Reserved Instance (VM)",
-    "savings_plan_vm": "Savings Plan (VM)",
     "vm_rightsizing": "VM Rightsizing",
     "windows_ahb": "Windows Azure Hybrid Benefit",
     "sql_ahb": "SQL Server Azure Hybrid Benefit",
@@ -429,7 +462,7 @@ class FindingsEngine:
         confidence = combine_confidence(base_confidence, validation, has_price)
         advisor_id = self._advisor_id_for(resource_id)
         # An Advisor rec corroborating our own detection raises confidence.
-        if advisor_id and category not in ("advisor_cost", "ri_vm", "savings_plan_vm"):
+        if advisor_id and category not in ("advisor_cost", "ri_vm"):
             confidence = round(min(1.0, confidence + 0.05), 2)
 
         details = dict(extra_details or {})
@@ -1012,17 +1045,20 @@ class FindingsEngine:
     def _aggregate_commitment_finding(
         self, category: str, kind: str, items: List[Dict], *,
         source: str, base_confidence: float, unit: str = "SKU", grounded: bool = False,
+        context_note: str = "",
     ) -> Optional[Dict]:
         """Roll many per-SKU/VM commitment items into ONE finding.
 
-        `kind` is "Reserved Instance" or "Savings Plan". Each item carries `s1` (1-year) and optional
-        `s3` (3-year) monthly saving. The **best case (3-year, the deepest discount) is the counted
-        headline**; the 1-year option is shown alongside so the client can pick the shorter commitment.
-        Resource-less (`id=None`) so it isn't collapsed by the per-resource dedupe.
+        `kind` is "Reserved Instance". Each item carries `s1` (1-year) and optional `s3` (3-year)
+        monthly saving. The **best case (3-year, the deepest discount) is the counted headline**; the
+        1-year option is shown alongside so the client can pick the shorter commitment. Resource-less
+        (`id=None`) so it isn't collapsed by the per-resource dedupe. `context_note` is appended to the
+        description (e.g. the production-targeting rationale for VMs).
         """
         one_total = 0.0
         three_total = 0.0
         has_3yr = False
+        any_estimated = False
         ui_items: List[Dict] = []
         for it in items:
             s1 = it.get("s1")
@@ -1034,12 +1070,14 @@ class FindingsEngine:
             three_total += best
             if s3 is not None:
                 has_3yr = True
+            any_estimated = any_estimated or bool(it.get("ri_price_estimated"))
             ui_items.append({
                 "name": it.get("name"), "sku": it.get("sku"), "region": it.get("region"),
                 "quantity": it.get("quantity") or 0,
                 "monthly_savings": round(s1, 2) if s1 is not None else round(best, 2),
                 "monthly_savings_3yr": round(s3, 2) if s3 is not None else None,
                 "monthly_ondemand": it.get("ondemand"), "monthly_reserved": it.get("reserved"),
+                "environment": it.get("environment"),
             })
         if not ui_items:
             return None
@@ -1079,8 +1117,8 @@ class FindingsEngine:
             category, synthetic, "microsoft.consumption/reservationrecommendations", headline,
             base_confidence=base_confidence,
             description=(
-                f"{n} {unit}{plural} run steadily enough to reserve ({shown}). A 1- or 3-year "
-                f"{kind} locks in a lower rate than pay-as-you-go — {rate_note}."
+                f"{n} {unit}{plural} are candidates to reserve ({shown}). A 1- or 3-year {kind} locks in "
+                f"a lower rate than pay-as-you-go — {rate_note}.{context_note}"
             ),
             recommendation=(
                 f"Purchase {'3-year' if has_3yr else '1-year'} {kind}s for the {unit.lower()}{plural} "
@@ -1093,38 +1131,43 @@ class FindingsEngine:
                 "reservation_options": options, "reservation_items": ui_items,
                 "item_count": n, "total_1yr_monthly": one_total,
                 "total_3yr_monthly": three_total if has_3yr else None,
+                "ri_price_estimated": any_estimated,
             },
         )
 
     async def detect_vm_commitments(
         self, vms: List[Dict], windows_no_ahb_ids: Optional[set] = None,
     ) -> List[Dict]:
-        """Retail-estimate fallback (used only when Azure's reservation engine returns nothing).
+        """Recommend Reserved Instances for **production** VMs (Savings Plans are not recommended).
 
-        A commitment saves a *fraction* of a VM's cost — the RI/Savings-Plan discount — so the saving
-        is `base × discount_ratio`, NOT the whole cost. The base is the COMPUTE portion of the VM's
-        actual cost (the Windows licence is stripped out, since AHB covers that separately and would
-        otherwise be double-counted); when no billing data exists we fall back to the retail rate.
-        RI-eligible SKUs roll into one "Reserved Instances" finding (1yr + 3yr); SKUs Azure only offers
-        a Savings Plan for roll into one "Savings Plans" finding.
+        A Reserved Instance suits a long-lived workload, and a provisioned production VM almost always
+        is one — so we recommend an RI for every running prod VM and **skip dev/test/staging** (short-
+        lived, not worth a 1–3 year commitment). Environment is read from tags first, then the VM/RG
+        name; unclassifiable VMs are **assumed production** and flagged. Idle VMs and Advisor-covered
+        VMs are still excluded (you don't reserve something you're deleting).
+
+        The saving is `compute_base × RI discount`, NOT the whole cost — the base is the COMPUTE portion
+        of the VM's actual bill (the Windows licence is stripped for non-AHB Windows VMs so RI and AHB
+        never overlap). When a SKU's retail RI price can't be fetched, a typical RI discount is used and
+        the item is flagged estimated (so a prod VM is never silently dropped).
         """
         if self._reservation_basis == "advisor":
             return []
         windows_no_ahb_ids = windows_no_ahb_ids or set()
         ri_items: List[Dict] = []
-        sp_items: List[Dict] = []
-        ri_all_steady = True
-        sp_all_steady = True
+        all_steady = True
         cost_available = bool(self._cost_map)
         for vm in vms:
             max_cpu = vm.get("max_cpu")
             peak_mem = vm.get("peak_memory_used_pct")
             mem_ok = bool(vm.get("memory_available"))
-            datapoints = int(vm.get("cpu_datapoints") or 0)
-            window = int(vm.get("metric_window_days") or METRIC_WINDOW_DAYS)
             # Skip genuinely idle VMs — you delete those, not reserve them (idle detector covers).
             if (max_cpu is not None and max_cpu < IDLE_MAX_CPU
                     and mem_ok and peak_mem is not None and peak_mem < IDLE_MAX_MEMORY_PCT):
+                continue
+            # Environment: recommend RI for prod (and unclassifiable-assumed-prod); skip clear dev/test.
+            env, env_reason = _vm_environment(vm)
+            if env == "nonprod":
                 continue
             rid = vm.get("id")
             if rid and self._advisor_index.get(rid.lower()):
@@ -1141,85 +1184,74 @@ class FindingsEngine:
                 windows = await self._pricing.get_vm_windows_monthly_price(region, sku)
                 ri1 = await self._pricing.get_vm_reserved_monthly_price(region, sku, "1 Year")
                 ri3 = await self._pricing.get_vm_reserved_monthly_price(region, sku, "3 Years")
-                sp1 = await self._pricing.get_vm_savings_plan_monthly_price(region, sku, "1 Year")
-                sp3 = await self._pricing.get_vm_savings_plan_monthly_price(region, sku, "3 Years")
             except PricingUnavailableError:
                 continue
             if not payg:
                 continue
 
-            # Discount RATIOS from retail (currency-independent); apply them to a real cost base.
+            # Discount RATIOS from retail (currency-independent). If a SKU's retail RI price is missing,
+            # fall back to typical Azure VM RI discounts so a prod VM still gets a (flagged) recommendation.
             def _ratio(price):
                 return (payg - price) / payg if price and payg and payg > price else None
-            ri1_r, ri3_r = _ratio(ri1), _ratio(ri3)
-            sp1_r, sp3_r = _ratio(sp1), _ratio(sp3)
-            # Only recommend what Azure actually offers for this SKU/region — many D-series expose only
-            # a Savings Plan, so fabricating an RI there is misleading.
-            ri_available = ri1_r is not None or ri3_r is not None
+            r1, r3 = _ratio(ri1), _ratio(ri3)
+            ri_estimated = False
+            if r1 is None:
+                r1, ri_estimated = _RI_DEFAULT_DISCOUNT_1YR, True
+            if r3 is None:
+                r3, ri_estimated = _RI_DEFAULT_DISCOUNT_3YR, True
 
-            # Base = the COMPUTE portion of the VM's actual cost. For a Windows VM not yet on AHB, strip
-            # the licence (compute_fraction = compute-only/Windows retail) so the commitment discount
-            # applies to compute only and doesn't overlap AHB. Linux / already-AHB VMs → all compute.
+            # Base = the COMPUTE portion of the VM's actual cost (Windows licence stripped for non-AHB
+            # Windows VMs so RI never overlaps AHB). No billing data → retail run-rate.
             is_win_no_ahb = bool(rid and rid.lower() in windows_no_ahb_ids)
             compute_fraction = (payg / windows) if (is_win_no_ahb and windows and windows > payg) else 1.0
             if actual is not None and actual > 0:
                 base = round(actual * compute_fraction, 2)
                 ondemand = round(actual, 2)
             else:
-                base = payg                     # no billing data → retail run-rate
+                base = payg
                 ondemand = payg
 
-            r1, r3, reserved_price = (ri1_r, ri3_r, ri1) if ri_available else (sp1_r, sp3_r, sp1)
             s1 = round(base * r1, 2) if r1 else None
             s3 = round(base * r3, 2) if r3 else None
+            if (s1 is None or s1 <= 0) and (s3 is None or s3 <= 0):
+                continue
 
-            # Steadiness: prefer real month-over-month billing history (the manual-report check) over
-            # the metric-coverage proxy. A resource billed consistently across months is safe to
-            # commit; one that swings is still surfaced (combined basis) but flagged + lower confidence.
+            # Steadiness is no longer a GATE (a prod VM gets an RI regardless) — it only tunes
+            # confidence: a VM billed consistently across months (or with full metric coverage) is a
+            # safer commit than one with sparse/erratic data.
             cons = self._consistency.get((rid or "").lower())
+            datapoints = int(vm.get("cpu_datapoints") or 0)
+            window = int(vm.get("metric_window_days") or METRIC_WINDOW_DAYS)
             if cons and cons.get("billed_months"):
                 steady = bool(cons.get("stable"))
             else:
                 steady = bool(window and datapoints >= 0.8 * window)
-            if self._reservation_basis == "measured" and not steady:
-                continue
-
-            base_item = {
+            all_steady = all_steady and steady
+            ri_items.append({
                 "name": vm.get("name"), "sku": sku, "region": region, "quantity": 1,
                 "ondemand": ondemand, "subscription_id": vm.get("subscriptionId"),
                 "reserved": round(ondemand - (s1 or 0), 2),
                 "billed_months": cons.get("billed_months") if cons else None,
                 "cost_stable": cons.get("stable") if cons else None,
-                # Audit trail: saving = compute_base × discount%. compute_base strips the Windows
-                # licence for Windows VMs so it never overlaps AHB.
                 "compute_base": round(base, 2), "actual_monthly_cost": round(actual, 2) if actual else None,
                 "discount_1yr": round(r1, 4) if r1 else None,
                 "discount_3yr": round(r3, 4) if r3 else None,
                 "grounded": actual is not None and actual > 0,
-            }
-            if ri_available and (s1 is not None or s3 is not None):
-                ri_items.append({**base_item, "s1": s1, "s3": s3})
-                ri_all_steady = ri_all_steady and steady
-            elif s1 is not None or s3 is not None:   # Savings Plan (RI not offered for this SKU)
-                sp_items.append({**base_item, "s1": s1, "s3": s3})
-                sp_all_steady = sp_all_steady and steady
+                "s1": s1, "s3": s3,
+                "environment": env, "env_reason": env_reason, "ri_price_estimated": ri_estimated,
+            })
 
-        out: List[Dict] = []
-        if ri_items:
-            conf = 0.85 if ri_all_steady else 0.55
-            f = self._aggregate_commitment_finding(
-                "ri_vm", "Reserved Instance", ri_items,
-                source="retail_estimate", base_confidence=conf, unit="VM", grounded=cost_available)
-            if f:
-                out.append(f)
-        if sp_items:
-            conf = 0.85 if sp_all_steady else 0.55
-            f = self._aggregate_commitment_finding(
-                "savings_plan_vm", "Savings Plan", sp_items,
-                source="retail_estimate", base_confidence=conf, unit="VM", grounded=cost_available)
-            if f:
-                out.append(f)
-        return out
+        if not ri_items:
+            return []
+        assumed = sum(1 for it in ri_items if it["environment"] == "unknown")
+        note = (f" Recommended for production VMs; {assumed} untagged VM{'s' if assumed != 1 else ''} "
+                "assumed production — verify before committing." if assumed else
+                " Recommended for production VMs.")
+        conf = 0.85 if all_steady else 0.65
+        f = self._aggregate_commitment_finding(
+            "ri_vm", "Reserved Instance", ri_items, source="retail_estimate",
+            base_confidence=conf, unit="VM", grounded=cost_available, context_note=note)
+        return [f] if f else []
 
     # -- commitments from Azure's own reservation engine (authoritative) -------
 
@@ -1227,14 +1259,15 @@ class FindingsEngine:
         """Build reservation findings from parsed Consumption `reservationRecommendations`.
 
         These are SKU-level *purchase* recommendations (a reservation covers matching resources in a
-        region, not one VM), computed by Azure on real usage at the customer's real prices, excluding
-        reservations already owned — so they replace our retail-estimate `detect_vm_commitments` for
-        any resource type Azure returns. Grouped into ONE finding per finding-category (e.g. all VM
-        reservations together): 1-year headline total, 3-year total alongside, every SKU listed in
-        `details.reservation_items`. Resource-less (escapes dedupe).
+        region), computed by Azure on real usage at the customer's real prices, excluding reservations
+        already owned. Used here for **non-VM** resource types only (SQL / Cosmos / App Service / Files /
+        Disks); **VMs are handled by `detect_vm_commitments`** (production-targeted, not gated on Azure's
+        steadiness check). Grouped into ONE finding per finding-category. Resource-less (escapes dedupe).
         """
         by_category: Dict[str, List[Dict]] = {}
         for g in groups:
+            if g.get("category") in ("ri_vm", "savings_plan_vm"):
+                continue  # VMs are covered by detect_vm_commitments (production-targeted)
             terms = g.get("terms", {})
             p1 = terms.get("P1Y")
             p3 = terms.get("P3Y")

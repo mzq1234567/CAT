@@ -189,7 +189,7 @@ def _place(canvas, name: str, x: float, top: float, width: float = None,
 # category → pillar, matching the 3-pillar client template (Compute / Storage / Network).
 # Database-style commitments fold into Compute.
 _PILLAR = {
-    "ri_vm": "Compute", "savings_plan_vm": "Compute", "windows_ahb": "Compute",
+    "ri_vm": "Compute", "windows_ahb": "Compute",
     "sql_ahb": "Compute",
     "oversized_vms": "Compute", "idle_vms": "Compute", "deallocated_vms": "Compute",
     "vm_rightsizing": "Compute", "idle_app_service_plans": "Compute",

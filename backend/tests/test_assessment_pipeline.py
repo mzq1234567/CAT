@@ -200,11 +200,12 @@ def test_dedupe_keeps_one_finding_per_resource():
 
 async def test_pipeline_uses_reservation_recommendations(pipeline_env):
     TestSession, install, seed = pipeline_env
-    # Azure returns a real reservation recommendation → it must surface as an authoritative RI finding.
+    # Azure's reservation engine covers NON-VM types (VMs go through the production-targeted VM
+    # detector). A real SQL reservation rec must surface as an authoritative reserved-capacity finding.
     recs = [{
         "kind": "legacy", "location": "eastus",
         "properties": {
-            "resourceType": "virtualmachines", "normalizedSize": "Standard_D2s_v3", "term": "P1Y",
+            "resourceType": "SQLDatabases", "normalizedSize": "SQLDB_GP_Gen5", "term": "P1Y",
             "lookBackPeriod": "Last30Days", "scope": "Single", "netSavings": 123.0,
             "costWithNoReservedInstances": 400.0, "totalCostWithReservedInstances": 277.0,
             "recommendedQuantity": 2, "subscriptionId": "sub-1",
@@ -216,7 +217,7 @@ async def test_pipeline_uses_reservation_recommendations(pipeline_env):
     await pipeline.run_assessment(aid, ["sub-1"], "token")
 
     s = TestSession()
-    ri = s.query(Finding).filter(Finding.category == "ri_vm").all()
+    ri = s.query(Finding).filter(Finding.category == "sql_db_reserved_capacity").all()
     assert len(ri) == 1
     assert ri[0].estimated_savings_monthly == 123.0
     assert ri[0].details["source"] == "azure_reservation_recommendations"

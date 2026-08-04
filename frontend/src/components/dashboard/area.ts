@@ -11,7 +11,6 @@ const CATEGORY_TO_AREA: Record<string, Area> = {
   idle_vms: "Compute",
   oversized_vms: "Compute",
   ri_vm: "Compute",
-  savings_plan_vm: "Compute",
   vm_rightsizing: "Compute",
   deallocated_vms: "Compute",
   windows_ahb: "Compute",

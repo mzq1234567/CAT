@@ -24,6 +24,7 @@ interface ReservationItem {
   quantity?: number;
   monthly_savings?: number;
   monthly_savings_3yr?: number | null;
+  environment?: string; // "prod" | "nonprod" | "unknown" (unknown → assumed production)
 }
 interface EligibleVm {
   name?: string;
@@ -238,6 +239,19 @@ function CommitmentPanel({
                   <Typography variant="body2" fontWeight={600} sx={{ color: colors.textPrimary }} noWrap>
                     {v.quantity && v.quantity > 1 ? `${v.quantity}× ` : ""}
                     {v.sku || v.name}
+                    {v.environment === "unknown" && (
+                      <Box
+                        component="span"
+                        title="No environment tag — assumed production. Verify before committing."
+                        sx={{
+                          ml: 1, px: 0.6, py: 0.05, borderRadius: 1, fontSize: 10, fontWeight: 700,
+                          color: colors.warning, bgcolor: alpha(colors.warning, 0.14),
+                          textTransform: "uppercase", letterSpacing: "0.03em", cursor: "help",
+                        }}
+                      >
+                        assumed prod
+                      </Box>
+                    )}
                   </Typography>
                   <Typography variant="caption" color={colors.textMuted}>
                     {v.name && v.name !== v.sku ? v.name : ""}

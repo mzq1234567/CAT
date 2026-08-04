@@ -1340,6 +1340,32 @@ User caught a real flaw in the disk detector + asked to finish the dismiss butto
   flag + zeroes totals + response shows dismissed:true.
 - Backend **235 passing**; frontend build clean.
 
+### Post-ship 29 — Savings Plan removed; RI is now production-targeted (2026-08-03)
+User: remove Savings Plan entirely; scrap the steadiness/age gate for RIs; recommend RI for PROD VMs
+(a provisioned prod VM is ~always kept long-term), skip dev/test. Untagged → assume prod (user's call).
+- **Savings Plan gone**: dropped sp_items path + `savings_plan_vm` category/display/pillar/area.ts;
+  removed `get_vm_savings_plan_monthly_price` (pricing.py) + its 2 tests + FakePricing stub. Dead-ish:
+  FakePricing still has `sp`/`DEFAULT_SP` params (harmless, unused).
+- **Environment classifier** `_vm_environment(vm)` → (prod|nonprod|unknown, reason): tags first
+  (`environment/env/tier/stage/usage/deployment` × prod/nonprod keyword sets), then VM/RG name TOKENS
+  (split on non-alphanumeric so 'test'≠'latest'). Unknown → "assumed production" (flagged).
+- **`detect_vm_commitments` rewritten**: RI-only; skip nonprod; NO steadiness gate (steadiness now only
+  tunes confidence, 0.85 steady / 0.65 not); RI-price fallback to typical discounts
+  (`_RI_DEFAULT_DISCOUNT_1YR=0.40`, `_3YR=0.60`, marked `ri_price_estimated`) so a prod VM is never
+  dropped when retail RI price is missing. Still skips idle/Advisor-covered/non-billing VMs. Adds
+  `environment`/`env_reason`/`ri_price_estimated` per item; a `context_note` ("N untagged assumed
+  production — verify") appended to the description.
+- **`_aggregate_commitment_finding`**: gained `context_note`; carries `environment` into ui_items +
+  `ri_price_estimated` into details; description no longer says "run steadily enough" (neutral now).
+- **`commitments_from_recommendations`**: now SKIPS `ri_vm`/`savings_plan_vm` (VMs handled by the new
+  detector); Azure's engine is used for NON-VM reserved capacity only (SQL/Cosmos/etc). Trade-off:
+  Azure's negotiated VM prices no longer used — VM RI uses retail-estimate grounded in actual cost.
+- **assessment.py `_detect_all`**: always runs `detect_vm_commitments` (removed the `if not has_vm_recs`
+  gate). **frontend FindingEvidence.tsx**: "assumed prod" chip on untagged reservation items.
+- Tests: rewrote SP-fallback tests → RI-estimate; replaced measured-gate test → prod/dev classification
+  test; repointed `_ri_group` + 2 aggregation tests + pipeline reservation test to the SQL (non-VM)
+  path; added `test_recommendations_exclude_vms`. Backend **234 passing**; frontend build clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD

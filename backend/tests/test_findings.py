@@ -69,9 +69,6 @@ class FakePricing:
     async def get_vm_reserved_monthly_price(self, region, sku, term="1 Year"):
         return self.ri.get((sku, term))
 
-    async def get_vm_savings_plan_monthly_price(self, region, sku, term="1 Year"):
-        return self.sp.get((sku, term))
-
     async def get_vm_windows_monthly_price(self, region, sku):
         return self.win.get(sku)
 
@@ -239,7 +236,7 @@ async def test_vm_without_cpu_metrics_is_skipped():
     assert findings == []
 
 
-# ── Commitments: Reserved Instances + Savings Plan ───────────────────────────────
+# ── Commitments: Reserved Instances (production-targeted; Savings Plans removed) ──
 
 def _steady_vm(max_cpu=50.0, peak_memory=40.0, datapoints=30, rid=VM_RID):
     # Well-utilised (not idle, not downsizable) + full metric coverage → steady.
@@ -273,10 +270,19 @@ async def test_commitment_advisor_wins():
     assert await engine.detect_vm_commitments([_steady_vm()]) == []
 
 
-async def test_commitment_measured_basis_skips_unconfirmed():
-    engine = FindingsEngine(pricing=FakePricing(), reservation_basis="measured")
-    # Few datapoints → usage unconfirmed → measured basis skips it.
-    assert await engine.detect_vm_commitments([_steady_vm(datapoints=5)]) == []
+async def test_commitment_skips_dev_test_and_flags_untagged():
+    # RI for production (and unclassifiable-assumed-prod) VMs; dev/test VMs are skipped.
+    engine = FindingsEngine(pricing=FakePricing())
+    prod = _vm(max_cpu=50.0, peak_memory=40.0, rid="/s/p"); prod["tags"] = {"Environment": "Production"}
+    dev = _vm(max_cpu=50.0, peak_memory=40.0, rid="/s/d"); dev["tags"] = {"env": "dev"}
+    untagged = _vm(max_cpu=50.0, peak_memory=40.0, rid="/s/u")  # no tag → assumed production
+    for i, v in enumerate((prod, dev, untagged)):
+        v["name"] = f"vm{i}"
+    f = (await engine.detect_vm_commitments([prod, dev, untagged]))[0]
+    items = {it["name"]: it for it in f["details"]["reservation_items"]}
+    assert "vm1" not in items                        # dev VM skipped entirely
+    assert items["vm0"]["environment"] == "prod"     # tagged production → recommended
+    assert items["vm2"]["environment"] == "unknown"  # untagged → assumed production (flagged)
 
 
 async def test_commitment_combined_unconfirmed_lower_confidence():
@@ -293,7 +299,8 @@ async def test_commitment_advisor_basis_produces_nothing():
 
 # ── Commitments from Azure's own reservation engine (authoritative) ──────────────
 
-def _ri_group(category="ri_vm", sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=2):
+def _ri_group(category="sql_db_reserved_capacity", sku="SQLDB_GP_Gen5", p1=100.0, p3=160.0, qty=2):
+    # Non-VM reserved capacity (VMs are handled by the production-targeted VM detector, not here).
     terms = {}
     if p1 is not None:
         terms["P1Y"] = {"monthly_savings": p1, "monthly_ondemand": 400.0,
@@ -301,15 +308,21 @@ def _ri_group(category="ri_vm", sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=2
     if p3 is not None:
         terms["P3Y"] = {"monthly_savings": p3, "monthly_ondemand": 400.0,
                         "monthly_reserved": round(400.0 - p3, 2), "quantity": qty}
-    return {"resource_type": "virtualmachines", "category": category, "product": "Virtual Machines",
-            "sku": sku, "region": "eastus", "scope": "Single", "flexibility_group": "DSv3 Series",
+    return {"resource_type": "sqldatabases", "category": category, "product": "SQL Database",
+            "sku": sku, "region": "eastus", "scope": "Single", "flexibility_group": None,
             "subscription_id": "sub-1", "terms": terms}
+
+
+def test_recommendations_exclude_vms():
+    # VM reservation recs are NOT surfaced here — VMs go through the production-targeted VM detector.
+    engine = FindingsEngine(pricing=FakePricing())
+    assert engine.commitments_from_recommendations([_ri_group(category="ri_vm")]) == []
 
 
 def test_recommendations_build_ri_finding_best_case_3yr():
     engine = FindingsEngine(pricing=FakePricing())
     f = engine.commitments_from_recommendations([_ri_group()])[0]
-    assert f["category"] == "ri_vm"
+    assert f["category"] == "sql_db_reserved_capacity"
     assert f["resource_id"] is None                      # SKU-level purchase → escapes dedupe
     assert f["estimated_savings_monthly"] == 160.0       # best case = 3-year headline
     labels = [o["label"] for o in f["details"]["reservation_options"]]
@@ -353,28 +366,26 @@ def test_recommendations_skip_when_no_positive_saving():
     assert engine.commitments_from_recommendations([empty]) == []
 
 
-async def test_commitment_uses_savings_plan_when_ri_unavailable():
-    # A SKU with no Reserved Instance offering in retail (ri={}) must NOT get a fabricated RI — it
-    # falls back to the Savings Plan Azure actually offers for it.
-    engine = FindingsEngine(pricing=FakePricing(ri={}))  # D16: payg 560.64, no RI, SP 1yr 450
+async def test_commitment_ri_estimated_when_retail_ri_missing():
+    # A SKU with no Reserved Instance price in retail (ri={}) still gets a Reserved Instance
+    # recommendation using a typical RI discount, clearly flagged estimated (never a Savings Plan).
+    engine = FindingsEngine(pricing=FakePricing(ri={}))  # D16: payg 560.64, no RI retail
     f = (await engine.detect_vm_commitments([_steady_vm()]))[0]
-    assert f["category"] == "savings_plan_vm"
-    assert f["details"]["kind"] == "Savings Plan"
-    assert f["estimated_savings_monthly"] == round(560.64 - 450, 2)  # 110.64 (1yr SP)
+    assert f["category"] == "ri_vm"
+    assert f["details"]["ri_price_estimated"] is True
+    # base = payg 560.64 (no cost data); 3yr default discount 0.60 → 336.38.
+    assert f["estimated_savings_monthly"] == round(560.64 * 0.60, 2)
 
 
-async def test_commitment_burstable_falls_back_to_savings_plan():
-    # B-series can't take a Reserved Instance → it rolls into the Savings Plan finding, not RI.
-    pricing = FakePricing(vm_prices={"Standard_B2ms": 60.0}, ri={},
-                          sp={("Standard_B2ms", "1 Year"): 45.0})
-    engine = FindingsEngine(pricing=pricing)
+async def test_commitment_burstable_still_gets_ri_estimate():
+    # B-series with no RI retail price still gets an (estimated) Reserved Instance — Savings Plans gone.
+    engine = FindingsEngine(pricing=FakePricing(vm_prices={"Standard_B2ms": 60.0}, ri={}))
     vm = _vm(max_cpu=50.0, peak_memory=40.0, sku="Standard_B2ms")
     findings = await engine.detect_vm_commitments([vm])
-    cats = {f["category"] for f in findings}
-    assert cats == {"savings_plan_vm"}                    # no RI finding for a burstable VM
-    sp = findings[0]
-    assert sp["details"]["kind"] == "Savings Plan"
-    assert sp["estimated_savings_monthly"] == round(60.0 - 45.0, 2)  # 15.0
+    assert {f["category"] for f in findings} == {"ri_vm"}
+    f = findings[0]
+    assert f["details"]["ri_price_estimated"] is True
+    assert f["estimated_savings_monthly"] == round(60.0 * 0.60, 2)  # 36.0
 
 
 # ── Windows Azure Hybrid Benefit (aggregated into one finding) ───────────────────

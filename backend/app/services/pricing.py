@@ -201,31 +201,6 @@ class PricingEngine:
             return None
         return round(min(candidates) * HOURS_PER_MONTH, 2)
 
-    async def get_vm_savings_plan_monthly_price(
-        self, region: str, arm_sku_name: str, term: str = "1 Year"
-    ) -> Optional[float]:
-        """Compute Savings Plan monthly rate for a VM SKU, read from the retail item's `savingsPlan`.
-
-        The Retail Prices API (preview) attaches a `savingsPlan: [{term, retailPrice}]` array (hourly
-        rates) to consumption items. Returns None when the data isn't present for the SKU.
-        """
-        filter_str = (
-            "serviceName eq 'Virtual Machines' "
-            f"and armRegionName eq '{region}' "
-            f"and armSkuName eq '{arm_sku_name}' "
-            "and priceType eq 'Consumption'"
-        )
-        items = await self.query(filter_str)
-        for it in items:
-            if it.get("type") != "Consumption" or "Windows" in (it.get("productName") or ""):
-                continue
-            if "Spot" in (it.get("meterName") or "") or "Low Priority" in (it.get("meterName") or ""):
-                continue
-            for sp in it.get("savingsPlan") or []:
-                if sp.get("term") == term and sp.get("retailPrice"):
-                    return round(float(sp["retailPrice"]) * HOURS_PER_MONTH, 2)
-        return None
-
     async def get_vm_reserved_monthly_price(
         self, region: str, arm_sku_name: str, term: str = "1 Year"
     ) -> Optional[float]:

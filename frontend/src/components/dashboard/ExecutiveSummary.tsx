@@ -79,6 +79,15 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
       <Box>
         <Card sx={{ mb: 2.5 }}>
           <CardContent sx={{ p: { xs: 3, md: 4 } }}>
+            {/* One plain-language line so a non-technical exec gets spend + savings in a single read,
+                before the numbers/graphs. This is the "single glance" the C-suite wants. */}
+            <Typography variant="h6" fontWeight={500} mb={2.5} sx={{ color: colors.textSecondary, lineHeight: 1.45 }}>
+              You're spending{" "}
+              <Box component="span" sx={{ color: colors.textPrimary, fontWeight: 800 }}>{money(currentAnnual)}/yr</Box>
+              {" "}on Azure — we identified{" "}
+              <Box component="span" sx={{ color: SAVINGS_COLOR, fontWeight: 800 }}>{money(savingsAnnual)}/yr ({pct(savingsPct)})</Box>
+              {" "}in savings.
+            </Typography>
             {/* The three headline numbers live here and nowhere else (no repeated tiles below). */}
             <Box display="flex" alignItems="center" justifyContent="space-between" flexWrap="wrap" gap={3} mb={3}>
               <FlowNumber
