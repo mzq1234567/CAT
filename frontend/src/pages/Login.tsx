@@ -1,10 +1,10 @@
 import { Box, Button, Paper, Stack, Typography } from "@mui/material";
 import { useMsal } from "@azure/msal-react";
 import MicrosoftIcon from "@mui/icons-material/Window";
-import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import { loginRequest } from "../auth/msalConfig";
-import { colors, gradients } from "../theme";
+import { colors } from "../theme";
+import tptLogo from "../assets/tpt-logo-dark.png";
 
 export default function Login() {
   const { instance } = useMsal();
@@ -38,22 +38,14 @@ export default function Login() {
           border: `1px solid ${colors.border}`,
         }}
       >
+        {/* Vendor brand — the client's first impression of whose tool this is (dark-text logo on
+            the white card). */}
         <Box
-          sx={{
-            width: 64,
-            height: 64,
-            borderRadius: 3,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            mx: "auto",
-            mb: 3,
-            background: gradients.brand,
-            boxShadow: "0 8px 24px rgba(10,166,186,0.28)",
-          }}
-        >
-          <CloudQueueIcon sx={{ color: "white", fontSize: 36 }} />
-        </Box>
+          component="img"
+          src={tptLogo}
+          alt="Tech Plus Talent"
+          sx={{ display: "block", width: "100%", maxWidth: 250, mx: "auto", mb: 3.5, height: "auto" }}
+        />
 
         <Typography variant="h5" fontWeight={700} color={colors.textPrimary} mb={1}>
           Azure Cost Assessment

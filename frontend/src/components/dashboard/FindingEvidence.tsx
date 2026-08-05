@@ -63,6 +63,21 @@ interface EvidenceDetails {
   licence_kind?: string; // "Windows Server" (default) | "SQL Server"
 }
 
+/** Does this finding have chart-worthy evidence (meters / resize / cost-impact / commitment modelling)?
+ *  Lets the card decide whether to render a "Supporting Metrics" section at all. */
+export function hasSupportingMetrics(finding: Finding): boolean {
+  const d = (finding.details || {}) as EvidenceDetails;
+  const isVm =
+    finding.resource_type === "microsoft.compute/virtualmachines" ||
+    finding.category === "idle_vms" ||
+    finding.category === "oversized_vms";
+  const hasUtil = isVm && d.max_cpu != null;
+  const isDownsize = Boolean(d.current_sku && d.recommended_sku && d.current_vcpu != null);
+  const hasCostImpact = !isVm && finding.actual_monthly_cost != null && finding.actual_monthly_cost > 0;
+  const hasCommitment = (d.reservation_options || []).some((o) => o.monthly_savings > 0);
+  return hasUtil || isDownsize || hasCostImpact || hasCommitment;
+}
+
 function Panel({ children }: { children: React.ReactNode }) {
   return (
     <Box
@@ -104,12 +119,14 @@ function CommitmentPanel({
   items,
   kind,
   d,
+  showItems = true,
 }: {
   options: ReservationOption[];
   best: ReservationOption | null;
   items: ReservationItem[];
   kind: string;
   d: EvidenceDetails;
+  showItems?: boolean;
 }) {
   const sorted = [...options].sort((a, b) => b.monthly_savings - a.monthly_savings);
   const termOf = (label: string): "1yr" | "3yr" => (label.includes("3-year") ? "3yr" : "1yr");
@@ -218,7 +235,7 @@ function CommitmentPanel({
       )}
 
       {/* Per-SKU breakdown — reflects the selected term above. No separate toggle. */}
-      {items.length > 0 && (
+      {showItems && items.length > 0 && (
         <>
           <Box display="flex" alignItems="center" gap={0.75} mt={2.5} mb={1} sx={{ color: colors.textSecondary }}>
             <LayersOutlinedIcon fontSize="small" />
@@ -275,8 +292,16 @@ function CommitmentPanel({
   );
 }
 
-export default function FindingEvidence({ finding }: { finding: Finding }) {
+export default function FindingEvidence({
+  finding,
+  variant = "full",
+}: {
+  finding: Finding;
+  /** "metrics" hides the per-resource lists (they live in the Affected Resources section). */
+  variant?: "full" | "metrics";
+}) {
   const d = (finding.details || {}) as EvidenceDetails;
+  const showLists = variant !== "metrics";
   const isVm =
     finding.resource_type === "microsoft.compute/virtualmachines" ||
     finding.category === "idle_vms" ||
@@ -300,8 +325,9 @@ export default function FindingEvidence({ finding }: { finding: Finding }) {
     ? options.reduce((a, b) => (b.monthly_savings > a.monthly_savings ? b : a))
     : null;
 
-  if (!hasUtil && !isDownsize && !hasCostImpact && !hasCommitment && !hasAhbList && !hasResItems)
-    return null;
+  const anyMetrics = hasUtil || isDownsize || hasCostImpact || hasCommitment;
+  // In "metrics" mode the resource lists are rendered elsewhere, so only real metrics count as content.
+  if (variant === "metrics" ? !anyMetrics : !anyMetrics && !hasAhbList && !hasResItems) return null;
 
   const savePct = hasCostImpact
     ? Math.min(100, (finding.estimated_savings_monthly / (finding.actual_monthly_cost || 1)) * 100)
@@ -378,11 +404,11 @@ export default function FindingEvidence({ finding }: { finding: Finding }) {
 
       {/* Commitment — one panel, one term control driving both totals and the per-SKU breakdown */}
       {(hasCommitment || hasResItems) && (
-        <CommitmentPanel options={options} best={bestOption} items={resItems} kind={commitKind} d={d} />
+        <CommitmentPanel options={options} best={bestOption} items={resItems} kind={commitKind} d={d} showItems={showLists} />
       )}
 
       {/* Aggregated AHB — the list of eligible VMs / SQL resources behind the total */}
-      {hasAhbList && (
+      {showLists && hasAhbList && (
         <Panel>
           <Heading icon={<LayersOutlinedIcon fontSize="small" />}>
             {eligible.length} {ahbNoun}{eligible.length !== 1 ? "s" : ""} eligible for Azure Hybrid Benefit

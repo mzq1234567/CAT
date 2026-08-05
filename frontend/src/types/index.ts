@@ -62,6 +62,9 @@ export interface AssessmentSummary {
   current_annual_spend: number | null;
   spend_by_area: Record<string, number> | null;
   cost_data_available: boolean;
+  // Spend is an estimated run rate (new/migrated subscription, no complete billing month) over N days.
+  spend_estimated: boolean;
+  spend_period_days: number | null;
   currency: string;
   // Annual spend-growth rate from the recent trend (e.g. 0.12 = +12%/yr); null if too little history.
   observed_annual_growth: number | null;

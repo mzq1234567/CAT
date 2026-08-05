@@ -111,6 +111,24 @@ def test_dismiss_nonexistent_finding_is_404(db_session):
     assert client.post(f"/api/assessments/{a.id}/findings/424242/dismiss").status_code == 404
 
 
+def test_restore_finding_reverses_exclusion(db_session):
+    # Exclude (dismiss) then restore — the finding and its savings must come back exactly. This is
+    # what makes the "Exclude from savings" action safe/reversible.
+    a = seed_completed(db_session)
+    client = build_client(db_session)
+    client.post(f"/api/assessments/{a.id}/findings/{a._finding_id}/dismiss")
+
+    r = client.post(f"/api/assessments/{a.id}/findings/{a._finding_id}/restore")
+    assert r.status_code == 200
+    assert r.json()["dismissed"] is False
+    assert db_session.get(Finding, a._finding_id).dismissed == 0
+
+    detail = client.get(f"/api/assessments/{a.id}").json()
+    assert detail["findings_count"] == 1
+    assert detail["total_savings_monthly"] == 100.0    # restored to the pre-exclusion total
+    assert detail["total_savings_annual"] == 1200.0
+
+
 # ── Report downloads ──────────────────────────────────────────────────────────────
 
 def test_download_pdf(db_session):

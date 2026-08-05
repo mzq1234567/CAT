@@ -285,3 +285,26 @@ async def test_pipeline_marks_failed_on_error(pipeline_env, monkeypatch):
     a = s.get(Assessment, aid)
     assert a.status == "failed"
     assert "resource graph exploded" in a.error_message
+
+
+def test_all_savings_including_ahb_counted_in_headline_total(pipeline_env):
+    # Every identified saving — including Azure Hybrid Benefit — contributes to the headline total
+    # (the UI carries an info note that savings may include AHB where applicable).
+    TestSession, _install, seed = pipeline_env
+    aid = seed()
+    findings = [
+        {"category": "ri_vm", "display_name": "RI", "resource_type": "vm",
+         "estimated_savings_monthly": 100.0, "estimated_savings_annual": 1200.0},
+        {"category": "windows_ahb", "display_name": "AHB", "resource_type": "vm",
+         "estimated_savings_monthly": 900.0, "estimated_savings_annual": 10800.0},
+        {"category": "sql_ahb", "display_name": "SQL AHB", "resource_type": "sql",
+         "estimated_savings_monthly": 50.0, "estimated_savings_annual": 600.0},
+    ]
+    s = TestSession()
+    pipeline._persist_findings_and_totals(s, aid, findings)
+    s.close()
+
+    a = TestSession().get(Assessment, aid)
+    assert a.total_savings_monthly == 1050.0    # 100 + 900 + 50
+    assert a.total_savings_annual == 12600.0    # 1200 + 10800 + 600
+    assert a.findings_count == 3

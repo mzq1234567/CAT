@@ -22,6 +22,7 @@ from ...services.assessment import run_assessment
 from ...services.audit import (
     ASSESSMENT_RUN,
     FINDING_DISMISSED,
+    FINDING_RESTORED,
     REPORT_DOWNLOADED,
     record_audit,
 )
@@ -128,7 +129,7 @@ def dismiss_finding(
     finding.dismissed_at = datetime.utcnow()
 
     # Re-roll the headline totals from the surviving findings so the dashboard stays consistent
-    # (a dismissed opportunity no longer counts toward savings).
+    # (a dismissed opportunity no longer counts toward savings). Mirrors the initial roll-up.
     active = [f for f in assessment.findings if not f.dismissed]
     assessment.total_savings_monthly = round(sum(f.estimated_savings_monthly for f in active), 2)
     assessment.total_savings_annual = round(sum(f.estimated_savings_annual for f in active), 2)
@@ -137,6 +138,35 @@ def dismiss_finding(
     db.commit()
     db.refresh(finding)
     record_audit(db, FINDING_DISMISSED, user, resource=f"finding:{finding_id}",
+                 assessment_id=assessment_id)
+    return finding
+
+
+@router.post("/{assessment_id}/findings/{finding_id}/restore", response_model=FindingResponse)
+def restore_finding(
+    assessment_id: int,
+    finding_id: int,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Undo an exclusion — bring a previously-excluded recommendation back into the assessment and its
+    savings totals. This is what makes the exclude action safe/reversible (no data is ever lost)."""
+    assessment = _owned_assessment(db, assessment_id, user)
+    finding = db.get(Finding, finding_id)
+    if not finding or finding.assessment_id != assessment_id:
+        raise HTTPException(status_code=404, detail="Finding not found.")
+    finding.dismissed = 0
+    finding.dismissed_by = None
+    finding.dismissed_at = None
+
+    active = [f for f in assessment.findings if not f.dismissed]
+    assessment.total_savings_monthly = round(sum(f.estimated_savings_monthly for f in active), 2)
+    assessment.total_savings_annual = round(sum(f.estimated_savings_annual for f in active), 2)
+    assessment.findings_count = len(active)
+
+    db.commit()
+    db.refresh(finding)
+    record_audit(db, FINDING_RESTORED, user, resource=f"finding:{finding_id}",
                  assessment_id=assessment_id)
     return finding
 

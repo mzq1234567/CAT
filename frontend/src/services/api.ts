@@ -76,6 +76,15 @@ export function useApi() {
       return data;
     },
 
+    async restoreFinding(assessmentId: number, findingId: number): Promise<Finding> {
+      const { data } = await http.post<Finding>(
+        `/assessments/${assessmentId}/findings/${findingId}/restore`,
+        {},
+        { headers: await authHeaders() }
+      );
+      return data;
+    },
+
     async downloadReport(id: number): Promise<void> {
       const token = await getToken();
       const response = await http.get(`/assessments/${id}/report/pdf`, {

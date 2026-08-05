@@ -30,6 +30,10 @@ class Assessment(Base):
     current_annual_spend = Column(Float, nullable=True)
     spend_by_area = Column(JSON, nullable=True)  # {area: monthly_cost}
     cost_data_available = Column(Integer, default=0)  # 0/1 — did we get any cost data?
+    # Spend is an ESTIMATED run rate (no complete billing month — new/migrated sub) rather than a real
+    # last-month bill. `spend_period_days` = days of billing the estimate was averaged over.
+    spend_estimated = Column(Integer, default=0)  # 0/1
+    spend_period_days = Column(Integer, nullable=True)
     currency = Column(String, default="USD")  # billing currency (from Cost Management)
     # Annual spend-growth rate from a best-fit line through recent monthly spend (e.g. 0.12 = +12%/yr).
     # Drives the report's Linear/Conservative growth projections; null when there's too little history.

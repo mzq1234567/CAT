@@ -17,6 +17,7 @@ export const AREA_ACCENT: Record<Area, string> = {
   Storage: colors.accentIndigo,
   Databases: colors.info,
   Network: "#A855F7",
+  Backup: "#0EA5A0",
   Other: colors.textMuted,
 };
 

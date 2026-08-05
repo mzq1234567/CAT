@@ -20,6 +20,7 @@ logger = logging.getLogger("cat.audit")
 # Event names
 ASSESSMENT_RUN = "assessment_run"
 FINDING_DISMISSED = "finding_dismissed"
+FINDING_RESTORED = "finding_restored"
 REPORT_DOWNLOADED = "report_downloaded"
 
 

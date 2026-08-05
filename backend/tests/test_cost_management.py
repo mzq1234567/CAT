@@ -15,6 +15,7 @@ from app.services.cost_management import (
     build_service_cost_query,
     get_actual_cost_by_resource,
     get_actual_cost_by_service,
+    get_runrate_baseline,
     parse_cost_rows,
     parse_service_cost_rows,
     spend_by_area,
@@ -265,3 +266,36 @@ def test_linear_growth_rate_edge_cases():
     assert linear_growth_rate([1000, 1000, 1000]) == 0.0     # flat → 0%
     # A single one-off spike doesn't dominate a best-fit line (unlike month-over-month averaging).
     assert linear_growth_rate([1000, 1000, 5000, 1000, 1000, 1000]) is not None
+
+
+# ── Run-rate baseline (subscriptions with no complete billing month) ────────────
+
+async def test_runrate_baseline_from_average_daily_spend():
+    # New/migrated subscription: only daily data over a partial period. The baseline is the average
+    # daily spend since billing began, normalised to a month.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"properties": {
+            "columns": [{"name": "Cost"}, {"name": "ServiceName"}, {"name": "UsageDate"}, {"name": "Currency"}],
+            "rows": [
+                [10.0, "Virtual Machines", 20250715, "INR"],
+                [10.0, "Virtual Machines", 20250716, "INR"],
+                [5.0, "Storage", 20250715, "INR"],
+                [5.0, "Storage", 20250724, "INR"],   # last billed day
+            ]}})
+
+    from app.services.cost_management import AVG_DAYS_PER_MONTH
+    client = AzureClient("fake-token", transport=httpx.MockTransport(handler))
+    base = await get_runrate_baseline(client, "sub-1")
+    assert base["period_days"] == 10          # 15 Jul → 24 Jul inclusive
+    assert base["service_costs"]["Virtual Machines"] == round((20 / 10) * AVG_DAYS_PER_MONTH, 2)
+    assert base["service_costs"]["Storage"] == round((10 / 10) * AVG_DAYS_PER_MONTH, 2)
+    assert base["currency"] == "INR"
+
+
+async def test_runrate_baseline_none_when_no_data():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"properties": {
+            "columns": [{"name": "Cost"}, {"name": "ServiceName"}, {"name": "UsageDate"}], "rows": []}})
+
+    client = AzureClient("fake-token", transport=httpx.MockTransport(handler))
+    assert await get_runrate_baseline(client, "sub-1") is None

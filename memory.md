@@ -1366,6 +1366,204 @@ User: remove Savings Plan entirely; scrap the steadiness/age gate for RIs; recom
   test; repointed `_ri_group` + 2 aggregation tests + pipeline reservation test to the SQL (non-VM)
   path; added `test_recommendations_exclude_vms`. Backend **234 passing**; frontend build clean.
 
+### Post-ship 30 — Run-rate fallback for partial billing windows (AHB + RI) (2026-08-05)
+Real flaw found via CRA-VM (D4s v3, 24×7): tool showed AHB saving ₹1,407/yr when the calculator says
+the Windows licence is ₹12,847.71/mo (₹154K/yr). Root cause: the test subscription was **migrated to a
+new sponsorship sub on 15 Jul 2026**, so there is **no complete billing month** — the "last complete
+month" (July) is a partial, still-settling fragment (~₹240 for CRA-VM). Grounding AHB/RI in that
+fragment under-counts ~100×. Azure bills the Windows licence **per running hour** (₹0 when deallocated —
+confirmed via MS Learn), so the licence MATH was right (median per-vCore ₹3,212 = calculator to the
+rupee); only the cost *basis* was wrong.
+- **Fix (no plumbing change — signal already in `self._consistency`):** new helper
+  `FindingsEngine._cost_basis_partial(rid)` → True when `billed_months < 2` (resource billed in ≤1 of
+  the last 6 months = new/migrated/just-provisioned → last-month cost is a partial fragment).
+- **detect_windows_ahb:** when `cost_available and not partial` → grounded (actual × lic_fraction);
+  else → **run-rate = full-month licence** (`vcpu × per_vcore_licence`), `run_rate_count++`. Adds
+  `run_rate_estimated_count` to details + a "priced at full-month list run-rate — subscription has <1
+  complete billing month; re-run after a full month" note to description/reason.
+- **detect_vm_commitments (RI):** `partial = _cost_basis_partial(rid)`; skip-on-zero-cost now gated on
+  `not partial` (a migrated 24×7 VM can read ~zero); `grounded_ok = actual>0 and not partial` else base
+  = payg compute run-rate; `run_rate_count`; caveat appended to context_note; finding-level
+  `grounded=cost_available and run_rate_count==0`.
+- Threshold rationale: `billed_months>=2` ⟺ at least one PRIOR complete month exists ⟺ last-month is a
+  full month. Transition is clean: once Aug completes (Sep 1), cost_map=Aug(full) and billed_months=2 →
+  grounding resumes automatically. Limitation: multi-sub mixed-age uses per-resource billed_months
+  (robust); a partial VM with actual=0 in AHB Pass-1 is still skipped (can't tell not-posted vs
+  deallocated) — CRA-VM has actual>0 so it's covered.
+- Tests: `test_ahb_partial_billing_window_prices_at_run_rate`,
+  `test_ri_partial_billing_window_prices_at_run_rate`. Backend **236 passing**.
+- Context doc for ChatGPT: [AHB_ISSUE_CONTEXT.md](AHB_ISSUE_CONTEXT.md) (§7 = this fix). Validate by
+  re-running after 31 Aug 2026 (August = first complete month).
+
+### Post-ship 31 — AHB is conditional: excluded from headline savings (2026-08-05)
+After Post-ship 30, AHB run-rate savings (₹1.03M) dominated the ₹1.73M headline — 10× the (partial)
+spend. User: most clients DON'T own on-prem Windows/SQL licences, so AHB shouldn't be in the headline;
+show it as a finding with "you can save X IF you have licences."
+- **Shared constant** `CONDITIONAL_SAVINGS_CATEGORIES = frozenset({"windows_ahb","sql_ahb"})` in
+  findings.py (single source of truth).
+- **assessment.py `_persist_findings_and_totals`:** headline total_savings_monthly/annual now SUM only
+  non-conditional findings (AHB still stored + counted in findings_count).
+- **assessments.py dismiss endpoint:** re-roll also excludes conditional (mirrors initial roll-up).
+- **report.py:** pillar totals exclude conditional (AHB already has its own `_ahb_items` section, so no
+  double-count); headline uses assessment.total_savings_annual (already excluded). Imports the constant.
+- **Frontend area.ts:** `CONDITIONAL_CATEGORIES`, `isConditionalSaving()`, `conditionalSavingsAnnual()`;
+  `rollupByArea` SKIPS conditional so the by-area donut reconciles with the headline.
+- **ExecutiveSummary:** indigo callout in both branches — "A further ₹X/yr via Azure Hybrid Benefit —
+  only if you own eligible Windows/SQL licences … not included in the total above."
+- **RecommendationCard:** AHB cards get an indigo "Conditional · needs licences" chip, header number in
+  indigo (not savings-green) with caption "per year · if licensed", and an expanded note.
+- InsightsRow needed no change (uses backend total + AHB-excluded rollups → consistent).
+- Test: `test_ahb_savings_excluded_from_headline_total` (pipeline). Backend **237 passing**; FE clean.
+- NOTE: on the migrated sub, residual "savings > partial spend" remains (RI run-rate vs partial spend) —
+  that's the Post-ship 30 migration artifact; self-heals once August is a complete month.
+
+### Post-ship 32 — Executive summary redesign + AHB folded back into savings (2026-08-05)
+User reversed Post-ship 31: AHB should COUNT toward the headline savings again (Card 2), with just a
+small info-icon caveat — "Estimated savings may include Azure Hybrid Benefit where applicable." — and
+NO separate savings categories. Plus a full exec-summary redesign for 5-second CFO comprehension.
+- **Reverted Post-ship 31 fully:** removed CONDITIONAL_SAVINGS_CATEGORIES + all its usages
+  (assessment.py totals, assessments.py dismiss, report.py pillar, constant in findings.py). Frontend:
+  rollupByArea no longer skips AHB; RecommendationCard conditional chip/indigo/note removed. Kept
+  area.ts `conditionalSavingsAnnual()`/`isConditionalSaving()` ONLY to decide whether to show the
+  info-icon (AHB actually contributes). Flipped test → `test_all_savings_including_ahb_counted_in_headline_total`.
+- **ExecutiveSummary.tsx fully rewritten** — three large KPI cards telling a story:
+  `Current Azure Spend  −  Estimated Savings  =  Projected Azure Spend`. Each card: big monthly number
+  (2.8rem, AnimatedValue, tooltip=exact) + annual sub-line. Card 2 (Savings) is the emphasized hero
+  (green gradient + shadow + info-icon w/ AHB tooltip). Desktop connectors are "−"/"="; mobile stacks
+  with ↓ arrows. Projected = current−savings ONLY when `reconciles` (savings≤spend); else shows "—" +
+  honest caveat banner (partial billing / no billing). Secondary strip below: Total findings +
+  High-impact findings (small). Removed the old SavingsProjection chart + repeated StatTiles from the
+  exec summary (declutter).
+- **AssessmentDashboard:** reordered so the 3 KPI cards render FIRST; the resource-scan coverage banner
+  ("Scanned N resources…") moved BELOW them. InsightsRow (Savings by area + Findings by impact) +
+  AreaBreakdown + Recommendations follow, unchanged.
+- Backend **237 passing**; FE clean. NOTE: on the migrated sub, savings (incl AHB run-rate) still
+  exceed the partial spend → Projected shows the caveat, not a negative; self-heals after a full month.
+
+### Post-ship 33 — Windows AHB: per-VM licence delta (REMOVED the median) (2026-08-06)
+User caught B2ms AHB showing ₹76,074/yr when the Azure calculator says the B2ms Windows licence is only
+₹557.83/mo (~₹6.7K/yr). **Verified live against the retail API** (scratchpad/verify_ahb.py):
+- B2ms: Windows−Linux = **₹551/mo = ₹6,615/yr** (₹275.6/vCore)
+- D4s_v3: Windows−Linux = **₹12,679/mo = ₹152,147/yr** (₹3,169.7/vCore)
+So the Windows Server licence is **NOT uniform per vCore across families** — B-series (burstable) carry
+~11× lower licence/vCore than D/E-series. **This means the earlier `_median` "fix" was itself the bug:**
+my original "B-series ₹275/vCore = bad fetch" diagnosis was WRONG — ₹275/vCore is the *real* B-series
+rate. The median forced every VM to the fleet (D-series-dominated) ₹3,170/vCore, so B2ms became
+2×3,170 = ₹6,339/mo = ₹76,074/yr. The Post-ship 30 run-rate change exposed it (grounding had masked it).
+- **Fix:** `detect_windows_ahb` now uses **each VM's own (Windows − Linux) retail delta**; removed the
+  `per_vcore_samples`/`_median` machinery and the `_median` function entirely. A VM whose Windows price
+  didn't come back above Linux (missing/invalid fetch) is **skipped** (never inflated by a fleet avg).
+- Result: B2ms → ₹6,615/yr (correct), D-series 2-vCPU → ~₹76,074/yr (were already correct),
+  D4s_v3 → ₹152,147/yr (unchanged/correct). Each family now priced on its own rate.
+- SQL AHB unaffected (uses fixed $112/vCore constant — SQL licensing IS ~uniform per vCore).
+- Test: `test_windows_ahb_median_corrects_a_bad_price_fetch` → rewritten as
+  `test_windows_ahb_uses_each_vms_own_licence_delta_per_family` (asserts B-series keeps its low rate,
+  per-vCore differs across families). Backend **237 passing**.
+- LESSON: earlier Post-ship note "B-series median fix validated in #46" was a false validation —
+  grounding on partial cost coincidentally hid the 6× lic_fraction inflation. Always cross-check licence
+  deltas against the Azure calculator / retail API per family, never assume per-vCore uniformity for VMs.
+
+### Post-ship 34 — Suppress broken PDF projections on partial billing (2026-08-06)
+User: report's 3-year trajectory graphs are "messed up" — "ACR after Savings" bars go massively
+negative (-₹1.5M/-₹3.1M/-₹4.6M). Root cause = SAME mismatch as dashboard: `_projection()` uses
+`rate = savings/spend`; with run-rate savings ₹1.59M and partial-window spend ₹34K, rate ≈ 47 (4700%),
+so ACR-after-savings = annual − annual×47 → deeply negative → broken chart.
+- **Fix:** `report.py _projection_blocks` now guards `if not spend or spend<=0 or savings > spend:` →
+  returns a single honest note paragraph ("projections aren't shown… savings exceed measured spend…
+  partial/young billing window… re-run after a full billing month") instead of the broken bars. Mirrors
+  the dashboard's Projected "—" + caveat.
+- Test: `test_projections_suppressed_when_savings_exceed_spend`. Backend **238 passing**.
+- Spend calc (answered): `current_monthly_spend` = last COMPLETE calendar month total from Cost
+  Management (ActualCost grouped by service), ×12 for annual; falls back to month-to-date for new subs
+  when last-month is empty. On this migrated sub it reads a partial fragment (₹2,798) → far below the
+  run-rate savings. NOTE: AHB findings show "<1 complete billing month" (billed_months<2) → contradicts
+  user's "billing since Jun 15" (that would give 2 billed months); data says only ~1 month billed on the
+  NEW sub → migration date effectively July, or July costs still settling/split old↔new sub.
+- STILL OPEN (offered, not yet done): dashboard "Current Azure Spend ₹34K/yr" is last-partial-month×12 —
+  technically correct but misleading; caveat banner covers it. Could mark the spend card "partial".
+
+### Post-ship 35 — Recommendations section: 3-level consulting redesign (2026-08-06)
+User: redesign Recommendations end-to-end to feel like a consulting report (Turbo360/FinOps-grade), not
+an accordion. 3-level hierarchy.
+- **New `categoryMeta.ts`** — the "consulting layer": per-category `{summary(n), businessValue, effort,
+  effortNote, prerequisites?, noun}` (META map for ~25 categories + reserved/orphan/rightsize profiles
+  + smart default via `metaFor`). Helpers: `nounFor`, `affectedResources(finding)` (reads
+  eligible_vms/reservation_items/single-resource → {count, items}), `affectedLabel` ("12 Virtual
+  Machines"), `Effort` type.
+- **Level 1 — `OptimizationCategories.tsx`** (NEW, replaces AreaBreakdown which was DELETED): premium
+  category filter cards (Compute/Storage/Databases/Network/Backup/Other) each showing annual+monthly
+  savings, % share, #recs, #resources; CardActionArea toggles the area filter; "All categories" reset
+  chip. Added **Backup** as a 6th Area (area.ts + tokens.ts AREA_ACCENT `#0EA5A0`; backup_* remapped
+  Storage→Backup).
+- **Level 2 — `RecommendationCard.tsx`** (rewritten): premium card w/ left category accent stripe,
+  icon tile, title, one-line business summary, chip row (Area/Impact/Effort/Confidence/"N resources"),
+  annual+monthly savings, chevron.
+- **Level 3** (expanded consulting sections, in order): Business Value (accent callout) · Why This
+  Recommendation Exists (description) · Financial Impact (savings stat block + ValidationChip) ·
+  Implementation Guidance (recommendation + effort note) · Prerequisites (warning callout, conditional
+  on meta.prerequisites) · **Affected Resources** (count + "Show resources" button → list, progressive
+  disclosure) · Supporting Metrics (`FindingEvidence variant="metrics"`, conditional on
+  `hasSupportingMetrics()`). Footer: memory/advisor chips + Dismiss.
+- **FindingEvidence.tsx**: added `variant: "full"|"metrics"` (+ `showItems` on CommitmentPanel) so the
+  per-resource lists move out to the Affected Resources section; exported `hasSupportingMetrics()`.
+- **AssessmentDashboard**: "Where the Savings Are" section removed; Recommendations section now =
+  Level-1 categories (filter) + DetailedFindings(filtered)+RecommendationCard. InsightsRow (donut +
+  impact) KEPT above — mild redundancy w/ Level 1; offered to remove the donut if desired.
+- FE build clean (tsc+vite, 2010 modules). NOTE: EffortChip Low=green/Med=amber/High=red.
+
+### Post-ship 36 — Recommendations → FinOps dashboard (charts + featured cards + modal) (2026-08-06)
+User: Post-ship 35 still felt like a long accordion. Full rebuild to a FinOps-platform experience.
+- **Removed artificial metadata**: Confidence % and Effort (Low/Medium/High) badges GONE from all
+  cards/modal (not measurable → hurt credibility). Kept only **Category** + **Impact**. (categoryMeta
+  still defines effort/effortNote but they're unrendered; `EffortChip`/`ConfidenceChip` no longer used.)
+- **Charts band** (NEW `RecommendationInsights.tsx`): 3 chart cards — Savings by Category (reuse
+  `Donut` + legend), Top Opportunities (top-5 currency bars), and Spend→Savings→Projected **Waterfall**
+  (NEW `charts/Waterfall.tsx`) when spend reconciles, else Recommendations-by-Impact (`HBars`).
+- **Level 1 tiles** unchanged (`OptimizationCategories`, now imports shared `areaIcons.tsx`).
+- **Weighted cards** (NEW `OpportunityCard.tsx`, variants featured|compact): top-2 by annual savings =
+  large featured cards (gradient, 2/row); rest = compact grid (3/row md). NO more full-width accordion.
+  Each card: name, 1-line business summary, annual+monthly savings, Category+Impact chips, affected
+  chip, **"View Details"**.
+- **Details MODAL** (NEW `RecommendationDetails.tsx`, MUI Dialog) replaces inline accordion: sections
+  Business Value · Why · Financial Impact · Implementation Guidance · Prerequisites · Affected Resources
+  (collapsed, "Show resources" button) · Supporting Metrics (`FindingEvidence variant="metrics"`) +
+  Dismiss. Progressive disclosure preserved.
+- **NEW `OpportunityGrid.tsx`**: impact filter + search, featured/compact split, holds modal state.
+- **AssessmentDashboard**: InsightsRow REMOVED (folded into charts band); section renamed "Optimization
+  Opportunities" = RecommendationInsights → OptimizationCategories → OpportunityGrid.
+- **DELETED**: RecommendationCard.tsx, DetailedFindings.tsx, InsightsRow.tsx, AreaBreakdown.tsx (prev).
+- FE build clean (tsc+vite, 2014 modules). Bundle ~1.25MB (chunk-size warning pre-existing).
+
+### Post-ship 37 — Run-rate spend baseline + Dismiss→Exclude(reversible) (2026-08-06)
+**Task 1 — spend baseline for subs with no complete billing month** (new/migrated). IF ≥2 complete
+months have cost → use last-month actuals (unchanged). ELSE → estimate monthly run rate from AVERAGE
+DAILY spend over the observed billing period (first billed day → last billed day), normalised ×30.4375.
+This finally makes SPEND consistent with the run-rate SAVINGS (Post-ship 30) so the KPI/waterfall can
+reconcile.
+- cost_management.py: `AVG_DAYS_PER_MONTH=30.4375`, `_parse_usage_date` (YYYYMMDD int),
+  `build_daily_service_cost_query` (Daily granularity, group ServiceName), `parse_daily_service_costs`
+  → (per_service_total, sorted_dates_with_cost, currency), `get_runrate_baseline` → {service_costs
+  (monthly), currency, period_days=span, period_start}. `date` added to datetime import.
+- assessment.py: `_gather_cost_and_consistency` now returns 4th val `complete_months` (count of months
+  with cost); new `_gather_spend_baseline(client, subs, complete_month_exists=complete_months>=2)` →
+  (service_costs, currency, estimated, period_days); persist stores `spend_estimated`/`spend_period_days`.
+- Model: Assessment `spend_estimated` (Int 0/1), `spend_period_days` (Int null). **alembic 010** (+ ran
+  `alembic upgrade head` on cat.db, 009→010). schemas.py + frontend types updated.
+- ExecutiveSummary: Current-Spend KPI card shows amber "Estimated run rate · Nd billed" chip + info
+  tooltip when `spend_estimated`.
+- Tests: `test_runrate_baseline_from_average_daily_spend` (span=10, ×30.4375), `_none_when_no_data`.
+
+**Task 2 — Dismiss redesigned → "Exclude from savings" (reversible, no silent loss)**. Kept the feature
+(legit use: exclude non-applicable recs for a realistic number) but made it intuitive+undoable.
+- Backend: `restore_finding` endpoint POST `/{aid}/findings/{fid}/restore` (dismissed=0, re-roll totals);
+  `FINDING_RESTORED` audit action. Frontend api `restoreFinding`.
+- RecommendationDetails (modal): button renamed "Dismiss recommendation"→**"Exclude from savings"** w/
+  tooltip; mutation LIFTED to parent via `onExclude` prop (removed useApi/useMutation from the modal).
+- OpportunityGrid: owns exclude+restore mutations; **Undo Snackbar** (7s) on exclude; **"N excluded from
+  savings · ₹X/yr not counted"** collapsible panel with per-item **Restore** buttons. `excludedFindings`
+  prop from AssessmentDashboard (`findings.filter(f=>f.dismissed)`).
+- Test: `test_restore_finding_reverses_exclusion`. Backend **241 passing**; FE build clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD

@@ -5,12 +5,12 @@ import {
 import { alpha } from "@mui/material/styles";
 import { useMsal } from "@azure/msal-react";
 import { useLocation, useNavigate } from "react-router-dom";
-import CloudQueueIcon from "@mui/icons-material/CloudQueue";
 import DashboardIcon from "@mui/icons-material/Dashboard";
 import AssessmentIcon from "@mui/icons-material/Assessment";
 import AddCircleOutlineIcon from "@mui/icons-material/AddCircleOutline";
 import LogoutIcon from "@mui/icons-material/Logout";
 import { colors, gradients } from "../theme";
+import tptLogo from "../assets/tpt-logo-dark.png";
 
 const SIDEBAR_WIDTH = 240;
 
@@ -80,38 +80,32 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
           height: "100vh",
         }}
       >
-        {/* Logo */}
+        {/* Brand header — vendor logo (dark-text version) sitting directly on the white sidebar,
+            product name beneath it. One brand mark, at the top. */}
         <Box
           sx={{
             px: 2.5,
-            py: 3,
-            display: "flex",
-            alignItems: "center",
-            gap: 1.5,
+            py: 2.75,
             borderBottom: `1px solid ${colors.border}`,
           }}
         >
           <Box
+            component="img"
+            src={tptLogo}
+            alt="Tech Plus Talent"
+            sx={{ display: "block", width: "100%", maxWidth: 168, height: "auto" }}
+          />
+          <Typography
+            fontSize={10}
             sx={{
-              width: 38,
-              height: 38,
-              borderRadius: 2,
-              background: gradients.brand,
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
+              mt: 1.25,
+              letterSpacing: "0.14em",
+              textTransform: "uppercase",
+              color: colors.textMuted,
             }}
           >
-            <CloudQueueIcon sx={{ color: "#fff", fontSize: 22 }} />
-          </Box>
-          <Box>
-            <Typography fontWeight={700} fontSize={16} color={colors.textPrimary} lineHeight={1.1}>
-              Azure CAT
-            </Typography>
-            <Typography fontSize={11} color={colors.textMuted} letterSpacing="0.04em">
-              COST ASSESSMENT
-            </Typography>
-          </Box>
+            Azure Cost Assessment
+          </Typography>
         </Box>
 
         {/* Nav items */}

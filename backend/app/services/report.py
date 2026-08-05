@@ -793,6 +793,18 @@ def _projection_blocks(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float
     spend, savings = ctx["_spend"], ctx["_savings"]
     measured = ctx.get("_growth")
 
+    # Spend-based projections are only meaningful when the numbers reconcile (savings ≤ measured spend).
+    # On a partial/young billing window (new or recently-migrated subscription) the measured spend is a
+    # fragment far below the run-rate savings, which would drive "ACR after savings" deeply negative — a
+    # broken chart. Show an honest note instead of nonsensical bars (mirrors the dashboard's behaviour).
+    if not spend or spend <= 0 or savings > spend:
+        return [Paragraph(
+            "Three-year spend projections aren't shown for this assessment. The identified savings exceed "
+            "the measured spend for this scope, which means the billing window is partial — typically a "
+            "new or recently-migrated subscription without a complete billing month. Re-run after a full "
+            "billing month has elapsed for reliable spend and projection figures.",
+            st["caption"])]
+
     base = ctx["_year"] + int(cfg.get("base_year_offset", 0))
     pattern = cfg.get("year_label", "{ordinal} Year ({start}-{end})")
     labels = [pattern.format(ordinal=_ordinal(i + 1), start=base + i, end=str(base + i + 1)[-2:])

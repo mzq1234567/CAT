@@ -130,6 +130,19 @@ def test_projections_render_without_measured_growth():
     assert len(pdf) > 5000  # multi-page branded report, not a stub
 
 
+def test_projections_suppressed_when_savings_exceed_spend():
+    """Partial/young billing window: run-rate savings exceed the measured (partial) spend, so the
+    spend-based projection charts would go negative — the report must suppress them and still build."""
+    a = _rich_assessment()
+    a.current_monthly_spend = 2798.0
+    a.current_annual_spend = 33576.0          # partial window (mid-cycle migration)
+    a.total_savings_monthly = 132000.0
+    a.total_savings_annual = 1590000.0        # run-rate savings >> measured spend
+    pdf = generate_pdf(a, _rich_findings())
+    assert pdf[:4] == b"%PDF"
+    assert len(pdf) > 5000                    # still a full report, just no broken projection bars
+
+
 def test_report_currency_symbols():
     from app.services.report import _set_currency, _usd
     _set_currency("GBP"); assert _usd(1000) == "£1,000.00"

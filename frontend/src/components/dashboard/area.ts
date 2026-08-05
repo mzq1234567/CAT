@@ -2,9 +2,9 @@
  * Groups the backend's real finding categories into a small set of executive-friendly areas.
  * Used only for the "savings by area" view — every number behind it comes from real findings.
  */
-export type Area = "Compute" | "Storage" | "Databases" | "Network" | "Other";
+export type Area = "Compute" | "Storage" | "Databases" | "Network" | "Backup" | "Other";
 
-export const AREAS: Area[] = ["Compute", "Storage", "Databases", "Network", "Other"];
+export const AREAS: Area[] = ["Compute", "Storage", "Databases", "Network", "Backup", "Other"];
 
 const CATEGORY_TO_AREA: Record<string, Area> = {
   // Compute
@@ -22,9 +22,10 @@ const CATEGORY_TO_AREA: Record<string, Area> = {
   managed_disk_reserved_capacity: "Storage",
   azure_files_reserved_capacity: "Storage",
   disk_rightsizing: "Storage",
-  backup_redundancy: "Storage",
-  backup_policy_review: "Storage",
-  incremental_backup: "Storage",
+  // Backup
+  backup_redundancy: "Backup",
+  backup_policy_review: "Backup",
+  incremental_backup: "Backup",
   // Databases
   paused_sql_databases: "Databases",
   stopped_sql_managed_instances: "Databases",
@@ -48,7 +49,23 @@ export function areaForCategory(category: string): Area {
   return CATEGORY_TO_AREA[category] ?? "Other";
 }
 
+// Azure Hybrid Benefit savings are CONDITIONAL — they only materialise if the customer already owns
+// eligible Windows/SQL Server licences (with Software Assurance), which most don't. They're shown as
+// findings but kept OUT of the headline total and the by-area chart, matching the backend roll-up.
+export const CONDITIONAL_CATEGORIES = new Set(["windows_ahb", "sql_ahb"]);
+
+export function isConditionalSaving(category: string): boolean {
+  return CONDITIONAL_CATEGORIES.has(category);
+}
+
 import type { Finding } from "../../types";
+
+/** Sum of conditional (AHB) annual savings — shown separately as "available if you own licences". */
+export function conditionalSavingsAnnual(findings: Finding[]): number {
+  return findings
+    .filter((f) => isConditionalSaving(f.category))
+    .reduce((sum, f) => sum + (f.estimated_savings_annual || 0), 0);
+}
 
 export interface AreaRollup {
   area: Area;

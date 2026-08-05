@@ -411,27 +411,29 @@ async def test_windows_ahb_aggregates_eligible_vms():
     assert f["details"]["eligible_count"] == 2
 
 
-async def test_windows_ahb_median_corrects_a_bad_price_fetch():
-    # The Windows licence is a flat per-vCore charge, so it must be identical per vCore on every VM.
-    # Two VMs price correctly (33.58/vCore); a third (like some B-series) returns a Windows price
-    # barely above Linux — a bad fetch. The fleet MEDIAN must correct it, not understate its AHB.
+async def test_windows_ahb_uses_each_vms_own_licence_delta_per_family():
+    # The Windows Server licence is NOT uniform per vCore across families: a B-series (burstable) VM
+    # carries a far lower licence per vCore than a D-series one (verified against Azure retail — B2ms
+    # ~₹276/vCore vs D-series ~₹3,170/vCore). Each VM must use its OWN (Windows − Linux) delta; using a
+    # fleet average would inflate the B-series ~11× (the real bug this replaced).
     pricing = FakePricing(
-        vm_prices={"Standard_D2s_v3": 70.08, "Standard_D4s_v3": 140.16, "Standard_B2ms": 60.0},
-        win={"Standard_D2s_v3": 137.24,     # (137.24-70.08)/2  = 33.58/vCore  (good)
-             "Standard_D4s_v3": 274.48,     # (274.48-140.16)/4 = 33.58/vCore  (good)
-             "Standard_B2ms": 65.0},        # (65-60)/2 = 2.5/vCore            (bad fetch)
+        vm_prices={"Standard_D4s_v3": 158.76, "Standard_B2ms": 60.0},
+        win={"Standard_D4s_v3": 311.00,   # licence 152.24 → 38.06/vCore (D-series, high)
+             "Standard_B2ms": 66.60},     # licence   6.60 →  3.30/vCore (B-series, low)
     )
     vms = []
-    for i, sku in enumerate(("Standard_D2s_v3", "Standard_D4s_v3", "Standard_B2ms")):
+    for i, sku in enumerate(("Standard_D4s_v3", "Standard_B2ms")):
         vm = _vm(max_cpu=40.0, sku=sku, rid=f"/s/vm-{i}")
         vm["name"] = f"win-{i}"
         vms.append(vm)
     out = await FindingsEngine(pricing=pricing).detect_windows_ahb(vms)
     items = {v["name"]: v for v in out[0]["details"]["eligible_vms"]}
-    # B2ms's bad fetch alone would give ~₹5; the median corrects it to the fleet per-vCore rate.
-    assert items["win-2"]["licence_charge"] > 50
-    # Every VM ends up at the SAME per-vCore licence — that's the whole point of the fix.
-    assert len({round(v["licence_charge"] / v["vcpu"], 1) for v in items.values()}) == 1
+    # Each VM keeps its OWN delta — the B-series is NOT bumped up to the D-series rate.
+    assert items["win-0"]["licence_charge"] == 152.24        # D4s_v3
+    assert items["win-1"]["licence_charge"] == 6.60          # B2ms stays low
+    # The per-vCore licences genuinely differ across families.
+    assert round(items["win-0"]["licence_charge"] / items["win-0"]["vcpu"], 2) == 38.06
+    assert round(items["win-1"]["licence_charge"] / items["win-1"]["vcpu"], 2) == 3.30
 
 
 async def test_windows_ahb_empty_when_no_eligible_vms():
@@ -473,6 +475,47 @@ async def test_ahb_matches_azure_calculator_to_the_dollar():
     grounded = FindingsEngine(pricing=pricing, cost_map={"/s/win": 300.0})
     fg = (await grounded.detect_windows_ahb([vm]))[0]
     assert fg["estimated_savings_monthly"] == round(300.0 * frac, 2)
+
+
+async def test_ahb_partial_billing_window_prices_at_run_rate():
+    # CRA-VM scenario: a 24×7 Windows VM whose subscription was migrated mid-month, so it has billed
+    # only ONE (partial) month. Grounding on that fragment understates the licence ~100×, so the tool
+    # must price at the full-month run-rate (the licence itself), flagged as an estimate.
+    pricing = FakePricing(vm_prices={"Standard_D16s_v3": 560.64}, win={"Standard_D16s_v3": 1097.92})
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+
+    partial = FindingsEngine(
+        pricing=pricing,
+        cost_map={"/s/win": 5.0},                                    # only a few hours billed so far
+        cost_consistency={"/s/win": {"billed_months": 1, "stable": False}},
+    )
+    f = (await partial.detect_windows_ahb([vm]))[0]
+    assert f["estimated_savings_monthly"] == 537.28                  # run-rate licence, NOT 5.0 × frac
+    assert f["details"]["run_rate_estimated_count"] == 1
+    assert "run-rate" in f["description"]
+
+    # Once a complete month exists (billed_months ≥ 2) it grounds on the real bill again.
+    complete = FindingsEngine(
+        pricing=pricing, cost_map={"/s/win": 300.0},
+        cost_consistency={"/s/win": {"billed_months": 3, "stable": True}},
+    )
+    fc = (await complete.detect_windows_ahb([vm]))[0]
+    frac = (1097.92 - 560.64) / 1097.92
+    assert fc["estimated_savings_monthly"] == round(300.0 * frac, 2)
+    assert fc["details"]["run_rate_estimated_count"] == 0
+
+
+async def test_ri_partial_billing_window_prices_at_run_rate():
+    # Same migration scenario for Reserved Instances: a prod VM billed only a partial month must be
+    # reserved off its compute RUN-RATE, not the tiny fragment, so a 24×7 VM isn't under-reserved.
+    partial = FindingsEngine(
+        pricing=FakePricing(),                                       # D16: payg 560.64, ri3 350
+        cost_map={VM_RID.lower(): 4.0},                              # partial fragment
+        cost_consistency={VM_RID.lower(): {"billed_months": 1, "stable": False}},
+    )
+    ri = [f for f in await partial.detect_vm_commitments([_steady_vm()]) if f["category"] == "ri_vm"][0]
+    assert ri["estimated_savings_monthly"] == round(560.64 - 350, 2)  # run-rate base → 210.64, not 4×
+    assert "run-rate" in ri["description"]
 
 
 async def test_windows_ahb_excludes_deleted_vms():

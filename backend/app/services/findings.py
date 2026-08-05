@@ -47,15 +47,6 @@ DOWNSIZE_HEADROOM_CEILING = 70.0  # a candidate (smaller) SKU must keep BOTH pro
 METRIC_WINDOW_DAYS = 30
 
 
-def _median(values: List[float]) -> Optional[float]:
-    """Median of the positive values (robust central estimate), or None if there are none."""
-    vals = sorted(v for v in values if v is not None and v > 0)
-    if not vals:
-        return None
-    m = len(vals) // 2
-    return vals[m] if len(vals) % 2 else round((vals[m - 1] + vals[m]) / 2, 4)
-
-
 def _vcpus(sku: str) -> Optional[int]:
     """vCPU count for a VM SKU — from the curated spec table, else parsed from the SKU name.
 
@@ -412,6 +403,20 @@ class FindingsEngine:
         self._reservation_basis = reservation_basis
 
     # -- shared builder --------------------------------------------------------
+
+    def _cost_basis_partial(self, resource_id: Optional[str]) -> bool:
+        """True when a resource hasn't billed a full representative month yet.
+
+        `billed_months` (from the 6-month history) counts months with any cost. A value of 1 means the
+        resource only started billing in the most recent month — a brand-new, recently-migrated, or
+        just-provisioned resource — so its "last month" cost is a partial fragment that badly
+        under-represents its real run-rate. In that case a saving grounded in that cost would be far
+        too low (e.g. AHB on a 24×7 VM whose subscription was migrated mid-month), so the caller should
+        price at the full-month run-rate instead and flag it as an estimate.
+        """
+        cons = self._consistency.get((resource_id or "").lower())
+        billed = cons.get("billed_months") if cons else None
+        return billed is not None and billed < 2
 
     def _advisor_id_for(self, resource_id: Optional[str]) -> Optional[str]:
         if not resource_id:
@@ -1156,6 +1161,7 @@ class FindingsEngine:
         windows_no_ahb_ids = windows_no_ahb_ids or set()
         ri_items: List[Dict] = []
         all_steady = True
+        run_rate_count = 0  # VMs priced at run-rate because their billing window is partial
         cost_available = bool(self._cost_map)
         for vm in vms:
             max_cpu = vm.get("max_cpu")
@@ -1173,8 +1179,11 @@ class FindingsEngine:
             if rid and self._advisor_index.get(rid.lower()):
                 continue  # Advisor wins
             actual = self._cost_map.get((rid or "").lower())
-            # No point reserving a VM that isn't billing (deallocated / demo box not in the window).
-            if cost_available and (not actual or actual <= 0):
+            partial = self._cost_basis_partial(rid)
+            # Skip a non-billing VM only when we have a COMPLETE billing month for it (then zero cost =
+            # deallocated / not in window). On a partial window (new/migrated subscription) a real 24×7
+            # VM can read near-zero, so keep it and price at run-rate below rather than dropping it.
+            if cost_available and not partial and (not actual or actual <= 0):
                 continue
 
             sku = vm.get("vmSize") or ""
@@ -1201,15 +1210,20 @@ class FindingsEngine:
                 r3, ri_estimated = _RI_DEFAULT_DISCOUNT_3YR, True
 
             # Base = the COMPUTE portion of the VM's actual cost (Windows licence stripped for non-AHB
-            # Windows VMs so RI never overlaps AHB). No billing data → retail run-rate.
+            # Windows VMs so RI never overlaps AHB). Ground it in the real bill only when the VM has
+            # billed a full month; with no billing OR a partial new/migrated window, use the compute
+            # run-rate so a 24×7 VM isn't under-reserved off a fragment of a month.
             is_win_no_ahb = bool(rid and rid.lower() in windows_no_ahb_ids)
             compute_fraction = (payg / windows) if (is_win_no_ahb and windows and windows > payg) else 1.0
-            if actual is not None and actual > 0:
+            grounded_ok = actual is not None and actual > 0 and not partial
+            if grounded_ok:
                 base = round(actual * compute_fraction, 2)
                 ondemand = round(actual, 2)
             else:
-                base = payg
+                base = payg  # compute-only run-rate (Linux-equivalent price)
                 ondemand = payg
+                if partial and cost_available:
+                    run_rate_count += 1
 
             s1 = round(base * r1, 2) if r1 else None
             s3 = round(base * r3, 2) if r3 else None
@@ -1236,7 +1250,7 @@ class FindingsEngine:
                 "compute_base": round(base, 2), "actual_monthly_cost": round(actual, 2) if actual else None,
                 "discount_1yr": round(r1, 4) if r1 else None,
                 "discount_3yr": round(r3, 4) if r3 else None,
-                "grounded": actual is not None and actual > 0,
+                "grounded": grounded_ok,
                 "s1": s1, "s3": s3,
                 "environment": env, "env_reason": env_reason, "ri_price_estimated": ri_estimated,
             })
@@ -1244,13 +1258,20 @@ class FindingsEngine:
         if not ri_items:
             return []
         assumed = sum(1 for it in ri_items if it["environment"] == "unknown")
-        note = (f" Recommended for production VMs; {assumed} untagged VM{'s' if assumed != 1 else ''} "
-                "assumed production — verify before committing." if assumed else
-                " Recommended for production VMs.")
+        caveats: List[str] = []
+        if assumed:
+            caveats.append(f"{assumed} untagged VM{'s' if assumed != 1 else ''} assumed production — "
+                           "verify before committing")
+        if run_rate_count:
+            caveats.append(f"{run_rate_count} priced at list run-rate — this subscription has less than "
+                           "one complete billing month (recently created or migrated); re-run after a "
+                           "full billing month for billed-actual figures")
+        note = " Recommended for production VMs." + (f" {'; '.join(caveats)}." if caveats else "")
         conf = 0.85 if all_steady else 0.65
         f = self._aggregate_commitment_finding(
             "ri_vm", "Reserved Instance", ri_items, source="retail_estimate",
-            base_confidence=conf, unit="VM", grounded=cost_available, context_note=note)
+            base_confidence=conf, unit="VM", grounded=cost_available and run_rate_count == 0,
+            context_note=note)
         return [f] if f else []
 
     # -- commitments from Azure's own reservation engine (authoritative) -------
@@ -1309,9 +1330,8 @@ class FindingsEngine:
         exclude_ids = exclude_ids or set()
         cost_available = bool(self._cost_map)  # per-resource Cost Management data present?
 
-        # Pass 1 — gather each eligible VM's prices + vCPUs, and sample the per-vCore licence.
+        # Pass 1 — gather each eligible VM's own Windows + Linux (compute-only) retail prices.
         rows: List[Dict] = []
-        per_vcore_samples: List[float] = []
         for vm in vms:
             if (vm.get("id") or "").lower() in exclude_ids:
                 continue  # VM is being deleted (idle/stopped) → no licence to save
@@ -1334,45 +1354,41 @@ class FindingsEngine:
             vcpu = _vcpus(sku)
             rows.append({"vm": vm, "sku": sku, "region": region, "actual": actual,
                          "windows": windows, "compute_only": compute_only, "vcpu": vcpu})
-            # Sample the per-vCore licence only where the Windows fetch looks sane (clearly > Linux).
-            if windows and vcpu and windows > compute_only:
-                per_vcore_samples.append((windows - compute_only) / vcpu)
         if not rows:
             return []
-
-        # The Windows Server licence is a flat per-vCore charge — it should be identical per vCore on
-        # every VM. Estimate it robustly with the MEDIAN of the samples: that neutralises a bad
-        # per-SKU price fetch (some B-series return a Windows price barely above Linux, which would
-        # otherwise understate their AHB) without disturbing the VMs that priced correctly.
-        per_vcore_licence = _median(per_vcore_samples)
 
         eligible: List[Dict] = []
         total = 0.0
         sub_id: Optional[str] = None
+        run_rate_count = 0  # VMs priced at run-rate because their billing window is partial
         for r in rows:
             vm, windows, compute_only = r["vm"], r["windows"], r["compute_only"]
             vcpu, actual = r["vcpu"], r["actual"]
-            # Licence = vCPUs × the environment's per-vCore rate; fall back to this VM's own retail
-            # delta only when it can't be sized or there's no per-vCore estimate.
-            if per_vcore_licence is not None and vcpu:
-                licence = vcpu * per_vcore_licence
-                windows_eff = compute_only + licence
-            elif windows and windows > compute_only:
-                licence = windows - compute_only
-                windows_eff = windows
-            else:
+            # Licence = this VM's OWN retail delta (Windows − Linux). The per-vCore Windows Server
+            # charge is NOT uniform across families — a B-series (burstable) VM carries a far lower
+            # licence per vCore than a D/E-series one — so each VM must use its own delta, never a fleet
+            # average. Skip a VM whose Windows price didn't come back above Linux (fetch missing/invalid).
+            if not (windows and windows > compute_only):
                 continue
+            licence = windows - compute_only
+            windows_eff = windows
             lic_fraction = max(0.0, licence / windows_eff) if windows_eff else 0.0
             if lic_fraction <= 0:
                 continue
-            # Take the licence as a fraction of the full Windows price, then apply it to the VM's ACTUAL
-            # cost so the saving tracks real, part-time spend instead of full-time list price.
-            if cost_available:
+            # Ground the saving in the VM's ACTUAL cost (licence fraction of the real bill) so it tracks
+            # real, part-time spend — BUT only when that bill covers a full representative month. If the
+            # resource hasn't billed a complete month yet (new/migrated/just-provisioned subscription),
+            # its last-month cost is a partial fragment that would understate a 24×7 VM by ~100×, so we
+            # price the licence at its full-month run-rate instead and flag it as an estimate.
+            partial = self._cost_basis_partial(vm.get("id"))
+            if cost_available and not partial:
                 monthly = round(actual * lic_fraction, 2)
                 grounded = True
             else:
-                monthly = round(licence, 2)
+                monthly = round(licence, 2)  # full-month licence run-rate
                 grounded = False
+                if partial:
+                    run_rate_count += 1
             if monthly <= 0:
                 continue
             sub_id = sub_id or vm.get("subscriptionId")
@@ -1380,8 +1396,8 @@ class FindingsEngine:
                 "name": vm.get("name"), "sku": r["sku"], "region": r["region"],
                 "monthly_savings": monthly, "resource_id": vm.get("id"),
                 "actual_cost_based": grounded,
-                # Audit trail — verifiable inputs. licence = vCPUs × per-vCore rate (median-calibrated);
-                # windows_price = compute_only + licence; saving = (grounded ? actual : licence) × fraction.
+                # Audit trail — verifiable inputs. licence = this VM's own (Windows − Linux) retail delta;
+                # windows_price = full Windows retail; saving = (grounded ? actual : licence) × fraction.
                 "windows_price": round(windows_eff, 2), "compute_only_price": round(compute_only, 2),
                 "licence_charge": round(licence, 2), "licence_fraction": round(lic_fraction, 4),
                 "vcpu": vcpu, "actual_monthly_cost": round(actual, 2) if actual else None,
@@ -1401,10 +1417,18 @@ class FindingsEngine:
             "subscriptionId": sub_id, "resourceGroup": None,
         }
         grounded_count = sum(1 for e in eligible if e.get("actual_cost_based"))
+        # When some VMs were priced at run-rate because their subscription has no complete billing month
+        # yet (recent create/migration), say so plainly — the figure is a full-month estimate, not a bill.
+        run_rate_note = (
+            f" {run_rate_count} priced at full-month list run-rate — this subscription has less than one "
+            "complete billing month (recently created or migrated), so re-run after a full billing month "
+            "for billed-actual figures." if run_rate_count else ""
+        )
         reason = (
-            f"{n} running Windows VMs without licenseType=Windows_Server; licence = vCPUs × per-vCore "
-            f"rate (median-calibrated across the fleet, so a bad per-SKU fetch can't skew it), applied "
-            f"as a fraction of actual cost for {grounded_count}/{n}; ${total:.2f}/mo across: {shown}."
+            f"{n} running Windows VMs without licenseType=Windows_Server; licence = each VM's own retail "
+            f"(Windows − Linux) delta (per-family — B-series carry a much lower per-vCore licence than "
+            f"D/E-series), applied as a fraction of actual cost for {grounded_count}/{n}; "
+            f"${total:.2f}/mo across: {shown}." + run_rate_note
         )
         return [self._finding(
             "windows_ahb", synthetic, "microsoft.compute/virtualmachines", total,
@@ -1413,6 +1437,7 @@ class FindingsEngine:
                 f"{n} Windows VM{'s' if n != 1 else ''} pay Azure's Windows Server licence on top of "
                 f"compute ({shown}). Azure Hybrid Benefit removes that charge if you already own Windows "
                 "Server licences with Software Assurance — the saving shown is that licence portion."
+                + run_rate_note
             ),
             recommendation=("Apply Azure Hybrid Benefit (licenseType=Windows_Server) to the VMs you "
                             "have spare Windows Server licences (with Software Assurance) for; leave the "
@@ -1420,7 +1445,8 @@ class FindingsEngine:
             has_price=True, debug_reason=reason,
             # Grounded when every eligible VM's saving came from its actual bill (not the retail delta).
             grounded=cost_available and grounded_count == n,
-            extra_details={"eligible_vms": eligible, "eligible_count": n},
+            extra_details={"eligible_vms": eligible, "eligible_count": n,
+                           "run_rate_estimated_count": run_rate_count},
         )]
 
     # -- SQL Server Azure Hybrid Benefit (one classified finding) ---------------

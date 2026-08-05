@@ -21,6 +21,7 @@ from .azure_client import AzureClient
 from .cost_management import (
     NEEDS_REVIEW,
     get_cost_map_and_consistency,
+    get_runrate_baseline,
     get_service_costs_and_currency,
     linear_growth_rate,
     spend_by_area,
@@ -90,8 +91,10 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.advance(AssessmentState.CALCULATING_PRICES)
         # One monthly-history query per sub yields BOTH the last-month cost basis and the
         # month-over-month steadiness signal (half the load on the throttled billing API).
-        cost_map, consistency, growth = await _gather_cost_and_consistency(client, subscription_ids)
-        service_costs, currency = await _gather_service_costs(client, subscription_ids)
+        cost_map, consistency, growth, complete_months = await _gather_cost_and_consistency(
+            client, subscription_ids)
+        service_costs, currency, spend_estimated, spend_period_days = await _gather_spend_baseline(
+            client, subscription_ids, complete_month_exists=complete_months >= 2)
         currency = currency or settings.pricing_currency
         pricing = get_pricing_engine(currency)
 
@@ -117,7 +120,7 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.advance(AssessmentState.GENERATING_REPORT)
         _persist_findings_and_totals(
             db, assessment_id, findings, service_costs, total_resources, type_count, currency,
-            observed_growth=growth,
+            observed_growth=growth, spend_estimated=spend_estimated, spend_period_days=spend_period_days,
         )
 
         tracker.advance(AssessmentState.COMPLETED)
@@ -165,7 +168,10 @@ async def _gather_cost_and_consistency(client: AzureClient, subscription_ids: Li
                 combined_totals[month] = combined_totals.get(month, 0.0) + amount
     series = [combined_totals[m] for m in sorted(combined_totals)]
     growth = linear_growth_rate(series)
-    return cost_map, consistency, growth
+    # A complete previous billing month exists only if ≥ 2 complete months carried cost — i.e. billing
+    # started before the most recent complete month (so that month is a full, representative bill).
+    complete_months = sum(1 for amount in combined_totals.values() if amount > 0)
+    return cost_map, consistency, growth, complete_months
 
 
 async def _gather_reservation_recs(client: AzureClient, subscription_ids: List[str]) -> List[Dict]:
@@ -216,6 +222,40 @@ async def _gather_service_costs(client: AzureClient, subscription_ids: List[str]
                      "run one currency at a time.", currencies)
     currency = next(iter(currencies), None)
     return totals, currency
+
+
+async def _gather_spend_baseline(
+    client: AzureClient, subscription_ids: List[str], complete_month_exists: bool
+):
+    """The spend baseline: (per_service_costs, currency, estimated, period_days).
+
+    When a complete previous billing month exists → real last-month actuals. Otherwise (new or
+    recently-migrated subscription) the last "month" is a partial fragment, so we estimate the monthly
+    run rate from the AVERAGE DAILY spend over the observed billing period (first billed day → today).
+    `estimated=True` + `period_days` tell the UI to label the spend as an estimate.
+    """
+    if complete_month_exists:
+        totals, currency = await _gather_service_costs(client, subscription_ids)
+        return totals, currency, False, None
+
+    results = await asyncio.gather(
+        *(get_runrate_baseline(client, s) for s in subscription_ids), return_exceptions=True
+    )
+    totals: Dict[str, float] = {}
+    currency: str | None = None
+    period_days = 0
+    for r in results:
+        if isinstance(r, dict):
+            for service, cost in r["service_costs"].items():
+                totals[service] = totals.get(service, 0.0) + cost
+            currency = currency or r.get("currency")
+            period_days = max(period_days, int(r.get("period_days") or 0))
+
+    if not totals:  # no daily data either → fall back to whatever last-month/MTD returns
+        totals, currency = await _gather_service_costs(client, subscription_ids)
+        return totals, currency, False, None
+    logger.info("Spend baseline: no complete billing month → estimated run rate over %d days.", period_days)
+    return totals, currency, True, (period_days or None)
 
 
 async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_recs=None,
@@ -386,7 +426,8 @@ def _persist_inventory(db, assessment_id: int, inventory: Dict[str, List[Dict]])
 def _persist_findings_and_totals(
     db, assessment_id: int, findings: List[Dict], service_costs: Dict[str, float] | None = None,
     total_resources: int = 0, type_count: int = 0, currency: str | None = None,
-    observed_growth: float | None = None,
+    observed_growth: float | None = None, spend_estimated: bool = False,
+    spend_period_days: int | None = None,
 ) -> None:
     total_monthly = 0.0
     total_annual = 0.0
@@ -394,6 +435,8 @@ def _persist_findings_and_totals(
     for fd in findings:
         row = {k: v for k, v in fd.items() if k in _FINDING_COLUMNS}
         db.add(Finding(assessment_id=assessment_id, **row))
+        # All identified savings count toward the headline (incl. Azure Hybrid Benefit); the UI carries
+        # an info note that savings may include AHB where applicable.
         total_monthly += fd.get("estimated_savings_monthly", 0)
         total_annual += fd.get("estimated_savings_annual", 0)
         if fd.get("validation_status") == NEEDS_REVIEW:
@@ -417,6 +460,9 @@ def _persist_findings_and_totals(
         assessment.current_annual_spend = round(monthly * 12, 2)
         assessment.spend_by_area = spend_by_area(service_costs)
         assessment.cost_data_available = 1
+        # Flag when the baseline is an estimated run rate (no complete billing month) so the UI says so.
+        assessment.spend_estimated = 1 if spend_estimated else 0
+        assessment.spend_period_days = spend_period_days
         # No clamp: every finding is grounded in the resource's actual cost, so the sum is already
         # ≤ spend by construction. If it somehow isn't, that's a real bug to surface — not to paper
         # over by forcing savings == spend (which reads as a nonsensical 100% reduction).
@@ -426,5 +472,6 @@ def _persist_findings_and_totals(
                          assessment.current_annual_spend)
     else:
         assessment.cost_data_available = 0
+        assessment.spend_estimated = 0
 
     db.commit()

@@ -15,7 +15,7 @@ Design:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .azure_client import AzureClient
@@ -205,6 +205,96 @@ async def get_actual_cost_by_service(
     """Fetch last-month cost per Azure service, falling back to month-to-date for new subscriptions."""
     costs, _ = await get_service_costs_and_currency(client, subscription_id, now=now)
     return costs
+
+
+# ── Run-rate baseline (subscriptions with no complete previous billing month) ──────
+
+AVG_DAYS_PER_MONTH = 30.4375  # 365.25 / 12 — normalises a partial period to a monthly figure
+
+
+def _parse_usage_date(v) -> Optional[date]:
+    """Parse a Cost Management daily date cell (usually an int YYYYMMDD, e.g. 20250715)."""
+    s = str(v).strip().split(".")[0]
+    if len(s) == 8 and s.isdigit():
+        try:
+            return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "")).date()
+    except (ValueError, TypeError):
+        return None
+
+
+def build_daily_service_cost_query(now: Optional[datetime] = None, days_back: int = 62) -> Dict[str, Any]:
+    """ActualCost per DAY, grouped by ServiceName, over the last `days_back` days — used to estimate a
+    run rate for subscriptions too new to have a complete previous billing month."""
+    now = now or datetime.now(timezone.utc)
+    start = now - timedelta(days=days_back)
+    return {
+        "type": "ActualCost", "timeframe": "Custom",
+        "timePeriod": {"from": start.strftime("%Y-%m-%dT00:00:00Z"),
+                       "to": now.strftime("%Y-%m-%dT23:59:59Z")},
+        "dataset": {"granularity": "Daily",
+                    "aggregation": {"totalCost": {"name": "Cost", "function": "Sum"}},
+                    "grouping": [{"type": "Dimension", "name": "ServiceName"}]},
+    }
+
+
+def parse_daily_service_costs(payload: Dict[str, Any]):
+    """Daily, service-grouped response → (per_service_total, sorted_dates_with_cost, currency).
+
+    `per_service_total` sums each service over the whole window; `sorted_dates_with_cost` is every day
+    that had any cost (so the caller can measure the actual billing span, first → last)."""
+    props = payload.get("properties", {})
+    columns = [c.get("name") for c in props.get("columns", [])]
+    cost_idx = columns.index("Cost") if "Cost" in columns else 0
+    svc_idx = columns.index("ServiceName") if "ServiceName" in columns else None
+    date_idx = next((columns.index(n) for n in ("UsageDate", "Date", "BillingMonth") if n in columns), None)
+
+    per_service: Dict[str, float] = {}
+    per_date: Dict[date, float] = {}
+    for row in props.get("rows", []):
+        if cost_idx >= len(row):
+            continue
+        try:
+            cost = float(row[cost_idx] or 0)
+        except (TypeError, ValueError):
+            continue
+        svc = str(row[svc_idx]) if (svc_idx is not None and svc_idx < len(row) and row[svc_idx]) else "Other"
+        per_service[svc] = per_service.get(svc, 0.0) + cost
+        if date_idx is not None and date_idx < len(row):
+            d = _parse_usage_date(row[date_idx])
+            if d is not None:
+                per_date[d] = per_date.get(d, 0.0) + cost
+    dates = sorted(d for d, c in per_date.items() if c > 0)
+    return per_service, dates, extract_currency(payload)
+
+
+async def get_runrate_baseline(
+    client: AzureClient, subscription_id: str, days_back: int = 62, now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Estimate the monthly run rate from the AVERAGE DAILY spend since billing began.
+
+    For a subscription with no complete previous billing month (new or recently migrated), the last
+    "month" is a partial fragment that badly under- or mis-states spend. Instead we take the observed
+    billing period (first day with cost → last day with cost), compute the average daily spend, and
+    normalise it to a representative month. Returns None when no daily cost data is available.
+    """
+    payload = await client.query_cost_management(
+        subscription_id, build_daily_service_cost_query(now=now, days_back=days_back))
+    per_service, dates, currency = parse_daily_service_costs(payload)
+    if not dates:
+        return None
+    span = max((dates[-1] - dates[0]).days + 1, 1)  # inclusive day count of the observed period
+    service_monthly = {s: round((c / span) * AVG_DAYS_PER_MONTH, 2)
+                       for s, c in per_service.items() if c > 0}
+    return {
+        "service_costs": service_monthly,  # per-service MONTHLY run rate
+        "currency": currency,
+        "period_days": span,
+        "period_start": dates[0].isoformat(),
+    }
 
 
 async def get_service_costs_and_currency(

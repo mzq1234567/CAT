@@ -76,6 +76,9 @@ class AssessmentSummary(BaseModel):
     current_annual_spend: Optional[float] = None
     spend_by_area: Optional[Dict[str, float]] = None
     cost_data_available: bool = False
+    # Spend is an estimated run rate (new/migrated sub, no complete billing month) over N days.
+    spend_estimated: bool = False
+    spend_period_days: Optional[int] = None
     currency: str = "USD"
     # Annual spend-growth rate from the recent trend (e.g. 0.12 = +12%/yr); null if too little history.
     observed_annual_growth: Optional[float] = None
