@@ -32,8 +32,14 @@ and quantified:
   vaults, idle App Service Plans, paused SQL DBs, stopped SQL MIs, Bastion review.
 - **Azure Advisor** cost recommendations, re-scored and validated.
 
-Output: an interactive **executive dashboard** (drill-down per finding, dismiss support) and a branded
-**PDF report** with a 3-year spend projection computed from the environment's *measured* growth trend.
+Output: an interactive **executive dashboard** (drill-down per finding, exclude/restore support) and a
+branded **PDF report** with a 3-year spend projection computed from the environment's *measured*
+growth trend.
+
+While a run is in flight the client watches a **live assessment screen** — an abstract flow
+composition, the current stage, an eased progress filament, and discovered counts that surface one at
+a time. Every figure on it is a measured scan result and the stage reflects the backend's real state,
+so a slow subscription visibly holds the run where it is rather than advancing on a timer.
 
 ---
 
@@ -77,7 +83,9 @@ FastAPI backend  ──background job──►  Azure REST APIs (as the user):
 ```
 
 - **Stateless per request** on Azure — the user's token is used in-memory for the run, never persisted.
-- **Background assessment** — POST returns `202`; the frontend polls status until `completed`.
+- **Background assessment** — POST returns `202`; the frontend polls status until `completed`. While
+  it runs, the pipeline writes timestamped **events** as each real milestone is reached, so progress
+  reflects work actually done rather than a timer.
 - **Read-only** — verified: only GET/query calls, no writes.
 
 ---
@@ -90,6 +98,8 @@ frontend/          React + Vite + MUI + Recharts (currency-aware, interactive ch
     auth/          MSAL config (msalConfig.ts)
     services/      api.ts (typed API client + token acquisition)
     pages/         Login, SelectSubscriptions, Results
+    components/assessment/  Running-assessment experience (FlowField, StageCaption,
+                            ProgressThread, DiscoveryMetrics, stages)
     components/dashboard/   ExecutiveSummary, RecommendationCard, FindingEvidence, charts/
 backend/           FastAPI + SQLAlchemy + SQLite
   app/
@@ -112,7 +122,7 @@ backend/           FastAPI + SQLAlchemy + SQLite
     security/        JWKS RS256 verification, RBAC, rate limiting, audit log
     models/          db.py (SQLAlchemy models), schemas.py (Pydantic)
     database.py      SQLite via SQLAlchemy
-  alembic/           Migrations 001–009
+  alembic/           Migrations 001–011
   scripts/           reconcile_assessment.py (per-finding integrity validation harness)
 ```
 
@@ -202,8 +212,8 @@ cd backend
 cp .env.example .env                 # set AZURE_CLIENT_ID=<client-id>
 python -m venv .venv && .venv\Scripts\activate      # (source .venv/bin/activate on *nix)
 pip install -r requirements.txt
-alembic upgrade head                 # REQUIRED after pulling changes (adds new columns)
-uvicorn app.main:app --reload --port 8000
+alembic upgrade head                 # REQUIRED after pulling changes (adds new columns/tables)
+uvicorn app.main:app --reload --port 8000    # (or: .\start.ps1 on Windows — venv + deps + serve)
 
 # Frontend (separate terminal)
 cd frontend
@@ -211,8 +221,9 @@ cp .env.example .env                 # set VITE_AZURE_CLIENT_ID=<client-id>
 npm install && npm run dev           # http://localhost:5173
 ```
 
-> After pulling changes, **always run `alembic upgrade head`** — new columns are added via migrations;
-> skipping it 500s new assessments.
+> After pulling changes, **always run `alembic upgrade head`** — new columns and tables are added via
+> migrations; skipping it 500s new assessments. `.env`, `.venv` and `cat.db` are gitignored, so each
+> machine keeps its own and must migrate independently.
 
 ## Deployment
 
@@ -236,14 +247,20 @@ Redis.
 ## Database
 
 **SQLite** (dev; swappable to Postgres via `DATABASE_URL`) via SQLAlchemy, migrated with **Alembic
-(001–009)**. Four tables:
+(001–011)**. Five tables:
 
 | Table | Purpose | Key columns |
 |-------|---------|-------------|
-| `assessments` | one per run | status/progress, `total_savings_monthly/annual`, `current_monthly/annual_spend`, `currency`, `cost_data_available`, `observed_annual_growth`, `spend_by_area`, `total_resources` |
+| `assessments` | one per run | status/progress, `total_savings_monthly/annual`, `current_monthly/annual_spend`, `currency`, `cost_data_available`, `observed_annual_growth`, `spend_by_area`, `total_resources`, `major_resource_types` |
 | `findings` | one per opportunity | `category`, `estimated_savings_monthly/annual`, `severity`, `confidence`, `validation_status`, `actual_monthly_cost`, `dismissed`, `details` (JSON) |
 | `inventory_items` | scanned resources | `resource_id`, `resource_type`, `data` (JSON) |
+| `assessment_events` | live pipeline trail | `timestamp`, `stage`, `message` — written as each milestone is genuinely reached |
 | `audit_logs` | security trail | `event` (assessment_run / finding_dismissed / report_downloaded), user, timestamp |
+
+> **Existing databases:** if `alembic upgrade head` fails with *"table assessments already exists"*,
+> the `alembic_version` marker is missing rather than the schema being old. Check `alembic current`
+> first — if it prints nothing, confirm which columns/tables already exist before stamping, since
+> `alembic stamp head` would skip creating anything genuinely absent.
 
 ---
 
@@ -256,10 +273,11 @@ All under `/api`, all require a valid Bearer token (verified vs Entra JWKS).
 | GET  | `/api/subscriptions/` | List the user's Azure subscriptions |
 | POST | `/api/assessments/` | Start an assessment (returns `202` + summary; runs in background) |
 | GET  | `/api/assessments/` | List the user's assessments |
-| GET  | `/api/assessments/{id}` | Assessment detail (incl. findings) — polled until `completed` |
+| GET  | `/api/assessments/{id}` | Assessment detail (findings + live `events`) — polled until `completed` |
 | GET  | `/api/assessments/{id}/findings` | Flat list of findings |
 | GET  | `/api/assessments/{id}/findings/by-category` | Findings grouped by category (totals) |
-| POST | `/api/assessments/{id}/findings/{finding_id}/dismiss` | Dismiss a finding (re-rolls totals; audited) |
+| POST | `/api/assessments/{id}/findings/{finding_id}/dismiss` | Exclude a finding from savings (re-rolls totals; audited) |
+| POST | `/api/assessments/{id}/findings/{finding_id}/restore` | Undo an exclusion (re-rolls totals; audited) |
 | GET  | `/api/assessments/{id}/report/pdf` | Download the branded PDF |
 
 ---
@@ -305,4 +323,5 @@ doesn't expose, so guessing it could raise costs.)*
 | Azure APIs (raw REST) | Resource Graph, Monitor, Advisor, Cost Management, Consumption, Retail Prices |
 | Auth | Microsoft Entra ID (multi-tenant, delegated), MSAL + PKCE, JWKS RS256 verification |
 
-Backend tests: **235 passing** (`cd backend && python -m pytest -q`). Frontend: `npm run build`.
+Backend tests: **243 passing** (`cd backend && python -m pytest -q` — run from `backend/`, not the
+repo root). Frontend: `npm run build`.
