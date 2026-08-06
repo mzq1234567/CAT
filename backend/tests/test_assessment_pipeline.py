@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base
-from app.models.db import Assessment, Finding, InventoryItem
+from app.models.db import Assessment, AssessmentEvent, Finding, InventoryItem
 from app.services import assessment as pipeline
 from app.services.azure_client import AzureClient
 from app.services.pricing import PricingEngine
@@ -285,6 +285,64 @@ async def test_pipeline_marks_failed_on_error(pipeline_env, monkeypatch):
     a = s.get(Assessment, aid)
     assert a.status == "failed"
     assert "resource graph exploded" in a.error_message
+
+
+async def test_events_report_real_counts_in_order(pipeline_env):
+    # The live event stream is rendered verbatim to the client, so every event must correspond to
+    # work the pipeline actually did and carry the run's real numbers — never a placeholder.
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    events = (s.query(AssessmentEvent)
+              .filter(AssessmentEvent.assessment_id == aid)
+              .order_by(AssessmentEvent.id).all())
+    messages = [e.message for e in events]
+
+    assert messages[0] == "Connected to Azure"
+    assert "Assessing 1 subscription" in messages[1]   # singular, from the real sub count
+    assert messages[-1] == "Assessment complete"
+
+    # The findings count in the event must match what was actually persisted.
+    persisted = s.query(Finding).filter(Finding.assessment_id == aid).count()
+    identified = [m for m in messages if m.startswith("Identified ")]
+    assert identified and str(persisted) in identified[0]
+
+    # Every event is stamped with the stage it happened in, and ids increase monotonically.
+    assert all(e.stage for e in events)
+    assert [e.id for e in events] == sorted(e.id for e in events)
+
+
+async def test_scan_counts_are_published_before_the_run_finishes(pipeline_env, monkeypatch):
+    # The live progress UI shows REAL discovered counts while the assessment is still running, so
+    # the inventory summary must be persisted at the inventory phase — not held back to the end.
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())
+    aid = seed()
+
+    seen = {}
+    original = pipeline.enrich_vms_with_metrics
+
+    async def _spy(client, vms):
+        # Step 2 (metrics) runs after inventory — the counts must already be readable by now.
+        s = TestSession()
+        a = s.get(Assessment, aid)
+        seen["total"] = a.total_resources
+        seen["types"] = a.resource_type_count
+        seen["status"] = a.status
+        s.close()
+        return await original(client, vms)
+
+    monkeypatch.setattr(pipeline, "enrich_vms_with_metrics", _spy)
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    assert seen["status"] != "completed"      # genuinely mid-run, not an end-of-run read
+    assert seen["total"] and seen["total"] > 0
+    assert seen["types"] and seen["types"] > 0
 
 
 def test_all_savings_including_ahb_counted_in_headline_total(pipeline_env):

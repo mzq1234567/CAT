@@ -44,6 +44,10 @@ class Assessment(Base):
 
     findings = relationship("Finding", back_populates="assessment", cascade="all, delete-orphan")
     inventory_items = relationship("InventoryItem", back_populates="assessment", cascade="all, delete-orphan")
+    events = relationship(
+        "AssessmentEvent", back_populates="assessment", cascade="all, delete-orphan",
+        order_by="AssessmentEvent.id",
+    )
 
 
 class Finding(Base):
@@ -94,6 +98,24 @@ class AuditLog(Base):
     resource = Column(String, nullable=True)  # e.g. "assessment:12", "finding:34"
     request_id = Column(String, nullable=True)
     detail = Column(JSON, nullable=True)
+
+
+class AssessmentEvent(Base):
+    """A timestamped record of something the pipeline actually did.
+
+    These drive the live event stream on the running-assessment screen. They are written only when
+    the pipeline genuinely reaches the corresponding point, and any counts they carry are the real
+    values from that run — the UI must never invent progress the backend hasn't made.
+    """
+    __tablename__ = "assessment_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    assessment_id = Column(Integer, ForeignKey("assessments.id"), index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    stage = Column(String, nullable=True)  # the AssessmentState this happened in
+    message = Column(String)
+
+    assessment = relationship("Assessment", back_populates="events")
 
 
 class InventoryItem(Base):

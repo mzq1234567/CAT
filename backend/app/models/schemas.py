@@ -71,6 +71,9 @@ class AssessmentSummary(BaseModel):
     needs_review_count: int = 0
     total_resources: Optional[int] = None
     resource_type_count: Optional[int] = None
+    # Real per-type counts from the scan, [{"type": "Virtual Machines", "count": 16}] — surfaced
+    # live during the run so discovery metrics show measured values, never invented ones.
+    major_resource_types: Optional[List[Dict[str, Any]]] = None
     # Actual spend (null when billing/Cost Management access is unavailable)
     current_monthly_spend: Optional[float] = None
     current_annual_spend: Optional[float] = None
@@ -91,8 +94,20 @@ class AssessmentSummary(BaseModel):
         from_attributes = True
 
 
+class AssessmentEventResponse(BaseModel):
+    """One thing the pipeline actually did, for the live event stream."""
+    id: int
+    timestamp: datetime
+    stage: Optional[str] = None
+    message: str
+
+    class Config:
+        from_attributes = True
+
+
 class AssessmentResponse(AssessmentSummary):
     findings: List[FindingResponse] = []
+    events: List[AssessmentEventResponse] = []
 
 
 class SubscriptionResponse(BaseModel):

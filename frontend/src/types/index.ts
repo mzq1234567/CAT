@@ -57,6 +57,8 @@ export interface AssessmentSummary {
   needs_review_count: number;
   total_resources: number | null;
   resource_type_count: number | null;
+  // Real per-type counts from the scan, e.g. [{ type: "Virtual Machines", count: 16 }].
+  major_resource_types: { type: string; count: number }[] | null;
   // Actual spend from Cost Management (null when billing access is unavailable)
   current_monthly_spend: number | null;
   current_annual_spend: number | null;
@@ -74,8 +76,17 @@ export interface AssessmentSummary {
   completed_at: string | null;
 }
 
+/** One thing the pipeline actually did, emitted by the backend as it happened. */
+export interface AssessmentEvent {
+  id: number;
+  timestamp: string;
+  stage: string | null;
+  message: string;
+}
+
 export interface Assessment extends AssessmentSummary {
   findings: Finding[];
+  events: AssessmentEvent[];
 }
 
 export interface FindingsByCategory {

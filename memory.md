@@ -1564,6 +1564,503 @@ reconcile.
   prop from AssessmentDashboard (`findings.filter(f=>f.dismissed)`).
 - Test: `test_restore_finding_reverses_exclusion`. Backend **241 passing**; FE build clean.
 
+### Post-ship 38 — Assessment execution experience redesign (2026-08-06)
+User: the running-assessment screen felt like a developer placeholder (heading + spinner); wanted an
+immersive, premium-SaaS experience (Turbo360/Linear/Stripe calibre) that makes sophisticated analysis
+feel visibly underway. Full redesign, all data kept REAL.
+- **Backend (enables honest live counters):** `_persist_inventory_summary()` writes
+  `total_resources`/`resource_type_count` immediately after the step-1 inventory summary instead of
+  only at step 6, so the polling UI can show ACTUAL discovered counts mid-run. No migration (all three
+  columns already existed). `schemas.AssessmentSummary` +`major_resource_types` (already a populated
+  DB column, was simply never exposed) → real per-type counts e.g. "16 virtual machines".
+- **Why this mattered:** the spec asked for live counters ("193 resources discovered"). Fabricating
+  them would violate the tool's core rule (never show a fabricated number). The counts already existed
+  at step 1 — they just weren't published yet, so early-persisting made them honest instead of faked.
+- **CORRECTED IN THE SAME SESSION (Post-ship 38a below) — the first cut was wrong.** It shipped a
+  bordered card with live counters, a phase checklist and a reassurance chip; user rightly called it a
+  "setup wizard / installer". The counter + checklist UI described here was DELETED. The backend
+  early-persist survives; the `major_resource_types` schema/type exposure was reverted as dead surface.
+- **New `frontend/src/components/assessment/`:**
+  - `useAssessmentMotion.ts` — `useReducedMotion`, `useSmoothProgress`, `usePhaseCaption`,
+    `PHASE_CAPTIONS`.
+    **`useSmoothProgress` is the "believable progress" core:** backend progress jumps 0→15→35→55→70→
+    85→95→100 and polling is every 2s, so the raw bar lurches then freezes. It eases asymptotically
+    toward the CURRENT PHASE'S CEILING (= the next phase's progress value), never goes backwards, and
+    **can never pass that ceiling** — only a real backend transition unlocks the next band. So motion
+    is continuous without ever overstating completion.
+    `PHASE_CAPTIONS` maps each backend state to finer-grained sub-activities the pipeline genuinely
+    performs; captions are scoped to the actual current phase (never claim un-started work).
+    **Deliberately omits "Savings Plan eligibility"** from the user's requested caption list — that
+    detector was removed in Post-ship 29, so advertising it would describe work the tool no longer does.
+  - `AnalysisEngine.tsx` — the centrepiece SVG: resource tiles stream along 3 lanes into a pulsing
+    gradient core (halo + rotating dashed ring + analysis trace), output flows right into assembling
+    bars. Pure SVG + CSS transforms, no per-frame JS, no Azure/cloud logos. Fully static under
+    reduced-motion.
+  - `AssessmentProgress.tsx` — premium card: gradient hero + animation, cycling caption (Fade),
+    gradient progress bar with shimmer sweep, **LiveStat chips (real counts, count-up via the existing
+    `AnimatedValue`, each rendered ONLY once the backend actually reports it** — absent, never a
+    placeholder), phase rail with pop-in animated ticks + pulsing active dot, read-only reassurance chip.
+- **`Results.tsx`:** deleted the old `ProgressView` (spinner/CloudSyncIcon/LinearProgress + its
+  `pulse` keyframe and now-unused imports); renders `<AssessmentProgress assessment={...}/>`. Poll
+  interval 4s→2s while running so phase changes and counts land promptly.
+- Verify: backend **242 passing** (+`test_scan_counts_are_published_before_the_run_finishes`, which
+  spies at the metrics phase to prove counts are readable MID-run — confirmed it fails with `None`
+  without the early persist); frontend tsc + build clean (2020 modules).
+- NOTE: could not screenshot (no browser here) — user reviews by running an assessment.
+
+### Post-ship 38a — assessment loading screen: minimal hero animation (2026-08-06)
+User rejected Post-ship 38's UI: "looks like an installer / setup wizard", "another dashboard card
+with icons, counters and a checklist". Wanted premium-SaaS minimalism (Stripe/Vercel/Linear/Framer)
+— one beautiful animation as hero, dynamic caption, whisper of progress, nothing else.
+- **Deleted from the running view:** the card shell (border/shadow/surface), LiveStat counters, the
+  phase checklist rail, the read-only chip, the status_message row, the % readout. `AnimatedValue`
+  import dropped. Reverted `major_resource_types` from `schemas.py` + `types/index.ts` (nothing
+  consumes it now — no dead API surface). **Kept** `_persist_inventory_summary` + its test: publishing
+  counts when they're known is a correctness fix regardless of UI, and `total_resources` still feeds
+  the completed dashboard's coverage banner.
+- **`AnalysisEngine.tsx` rewritten — "signal convergence"** (240×240 viewBox, rendered at 300px):
+  ambient radial aura breathing (7s) · 3 hairline orbits (7% opacity) · 2 gradient scan arcs counter-
+  rotating (22s / 16s) · 8 nodes orbiting on 3 rings at different speeds+directions, accent ones
+  `flare` as they're read · 4 pulses converging inward along rotated spokes (cubic-bezier) · a core
+  of rotating dashed ring + solid centre. Slow confident timing, hairline strokes, one accent colour.
+  Uses `transformBox: "view-box"` + explicit `transformOrigin` (the previous version omitted
+  transformBox, which makes SVG rotation origins unreliable). Still pure SVG/CSS, no per-frame JS,
+  no logos; static composition under reduced-motion.
+- **`AssessmentProgress.tsx` rewritten:** centred flex column, `minHeight` 62–72vh for real whitespace.
+  Hierarchy is strictly animation → caption → progress. Caption is 17px/500 with a keyed
+  fade+translateY rise (`cubic-bezier(.16,1,.3,1)`) in a fixed-height box so nothing shifts. Progress
+  is a 168×2px hairline, no number.
+- **`Results.tsx`:** while non-terminal it now returns ONLY `<AssessmentProgress/>` inside Layout —
+  the header, breadcrumbs, status chip and metadata line are suppressed so nothing competes with the
+  animation. Header/dashboard return for completed/failed.
+- **Captions softened** to the user's register ("Crunching the numbers", "Discovering your Azure
+  resources"), still phase-scoped and still excluding Savings Plan (removed detector).
+- Verify: backend **242 passing**; frontend tsc + build clean. Could not screenshot — user reviews live.
+
+### Post-ship 38b — cinematic assessment animation + a real visual-verification loop (2026-08-06)
+User rejected 38a too ("circles, ripples, changing captions… a generic spinner"). Asked for a
+cinematic animation telling the story of an Azure environment being analysed, scene by scene.
+- **🔴 FOUND A SILENT BUG THAT AFFECTED 38 AND 38a: MUI's `keyframes` helper only injects its
+  `@keyframes` rule when consumed through `sx`/`styled`.** Referenced from a plain `style` attribute
+  (which is what all the SVG children used) it returns an animation NAME whose rule was never added
+  to the stylesheet — so every animated SVG element was frozen. Both earlier versions were largely
+  STATIC in the browser, which is very likely why they read as "a generic loading spinner".
+  **Fix: keyframes now live in a plain `<style>` block inside the SVG with stable `ae-*` names**, and
+  elements reference them by name via `style`. Rule for this repo: never use MUI `keyframes` with the
+  `style` prop — use `sx`, or raw CSS.
+- **`AnalysisEngine.tsx` rebuilt as a 13s master timeline** (viewBox 460×260, rendered 560px): Scene 1
+  abstract resource tiles surface → Scene 2 drawn along 5 curved inflow streams → Scene 3 hexagonal
+  prism core intensifies (fixed shell + counter-rotating inner lattice + clipped scan sweep — an
+  engine turning over, deliberately NOT a spinner) → Scene 4 three outflow streams feed an insight
+  panel that draws itself, bars grow, trend line draws, 4 abstract optimisation badges land → Scene 5
+  dissolve and repeat. Scenes are % windows of the shared cycle so they overlap rather than step.
+  Particles ride the *same* path strings as the drawn streams via CSS `offset-path` (so stream and
+  particle can't drift apart) on independent 2.4–2.9s cycles, so motion never stops during dissolve.
+  Transforms/opacity only, no per-frame JS.
+- **`offset-path` gotcha:** `offset-anchor` follows `transform-origin`, and SVG resolves that against
+  the viewBox by default → every particle rides off-path. Pinned with `transformBox: "fill-box"` +
+  `transformOrigin: "center"`.
+- **VERIFICATION LOOP (new capability — previous sessions all said "could not screenshot"):** Chrome
+  IS installed at `/c/Program Files/Google/Chrome/Application/chrome.exe`. Working recipe: temp
+  `anim-preview.html` + `src/anim-preview.tsx` harness → `npx vite --port 5199` → Playwright (`chromium.launch({channel:"chrome"})`,
+  no browser download needed) → **`document.getAnimations().forEach(a => {a.pause(); a.currentTime = T})`
+  to SEEK the timeline**, then screenshot. Chrome's `--virtual-time-budget` does NOT advance CSS
+  animations (all frames came back byte-identical) — seeking via the Web Animations API is what works.
+  All temp files + the playwright devDependency were removed afterwards.
+- **Two composition flaws only visible once rendered, then fixed:** (1) tile delays were bunched at
+  0–1.8s so the left half went dead for >half the cycle → respread across the full 13s (0/2.6/5.2/
+  7.8/10.4) for continuous arrival; (2) the insight panel out-weighed the core → prism scaled ~1.18×
+  about (220,130) and insight scenes pulled ~10% earlier to cut dead time.
+- **Deliberate deviation from the spec:** it asked for "currency values count upwards". Rendering a
+  live currency figure during analysis would look like a real preliminary savings result — exactly the
+  fabricated-number failure this repo forbids. Used abstract growing bars + a trend line instead;
+  no digits.
+- Verify: backend **242 passing**; frontend tsc + build clean. Frames confirmed visually at
+  t=1.2/3.2/5.2/7.2/9.2/11.2s plus a full-page shot.
+
+### Post-ship 38c — Azure-native animation + removed results-implying visuals (2026-08-06)
+User: 38b "looks like a generic analytics platform, not an Azure Cost Assessment engine" + a correct
+hard rule — **the loading animation runs BEFORE results exist, so it must never depict findings.**
+- **🔴 REAL ISSUE FIXED (user was right):** 38b showed growing savings bars, a rising trend line and
+  four "optimisation" badges (RI/AHB/rightsize/network). Those imply findings the tool does not have
+  yet — the same fabrication class this repo forbids everywhere else. **All removed, along with the
+  savings-green (#12B886) palette** (green reads as "savings found"). Animation now depicts PROCESS
+  only: enumeration, telemetry sampling, pricing resolution.
+- **⚠️ LICENSING — official Azure Architecture Icons NOT shipped (deliberate).** User asked for
+  Microsoft's official icon set. Microsoft licenses it for use "in architectural diagrams, training
+  materials, or documentation"; embedding it as chrome in a commercial multi-tenant SaaS product is
+  outside those terms, and hand-redrawing the icons would create derivative works (worse). Also can't
+  accept MS terms / download the pack on the user's behalf. **Built icon-agnostic instead:** new
+  `azureResourceGlyphs.tsx` holds plain geometric 24×24 marks (VM, disk, storage, SQL, App Service,
+  VNet, Load Balancer, Key Vault) behind a `RESOURCE_GLYPHS` registry + `<Glyph>` renderer. Swapping
+  in the official set = drop SVGs into `src/assets/azure-icons/` and replace the `paths` entries;
+  nothing else changes. **Decision still open for the user.**
+- **Azure-native restyle:** Fluent/Azure palette (#0078D4 blue, #50E6FF light, #00B7C3 cyan, #003E6B
+  deep) replacing the teal/green. Left is now a dashed **subscription boundary** with a title tab
+  (reads like an Azure architecture diagram) holding resource tiles.
+- **Right panel rotates across a 39s META cycle (3 × the 13s intake CYCLE)** so it never sits on one
+  graph: **A** resource topology assembling (7 nodes, 7 dependency edges drawing via dashoffset) →
+  **B** utilisation telemetry (3 CPU/mem/storage traces drawing, each grounded on a baseline) →
+  **C** inventory/pricing grid resolving cell by cell (24 cells). Engine core now also pulses.
+- **Three flaws caught only by rendering** (harness recipe in 38b): (1) tile duty cycle was ~38% so
+  the subscription looked near-empty — widened to ~64%, now ~4 of 6 tiles on screen; (2) stage-B
+  "sampling head" sweep bars rendered as vertical glitches crossing the traces — deleted, replaced
+  with baselines; (3) third trace used #003E6B, too heavy — now #4A9FE0.
+- **Gotcha for future edits:** a regex of the form `@keyframes X \{[^}]*\}` does NOT work on keyframe
+  blocks — they contain nested `{}`, so it truncates and leaves orphaned CSS. Edit them by hand.
+- Verify: backend **242 passing**; frontend tsc + build clean; all three stages confirmed visually.
+
+### Post-ship 38d — Azure PORTAL vocabulary, not Azure icons (2026-08-06)
+User's key insight (correct): the problem was never the absence of Microsoft's icons — the animation
+didn't resemble an Azure ENVIRONMENT. Fix = adopt Azure's structural vocabulary.
+- **Hierarchy is the signal:** left panel is now `SUBSCRIPTION` (labelled, dashed) containing two
+  labelled **resource groups** (`rg-prod-eastus` / `rg-data-eastus`), each holding **portal-style
+  resource cards** (tinted accent chip + glyph + name bar + type bar). Real `<text>` labels at 7.5–8.5px
+  do the heavy lifting — an Azure user reads sub→RG→resource instantly without any logo.
+- **`RESOURCES` table** pairs each glyph with a service-family accent (compute #0078D4, storage
+  #00B7C3, data/identity Fluent purple #5B5FC7, network #0F7B8A) and its portal type name.
+- **Engine redesigned Fluent, not polygonal:** hexagon → **layered squircles** (rx 26 front face over
+  a slowly counter-rotating depth plane) with a 3×3 processing grid whose cells pulse in sequence and
+  a clipped highlight sweep. Reads as a modern analysis surface rather than a spinning shape.
+- **Right panel (39s META, 3 views) is now infrastructure analysis, not stock analytics:**
+  **A** resource hierarchy expanding (Subscription → RG → typed resource rows, elbow connectors
+  drawing in) · **B** service dependency map · **C** resource inventory resolving row by row.
+- **Bugs caught by rendering (again worth the loop):**
+  - **Stage B glyph/label mismatch** — `DEP_NODES.res` was written as if it indexed GLYPHS but it
+    indexes `RESOURCES`, so "NIC" rendered a padlock and "Vault" a load balancer. Rebuilt semantically
+    (VM hub → Disk / Storage / VNet / Key vault) and re-laid-out as a **star from the VM**, which is
+    both the real dependency shape and crossing-free (the old layout had a messy X).
+  - **Stage C** rendered six identical full-width name bars (obviously fake) → added `nameScale` per
+    row so name lengths vary like real resource names.
+  - Left estate looked empty at ~38% tile duty → widened to ~64% (carried from 38c).
+- Verify: backend **242 passing**; frontend tsc + build clean; all three stages confirmed at 2× DPI.
+- **STILL OPEN for the user:** whether to swap in Microsoft's official Azure Architecture Icons. The
+  registry (`azureResourceGlyphs.tsx`) is the single drop-in point; licensing caveat in 38c stands.
+
+### Post-ship 38e — FINAL: pure motion design, architecture animation deleted (2026-08-06)
+User rejected the whole direction of 38b–38d: "I don't want an animated architecture diagram / an
+animated explainer. I simply want a beautiful loading experience." Reference points: Linear, Stripe,
+Arc, Framer, Raycast, Apple, Notion AI. **This supersedes 38b, 38c and 38d entirely.**
+- **DELETED:** `AnalysisEngine.tsx` and `azureResourceGlyphs.tsx` (subscription/RG boxes, dashed
+  borders, resource cards, topology + dependency + inventory stages, the central processor, the whole
+  Azure-architecture concept, and the official-icons drop-in registry with it). **The icons licensing
+  question from 38c is therefore moot / closed.**
+- **NEW `AuroraOrb.tsx`** — a luminous glass sphere with an aurora drifting inside. Four heavily
+  blurred gradient orbs (Azure blue #0078D4, cyan #50E6FF, violet #6C5CE7, teal #00C2CB) drift inside
+  a circular mask on **deliberately non-harmonic cycles (17s / 19s / 23s / 29s)** — because the
+  periods never align, the colour field never visibly repeats. On top: a specular sweep (8.5s), an
+  inner highlight, a soft glass rim, an ambient halo (11s), and a 9s whole-sphere breath.
+  Blur scales with `size` so it stays proportional at any dimension.
+- **Rim tuning (caught by rendering):** the first pass used `inset 0 0 0 1px rgba(255,255,255,.85)`,
+  which on the light page read as a hard grey hairline — a *drawn circle* rather than a lit sphere.
+  Softened to 0.5 + an inner feather; the edge now reads as light.
+- Explains nothing about the pipeline by design. Page hierarchy unchanged: orb → caption → 168×2px
+  progress hairline, on ~72vh of whitespace, header suppressed while running.
+- MUI `keyframes` + `sx` is used here (the supported path) rather than the `<style>` block workaround
+  38b needed — these are divs, not SVG children with `style` attributes.
+- Verify: backend **242 passing**; frontend tsc + build clean; no dangling refs to the deleted files;
+  visually confirmed at t=2/9/16/24s (field genuinely differs at each — blue-dominant → cyan → violet).
+
+### Post-ship 38f — orb made grabbable + palette fixed (2026-08-06)
+User: make it interactive ("not just clickable but stretchable… so user can play with it") and the
+colours are "kinda off".
+- **Palette (the "off" diagnosis):** pastel orbs at 0.42–0.7 opacity over a near-white base were being
+  WASHED OUT, not mixed — everything blended to milky grey-lavender. Fixed by saturating the hues and
+  carrying them at high opacity: #0B63E5 azure / #31D8FF cyan / #7A5CFF indigo / #00E0C6 aqua at
+  0.62–0.82, plus `filter: saturate(1.12)` on the sphere. Hues now read as distinct colours.
+- **Physics (drag + squash-and-stretch):** one rAF loop writes transforms straight to DOM refs — no
+  React state per frame, so it holds 60fps. Spring is stiff+damped while dragging (k .30 / d .70) and
+  soft+underdamped on release (k .085 / d .88) so it overshoots and wobbles home. Drag distance is
+  rubber-banded through `tanh` (ceiling = 0.4 × size). Stretch = translate + rotate-to-drag-axis +
+  `scale(1+s, 1−0.72s)` + counter-rotate, capped at 0.26. A tap (<6px movement) adds a random
+  velocity kick. Pointer events + `setPointerCapture` + `touchAction:"none"` → works on touch too.
+- **Transform layering is load-bearing:** physics writes to an OUTER node and the CSS `breathe`
+  animation lives on an INNER node. On one element they'd overwrite each other (same reason the halo
+  parallax and pointer-tracking glint each got their own ref node).
+- Extra depth touches: halo lags at 0.42× the sphere's offset (parallax); specular glint eases toward
+  the pointer; `cursor: grab/grabbing` is the affordance.
+- Verify: drove real Playwright pointer drags — mid-drag transform read
+  `translate3d(104.96px,71.13px,0) rotate(34.13deg) scale(1.26,0.8128) rotate(-34.13deg)` and it
+  settled back to `translate3d(0,0,0) scale(1,1)`. backend **242 passing**; tsc + build clean.
+
+### Post-ship 38g — coordinated caption/blob/progress + soft-body physics (2026-08-06)
+User approved 38f's direction ("keep this direction, blob stays the hero, never go back to
+architecture diagrams") with two asks: the caption felt disconnected from the animation, and the
+physics felt "cartoony".
+- **🔑 The cartoony fix — deform from MOTION, not displacement.** 38f drove stretch from offset, so
+  holding the blob out at arm's length kept it permanently elongated: textbook squash-and-stretch,
+  i.e. cartoon. Real soft bodies deform in response to velocity/acceleration and surface tension pulls
+  them round again at rest. Now: `stretch = smoothedSpeed × 0.018 + wobbleOsc × 0.06 + pull`, and the
+  deformation AXIS follows the velocity vector (falls back to the offset vector below 0.05 speed).
+  - `pull` (dragging only, `min(dist/size,1) × 0.11`) re-adds a MODEST sustained deformation, because
+    a held-under-tension viscoelastic body genuinely does stay partly deformed. Pure velocity-only
+    looked correct but killed playability — this blend is both physical and fun.
+  - Second-order **wobble oscillator** excited by acceleration (`decay .935`, `speed .42 rad/frame`)
+    = the jiggle after release. Velocity-driven **skewX** (±7°) makes the trailing edge lag.
+  - Measured curve (Playwright, real pointer drags): moving fast `scale(1.076,0.950)` · held still
+    while displaced 103px `scale(1.049,0.968)` · just released `scale(1.192,0.873) skew 5.46°`
+    (peak, highest accel) · settled `scale(1,1)`. Exactly the physical shape wanted.
+- **Sphere realism/lighting:** added a terminator (light falls off to lower-right), a coloured bounce
+  light on the lower-right limb, a tight specular dot ON TOP of the broad diffuse pool (both track the
+  pointer), and a fresnel edge. Silhouette now morphs organically via a 22s CSS `border-radius`
+  keyframe (children use `border-radius: inherit`) — kept in CSS deliberately so per-frame
+  border-radius repaints stay off the physics loop.
+- **Caption is now a transition, not a swap** (`StageCaption.tsx`, new): outgoing line blurs+lifts
+  away (300ms), then the incoming line resolves WORD BY WORD (55ms stagger, blur 6px→0, rise 10px→0,
+  `cubic-bezier(.16,1,.3,1)`).
+- **One shared beat = the synchronisation.** `AssessmentProgress` keeps `shown` lagging `caption` by
+  one exit animation; `StageCaption` calls `onSwapped` the instant the old line clears, and that single
+  `commit()` simultaneously swaps text, increments `stage`, pulses the blob and shifts the hue. So
+  blob and caption are causally linked, not merely concurrent.
+  - Blob `pulse` prop → wobble impulse + expanding ripple ring + glow flash.
+  - Blob `hue` prop → aurora + halo `hue-rotate`, eased over 2.4s, so the palette drifts per stage.
+  - Progress bar: `width` transition now `1.1s cubic-bezier(.22,1,.36,1)` (was `.4s linear`) plus a
+    brightening sweep keyed to `stage`.
+- Verified the out→commit→in handoff can't deadlock: sampled the DOM for 14s, 4 distinct captions
+  cycled correctly.
+- Verify: backend **242 passing**; frontend tsc + build clean; visually confirmed.
+
+### Post-ship 38h — execution polish: atmosphere, crossfade, filament progress (2026-08-06)
+User: concept is right and locked ("by far the best… do NOT throw this direction away"), execution
+isn't finished. Explicitly: don't enlarge the blob, make the WHITESPACE alive, kill the caption's
+empty frame, richer material/depth, custom progress indicator.
+- **🔑 Caption empty-frame fixed (`StageCaption.tsx` rewritten).** The old version ran strictly in
+  sequence — old line animated fully OUT, *then* the new line animated IN — leaving a real hole that
+  read as lag. Now both lines mount together in one CSS-grid cell (`gridArea: "1/1"`, so they stack
+  while staying in flow and nothing below shifts) and animate SIMULTANEOUSLY, overlapping ~400ms.
+  Verified by polling the DOM every 60ms for 9s: **0 empty frames / 150 samples**, 8 distinct states
+  (the extra states are the overlap frames, i.e. proof the crossfade is real).
+- **`AmbientField.tsx` (new) — the whitespace is now weather, not UI.** 4 huge colour washes on
+  43–67s non-harmonic cycles, 2 slow light rays, 10 drifting motes (fixed positions, never random, so
+  re-renders don't reshuffle). Opacities 0.03–0.09 — deliberately below conscious notice.
+  - **Caught by rendering:** `overflow:hidden` clipped the washes into a hard horizontal line at the
+    container edge. Fixed with a radial `maskImage` so the whole field feathers into the page.
+- **`ProgressThread.tsx` (new)** — replaces the default track+fill bar: 1.5px track, glowing gradient
+  filament, a highlight travelling along it continuously (motion between backend polls), a soft comet
+  head at the leading edge, `width`/`left` on 1.4s `cubic-bezier(.22,1,.36,1)`, plus a bright pulse
+  keyed to stage.
+- **Blob material/depth:** slow conic `swirl` (34s, `soft-light`) = liquid moving inside the glass;
+  a second reflection `glide` crossing on a different axis/rate to the main sweep; a refraction
+  caustic on the lower limb; and a 4-layer shadow (contact → mid → wide bloom → coloured scatter)
+  replacing the single flat shadow that made it read as a sticker.
+  - Caustic first rendered as an obvious white smudge (0.72 alpha / 3px blur) → softened to 0.4 / 7px.
+- **Simplified the sync plumbing:** `AssessmentProgress` now derives `stage` itself by watching the
+  caption change; `StageCaption` owns its overlap internally and needs no `phase`/`onSwapped`
+  callback. One counter drives caption + blob pulse + hue + progress pulse.
+- Verify: backend **242 passing**; frontend tsc + build clean; visually confirmed.
+
+### Post-ship 39 — loading screen replaced by a REAL backend-driven execution view (2026-08-06)
+User abandoned the whole decorative direction (38b–38h): the glass blob, architecture diagrams and
+abstract animations "none of them communicate what the product is actually doing". New requirement:
+the assessment itself IS the animation, driven by real backend events — "never fabricate events",
+"never invent values", "must NOT be a fake animation".
+- **DELETED:** `AuroraOrb.tsx`, `AmbientField.tsx`, `StageCaption.tsx`, plus the now-dead
+  `PHASE_CAPTIONS`/`usePhaseCaption` from `useAssessmentMotion.ts`. **Do not resurrect these**, and
+  do not go back to architecture/topology (38c–38d) either — both directions are explicitly rejected.
+- **BACKEND (this is what makes it real, not a mock):**
+  - New `AssessmentEvent` model + **alembic 011** (`assessment_events`: assessment_id, timestamp,
+    stage, message) + `Assessment.events` relationship.
+  - `ProgressTracker.event(msg)` — writes one row, stamped with the current state; wrapped in
+    try/except so a failed event write can never break a run.
+  - `assessment.py` emits ~15 events at REAL milestones carrying that run's REAL numbers: connected,
+    N subscriptions, "Found N resources across M types", per-type counts, VM metric sampling count,
+    Advisor rec count, cost-map match count, billing currency, findings count, complete.
+  - `_gather_inventory_summary` now returns top **8** types (was 3) and `_persist_inventory_summary`
+    stores them at step 1 → discovery metrics are live mid-run. **`report.py` pinned to `[:3]`** for
+    the "Major Resource Type" prose row, which would otherwise become a wall of text.
+  - `schemas.py`: `AssessmentEventResponse` + `events` on `AssessmentResponse`; re-added
+    `major_resource_types` (now genuinely consumed, unlike the 38a revert).
+- **DB GOTCHA HIT + FIXED:** `alembic upgrade head` failed with "table assessments already exists"
+  because `alembic_version` was EMPTY (so it replayed from 001), while `assessment_events` had
+  already been created by `create_all()` (alembic's env.py imports the app). Fixed non-destructively
+  with `alembic stamp head` — 13 existing assessments preserved. **Separately verified migration 011
+  is sound by building a fresh DB from migrations ONLY (no create_all): 001→011 clean.**
+- **FRONTEND:** `stages.ts` (6 stages mirroring the state machine + a one-line explanation each),
+  `StageTimeline.tsx` (self-drawing checkmarks, pulsing active marker, filling connectors, blurb
+  only on the active stage), `EventStream.tsx` (console-style feed; animates only genuinely NEW ids
+  so a poll of the same list doesn't re-animate; auto-scrolls; top-edge mask), `DiscoveryMetrics.tsx`
+  (count-up tiles, each rendered ONLY when its value exists — no zeros, no placeholders),
+  `ProgressThread.tsx` (kept from 38h, gained `fluid`). `AssessmentProgress.tsx` rebuilt as the card.
+- **🔴 REPEAT BUG CAUGHT BY RENDERING — the exact trap logged in 38b.** The timeline's checkmark used
+  `style={{ animation: `${drawCheck} …` }}`; MUI `keyframes` only injects via emotion, so the rule
+  never existed, `strokeDashoffset` stayed 22 and completed stages rendered as blank green discs.
+  Fixed with `<Box component="path" sx={…}>`. **Rule, again: never put a MUI `keyframes` reference in
+  a `style` attribute — `sx` only.** Grepped the folder to confirm no others remain.
+- Verify: backend **243 passing** (+`test_events_report_real_counts_in_order`, which asserts the
+  first/last events, singular/plural subscription wording, that the "Identified N" count matches the
+  findings actually persisted, and monotonic ids); frontend tsc + build clean; rendered and confirmed.
+- **ACTION FOR USER:** other machines/deploys need `alembic upgrade head` (adds `assessment_events`).
+  Events only populate for assessments run AFTER this change; older ones show an empty feed.
+
+### Post-ship 39a — motion pass on the execution view (no new components) (2026-08-06)
+User: "STOP THINKING ABOUT ADDING MORE COMPONENTS… the problem is NOT the layout, nothing feels
+alive. I want motion design, not additional UI." Audited existing motion, fixed the gaps. **No new
+components — every change is to a file that already existed.**
+- **🔴 REAL BUG — counters always counted from ZERO.** `AnimatedValue` did `setDisplay(value * eased)`,
+  so every time a live counter changed (resources climbing 90 → 193 as the scan reports in) it snapped
+  back to 0 and recounted — reading as a glitch, and the exact opposite of "newly discovered resources
+  animate into their counters". Fixed to interpolate from the value CURRENTLY on screen
+  (`from + (value - from) * eased`, `from` held in a ref; state now starts at 0 so first mount still
+  counts up). **Also improves the completed dashboard**, where totals change on dismiss/restore.
+  - Verified with a live harness: during the 90→193 update the counter read
+    `158 → 160 → 175 → 184 → 189 → 192 → 193`, monotonic, never dipping.
+- **Stat tiles**: `<Fade>` (all at once) → staggered `tileIn` rise, 65ms apart, so a batch of newly
+  discovered resource types cascades instead of popping.
+- **Timeline**: rows stagger in (70ms apart); the completed connector now DRAWS itself downward
+  (`scaleY` from `transformOrigin: top`) instead of switching colour; the connector below the ACTIVE
+  stage carries a light travelling downward (`flowDown`) — ambient motion that shows work flowing on
+  without implying how far through the stage we are (the backend can't tell us that).
+- **Progress filament**: the gradient itself now flows (`background-position`, 200% size, 6s linear)
+  on top of the existing travelling highlight, so the bar reads as live even when width is static
+  between polls.
+- **Card sections** reveal in sequence (progress 120ms → metrics 220ms → timeline 320ms → feed 420ms).
+- Already present and confirmed working (not re-done): self-drawing checkmarks, per-row event feed
+  entrance keyed to new ids, active-marker pulse, smoothed progress easing.
+- Verify: backend **243 passing**; frontend tsc + build clean; motion confirmed via a scripted live
+  harness (counter roll-on) plus a render.
+
+### Post-ship 39b — loading screen: flow composition, no logs or timeline (2026-08-06)
+User rejected 39/39a's execution view: "stop treating the loading screen like an Azure Portal status
+page… feels like documentation". Confidence must come from MOTION, not reading.
+- **DELETED:** `StageTimeline.tsx`, `EventStream.tsx` (activity log + timestamps + vertical checklist
+  + per-step prose). **Do not bring back logs, timelines, checklists or step descriptions.** Also
+  still banned from earlier rounds: the glass blob/sphere (38e–38h) and architecture/topology
+  (38b–38d).
+- **`FlowField.tsx` (new centrepiece)** — abstract flow, deliberately NOT a large central object.
+  6 long curves sweep the full width, draw together through a waist at (285,100) and open out;
+  18 particles ride those exact paths via `offset-path`. Durations 6.7–10.1s are mutually
+  non-harmonic so the composition never falls into a visible repeat.
+  - **Seamless loop = NEGATIVE animation delays** (`-(dur/n)*k`): every particle starts mid-cycle, so
+    the stream is already full on frame 1 with no beginning or end. Verified: 18 particles spread
+    across 568px at first paint, not bunched at the origin.
+  - **Caught by rendering:** first pass dashed the BASE curve for the shimmer, which turned the
+    guides into disconnected scratches — particles then read as loose scattered dots with no line to
+    ride. Fixed by splitting into a continuous faint base curve + a SEPARATE dashed shimmer overlay.
+- **One caption only** (`StageCaption.tsx` re-created): stacked in one grid cell, outgoing blurs/lifts
+  while incoming resolves — overlapping, so there is never an empty frame.
+- **`DiscoveryMetrics.tsx` rewritten**: grid of cards → compact inline pills revealed ONE AT A TIME
+  (900ms apart via a `shown` counter). Values are real and unmodified; only the *reveal* is paced.
+- **`stages.ts` rewritten**: captions only, no per-stage prose. **NO IMPLEMENTATION NAMES** — the
+  screen must never say Azure Advisor, Resource Graph, Cost Management, retail pricing, ARM etc.
+  ("the assessment is not an Azure Advisor wrapper"). Grepped the UI to confirm; only match is the
+  comment stating the rule.
+- Layout: flow → caption → filament → pills, centred on ~78vh, staggered reveal 0/160/280/400ms.
+- **NOTE / open question for the user:** the backend event stream (table + `tracker.event()` calls
+  from post-ship 39) is STILL emitting but is no longer displayed anywhere. Kept as an execution
+  record (comparable to `audit_logs`, also not surfaced) rather than churning another migration to
+  drop it — but those messages DO contain implementation names, so it must not be surfaced as-is.
+- Verify: backend **243 passing**; frontend tsc + build clean; rendered and confirmed.
+
+### Post-ship 39c — UX polish pass: exit-before-enter, single statistic, TPT branding (2026-08-06)
+User kept 39b's flow composition but called the execution unfinished. Five specific fixes:
+- **⚠️ CAPTION TRANSITION REVERSED FROM 39b — this was an explicit user correction.** 39b used an
+  overlapping crossfade (both lines in one grid cell); user called it "broken… looks unpolished, no
+  overlapping text". Now **strict exit-before-enter**: outgoing fades+blurs, unmounts, THEN the new
+  one enters. New shared hook `useSequencedSwap(value, exitMs)` in `useAssessmentMotion.ts`.
+  Slots have FIXED height (caption 34px, statistic 40px) so the brief empty moment can't shift layout.
+  **Do not "fix" this back into a crossfade** — the overlap was the reported defect.
+  - Verified by polling the DOM every 40ms for ~10s: **max 1 caption and max 1 statistic on screen at
+    once**. (First check falsely reported 3 statistics — the selector was matching nested wrapper
+    divs containing the same text; re-ran counting only leaf `<span>` labels.)
+- **Statistics redesigned**: pill chips ("looked like Bootstrap badges", pulled attention from the
+  animation) → bare typography, ONE metric at a time, 3.4s dwell, counts up then dissolves into the
+  next. No border, no background, no grid.
+- **TPT branding, subconscious** (`AssessmentProgress.tsx`): the brand mark is a warm orange→magenta
+  gradient, and the composition is entirely cool blue — so a **brand-gradient ambient wash**
+  (orange/rose/violet, ~10% peak, 38px blur, 34s drift) is what makes the screen read as TPT.
+  Plus the logo as an **oversized ghost**: 165% width so the wordmark/tagline crop out of frame,
+  opacity 0.022, blur 6px.
+  - **Caught by rendering:** first attempt (78% width, 3.5% opacity, 1.5px blur) left "TECH PLUS
+    TALENT" and the tagline clearly legible behind the content — read as a mistake, not branding.
+    Legible lettering behind content always looks like an error; an unreadable warm shape reads as
+    depth.
+- **Depth in the flow** (`FlowField.tsx`): far layer of 8 ambient motes drifting on 24–37s cycles
+  (slower + dimmer + smaller than the path particles — the speed differential IS the parallax), plus
+  an occasional bright pulse running a single line on long offset cycles (17–30s) so two rarely
+  coincide and it reads as an event rather than a rhythm.
+- **Composition rebalanced**: optically centred (group lifted `mt:-4` on md+, because the flow
+  outweighs the three text rows beneath it), tighter vertical rhythm, staggered reveal 0/160/300/440ms.
+- Verify: backend **243 passing**; frontend tsc + build clean; no implementation names in any UI text.
+
+### Post-ship 39d — watermark tuning: visible but not muddying the page (2026-08-06)
+User: make the TPT ghost "kinda visible" — it wasn't, yet was still "messing with the background".
+Both were true: at 165% width / 6px blur it was an unreadable smear that nonetheless greyed the area
+behind the caption and statistic (the stat text visibly lost contrast).
+- **Root cause was the logo's own composition**, not the opacity. The asset is `TPT mark + "TECH PLUS
+  TALENT" wordmark + "Meaningful Tech and Talent" tagline`; blurred, the wordmark and tagline become
+  grey rectangular smudges that sat directly behind the type. **Fixed by clipping to the mark alone**
+  — `clipPath: inset(0% 27% 21% 0%)` trims the wordmark (right) and tagline (bottom).
+- With the smudge sources gone the mark can be crisper and MORE visible without dirtying anything:
+  opacity 0.022→0.065, blur 6px→0.6px, width 165%→48% (maxWidth 620), anchored `top: 13%` so it
+  overlaps the top of the flow (sitting fully above it read as a stray element) and masked with a
+  radial gradient so it dissolves at its own edges instead of ending on a rectangle.
+- Brand ambient wash weakened (0.10→0.07 peak, blur 38→46px) — it was tinting the type grey.
+- Verify: backend **243 passing**; tsc + build clean; rendered — mark clearly reads as TPT, and the
+  caption/statistic sit on clean background at full contrast.
+
+### Post-ship 39e — three fixes found by reviewing the REAL page (2026-08-06)
+User shared a screenshot of the running screen inside the actual app; I reviewed it and fixed what
+was genuinely wrong rather than declaring it done.
+- **🔑 Vertical centring — the standalone preview had misled me.** The container used
+  `minHeight: 82vh`, but `Layout`'s content column (`flexGrow: 1, p: 4`) is FULL height. A short
+  container centres its content within *itself* and leaves the remainder empty below, so the stack
+  sat high on the real page. Fixed to `minHeight: calc(100vh - 64px)` (64px = Layout's `p: 4` top +
+  bottom). Also removed the `mt: -4` "optical lift" — it had been tuned against the preview and was
+  compounding the problem.
+  - Measured at the user's real viewport (1917×853, 300px sidebar, `p: 4`): before **185px above /
+    299px below**, after **238 / 246** — 8px imbalance.
+  - **Lesson: measure layout against a harness that reproduces `Layout`'s real column, not a bare
+    centred div.** The preview used `p: 3` and no full-height column and reported a false balance.
+- **Brand wash had a visible edge**: falloff reached transparent at 76% of the element radius, so the
+  rounded boundary was perceptible and read as a panel. Falloff pulled in to 62% and blur 46→58px so
+  it dissolves completely.
+- **Ghost mark read pink**: added `saturate(0.45)` — the glyph's magenta end looked like a stain at
+  full brand saturation. Still warm, no longer a colour event.
+- Left alone deliberately: the statistic labels ("22 Disks") are the backend's own
+  `_friendly_resource_type` output; rewriting them client-side would risk drifting from what the scan
+  actually found.
+- Verify: backend **243 passing**; tsc + build clean; re-measured and re-rendered at the real viewport.
+
+### Post-ship 39f — TPT watermark removed for good (2026-08-06)
+User: "just remove the background tpt entirely. it ruins the vibe." **Do not reintroduce it.**
+- Deleted the ghost logo `<img>` and the `tptLogo` import from `AssessmentProgress.tsx`.
+- **Verdict from three attempts (39c/39d/39e), recorded so it isn't retried:** at 2.2% it was an
+  invisible smear that still greyed the type behind it; clipped and raised to 6.5% it was legible but
+  read as a stain; desaturated it read as a grey smudge. There is no opacity at which a logo behind
+  live content looks like branding rather than a mislaid asset — the concept is the problem, not the
+  tuning.
+- **Kept:** the warm ambient wash (orange→rose, 0.07 peak, 58px blur, 34s drift). It carries no shape,
+  so it offsets the otherwise entirely cool-blue composition without ever reading as a logo. Flagged
+  to the user as separately removable.
+- Verify: backend **243 passing**; tsc + build clean; no logo references remain under `assessment/`.
+
+### Post-ship 39g — loading screen was janky during a live run: profiled and fixed (2026-08-06)
+User: "the animations are too laggy while assessment is running." Profiled with Playwright + CDP
+`Emulation.setCPUThrottlingRate` (a local uvicorn assessment competes with the browser for CPU, so
+throttling reproduces the user's condition; unthrottled it measured 144fps and looked fine).
+- **Baseline:** x1 144fps/0 janky · **x4 40fps/2 janky** · **x6 24fps/121 janky, worst 62ms.**
+- **Isolation said it was NOT the CSS animations.** Killing the path `stroke-dashoffset` anims, the
+  particle anims, or the blurred brand wash each changed almost nothing (24.8 → 24.9/26.8/25.1).
+  Only hiding the whole SVG helped (→32.6), i.e. the cost scaled with NODE COUNT, not with animation
+  — the signature of React reconciliation, not paint.
+- **🔑 Root cause: `useSmoothProgress` called `setValue` on EVERY rAF**, re-rendering
+  `AssessmentProgress` and its entire subtree (~40 SVG nodes + caption + metrics) 60–144×/sec. It
+  bought nothing: the consumer animates between values with a 1.4s CSS transition.
+  - Fix: compute the eased curve per frame as before, but **publish to React at ~11Hz**
+    (`PUBLISH_INTERVAL_MS = 90`). Note the effect deliberately omits `value` from its deps (it would
+    restart the loop on every publish).
+- **Also fixed:** `React.memo` on `FlowField` (~40 animated nodes, depends only on `width`) and on
+  `StageCaption`; `AnimatedValue` now publishes at ~30Hz instead of per-frame (rolling digits are
+  indistinguishable at 30 vs 60, and several can count at once) — **this helps the completed
+  dashboard too**, which has many AnimatedValues.
+- **Result: x1 144fps/0 · x4 132fps/0 (was 40/2) · x6 82fps/20 janky (was 24/121).**
+- Verified the throttled publishing didn't make progress step or freeze: filament width over 3s ran
+  75.2 → 78.3 → 81.5 → … → 101.1px, smooth sub-pixel increments.
+- **Lesson for this repo: per-frame `setState` is the default cause of animation jank here, not the
+  CSS.** Drive per-frame values through refs/DOM or rate-limit the publish; keep heavy static
+  subtrees behind `React.memo`.
+- Verify: backend **243 passing**; tsc + build clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD

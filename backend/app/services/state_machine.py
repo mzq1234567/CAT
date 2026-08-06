@@ -20,7 +20,7 @@ from typing import Dict, Optional
 
 from sqlalchemy.orm import Session
 
-from ..models.db import Assessment
+from ..models.db import Assessment, AssessmentEvent
 
 
 class AssessmentState(str, Enum):
@@ -117,6 +117,21 @@ class ProgressTracker:
         if state in TERMINAL:
             assessment.completed_at = datetime.utcnow()
         self._db.commit()
+
+    def event(self, message: str) -> None:
+        """Record something the pipeline actually just did, for the live event stream.
+
+        Call this only at real milestones, and pass real values — the running-assessment screen
+        renders these verbatim, so a speculative or rounded-up event would be a fabricated claim
+        about the customer's environment. Never fatal: the stream is cosmetic relative to the run.
+        """
+        try:
+            self._db.add(AssessmentEvent(
+                assessment_id=self._id, stage=self.state.value, message=message,
+            ))
+            self._db.commit()
+        except Exception:  # noqa: BLE001 — an event write must never break an assessment
+            self._db.rollback()
 
     def fail(self, error_message: str) -> None:
         assessment = self._db.get(Assessment, self._id)

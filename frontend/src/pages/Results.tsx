@@ -1,27 +1,18 @@
 import {
-  Alert, Box, Breadcrumbs, Button, Chip, CircularProgress,
-  LinearProgress, Link, Stack, Typography,
+  Alert, Box, Breadcrumbs, Button, Chip, CircularProgress, Link, Typography,
 } from "@mui/material";
-import { alpha, keyframes } from "@mui/material/styles";
+import { alpha } from "@mui/material/styles";
 import { useNavigate, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import PictureAsPdfIcon from "@mui/icons-material/PictureAsPdf";
-import CloudSyncIcon from "@mui/icons-material/CloudSync";
-import CheckCircleIcon from "@mui/icons-material/CheckCircle";
-import RadioButtonUncheckedIcon from "@mui/icons-material/RadioButtonUnchecked";
 import ErrorOutlineIcon from "@mui/icons-material/ErrorOutline";
 import Layout from "../components/Layout";
 import AssessmentDashboard from "../components/dashboard/AssessmentDashboard";
+import AssessmentProgress from "../components/assessment/AssessmentProgress";
 import { useApi } from "../services/api";
-import { colors, gradients } from "../theme";
+import { colors } from "../theme";
 import React from "react";
 import { AssessmentStatus } from "../types";
-
-const pulse = keyframes`
-  0% { transform: scale(1); opacity: 0.85; }
-  50% { transform: scale(1.12); opacity: 1; }
-  100% { transform: scale(1); opacity: 0.85; }
-`;
 
 const STATUS_CHIP: Record<AssessmentStatus, { label: string; color: string }> = {
   queued: { label: "Queued", color: colors.warning },
@@ -35,101 +26,6 @@ const STATUS_CHIP: Record<AssessmentStatus, { label: string; color: string }> = 
   failed: { label: "Failed", color: colors.error },
 };
 
-// Ordered pipeline phases (mirror backend state machine) for the checklist view.
-const PHASES: { key: AssessmentStatus; label: string }[] = [
-  { key: "fetching_resources", label: "Collecting Azure inventory" },
-  { key: "fetching_metrics", label: "Analysing resource utilisation" },
-  { key: "running_advisor", label: "Reviewing optimisation signals" },
-  { key: "calculating_prices", label: "Calculating live prices" },
-  { key: "detecting_findings", label: "Identifying savings opportunities" },
-  { key: "generating_report", label: "Finalising results" },
-];
-
-function ProgressView({ status, progress, message }: {
-  status: AssessmentStatus;
-  progress: number;
-  message: string | null;
-}) {
-  const phaseIndex = PHASES.findIndex((p) => p.key === status);
-  const pct = progress || (status === "queued" ? 5 : 10);
-
-  return (
-    <Box display="flex" justifyContent="center" mt={2}>
-      <Box
-        sx={{
-          maxWidth: 480,
-          width: "100%",
-          bgcolor: colors.surface,
-          border: `1px solid ${colors.border}`,
-          borderRadius: 4,
-          p: 4,
-          textAlign: "center",
-        }}
-      >
-        <Box
-          sx={{
-            width: 72,
-            height: 72,
-            mx: "auto",
-            mb: 3,
-            borderRadius: "50%",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            background: gradients.brand,
-            animation: `${pulse} 2s ease-in-out infinite`,
-          }}
-        >
-          <CloudSyncIcon sx={{ color: "#fff", fontSize: 38 }} />
-        </Box>
-
-        <Typography variant="h6" fontWeight={700} color={colors.textPrimary} gutterBottom>
-          Running your assessment
-        </Typography>
-        <Typography variant="body2" color="text.secondary" mb={3}>
-          {message || "Analysing your Azure resources for cost optimisation opportunities."}
-        </Typography>
-
-        <Box mb={3}>
-          <LinearProgress
-            variant="determinate"
-            value={pct}
-            sx={{ "& .MuiLinearProgress-bar": { borderRadius: 4 } }}
-          />
-          <Typography variant="caption" color="text.secondary" mt={1} display="block">
-            {pct}% complete
-          </Typography>
-        </Box>
-
-        <Stack spacing={1.25} sx={{ textAlign: "left" }}>
-          {PHASES.map((phase, i) => {
-            const done = i < phaseIndex;
-            const active = i === phaseIndex;
-            return (
-              <Box key={phase.key} display="flex" alignItems="center" gap={1.5}>
-                {done ? (
-                  <CheckCircleIcon sx={{ fontSize: 18, color: colors.success }} />
-                ) : active ? (
-                  <CircularProgress size={16} thickness={6} />
-                ) : (
-                  <RadioButtonUncheckedIcon sx={{ fontSize: 18, color: colors.textMuted }} />
-                )}
-                <Typography
-                  variant="body2"
-                  color={done || active ? colors.textPrimary : colors.textMuted}
-                  fontWeight={active ? 600 : 400}
-                >
-                  {phase.label}
-                </Typography>
-              </Box>
-            );
-          })}
-        </Stack>
-      </Box>
-    </Box>
-  );
-}
-
 export default function Results() {
   const { id } = useParams<{ id: string }>();
   const assessmentId = parseInt(id!, 10);
@@ -142,7 +38,9 @@ export default function Results() {
     queryFn: () => api.getAssessment(assessmentId),
     refetchInterval: (query) => {
       const status = query.state.data?.status;
-      return status === "completed" || status === "failed" ? false : 4000;
+      // Poll faster while running so phase transitions and discovered counts land promptly — the
+      // progress card animates between polls, but the underlying data should still feel current.
+      return status === "completed" || status === "failed" ? false : 2000;
     },
   });
 
@@ -176,6 +74,16 @@ export default function Results() {
   }
 
   const isTerminal = assessment.status === "completed" || assessment.status === "failed";
+
+  // While running, the animation IS the page — no header, chips or breadcrumbs competing with it.
+  if (!isTerminal) {
+    return (
+      <Layout>
+        <AssessmentProgress assessment={assessment} />
+      </Layout>
+    );
+  }
+
   const chip = STATUS_CHIP[assessment.status];
 
   const breadcrumbs = (
@@ -245,15 +153,6 @@ export default function Results() {
         </Box>
         {actions && <Box display="flex" gap={1.5}>{actions}</Box>}
       </Box>
-
-      {/* Progress state */}
-      {!isTerminal && (
-        <ProgressView
-          status={assessment.status}
-          progress={assessment.progress}
-          message={assessment.status_message}
-        />
-      )}
 
       {assessment.status === "failed" && (
         <Alert severity="error" icon={<ErrorOutlineIcon />}>

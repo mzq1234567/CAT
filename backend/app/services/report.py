@@ -329,7 +329,9 @@ def _environment_rows(assessment, findings: List) -> List[List[str]]:
 
     rows.append(["Total No. of resources", str(assessment.total_resources or "—")])
 
-    types = [t.get("type", "") for t in (assessment.major_resource_types or []) if t.get("type")]
+    # Top 3 only: the column stores a longer breakdown for the live discovery metrics, but this row
+    # reads as prose and turns into a wall of text if every type is joined in.
+    types = [t.get("type", "") for t in (assessment.major_resource_types or [])[:3] if t.get("type")]
     rows.append(["Major Resource Type", " and ".join(types) if types else "—"])
 
     if assessment.current_monthly_spend is not None:

@@ -56,20 +56,37 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
             base_delay=settings.azure_retry_base_delay,
         )
 
+        # Every tracker.event() below reports work that has ALREADY happened, with the real numbers
+        # from this run — the live event stream renders them verbatim to the client.
+        tracker.event("Connected to Azure")
+        tracker.event(f"Assessing {len(subscription_ids)} "
+                      f"subscription{'s' if len(subscription_ids) != 1 else ''}")
+
         # 1. Inventory (server-side filtered ARG) — stamps snapshot_at.
         tracker.advance(AssessmentState.FETCHING_RESOURCES)
+        tracker.event("Enumerating Azure resources")
         inventory, inv_errors = await collect_inventory(client, subscription_ids)
         _persist_inventory(db, assessment_id, inventory)
         if inv_errors:
             logger.warning("Assessment %s inventory partial failures: %s", assessment_id, inv_errors)
         total_resources, type_count, major_types = await _gather_inventory_summary(
             client, subscription_ids)
+        # Publish the scan counts NOW (not just at the end) so the live progress UI can report real
+        # discovered totals while the run is still in flight — never a fabricated counter.
+        _persist_inventory_summary(db, assessment_id, total_resources, type_count, major_types)
+        if total_resources:
+            tracker.event(f"Found {total_resources:,} resources across {type_count} types")
+        for entry in major_types[:4]:
+            tracker.event(f"{entry['count']:,} {entry['type']}")
         # Cosmetic report metadata (client name, subscription names) — best-effort, never fatal.
         await _capture_report_metadata(db, assessment_id, client, subscription_ids, major_types)
 
         # 2. Utilisation metrics for running VM candidates + active App Service Plans.
         tracker.advance(AssessmentState.FETCHING_METRICS)
-        running_vms = await enrich_vms_with_metrics(client, inventory.get("running_vms", []))
+        vm_candidates = inventory.get("running_vms", [])
+        if vm_candidates:
+            tracker.event(f"Sampling 30-day utilisation for {len(vm_candidates)} virtual machines")
+        running_vms = await enrich_vms_with_metrics(client, vm_candidates)
         active_asps = await enrich_asps_with_metrics(client, inventory.get("active_app_service_plans", []))
         active_sql_dbs = await enrich_sql_dbs_with_metrics(
             client, inventory.get("rightsizable_sql_databases", []))
@@ -83,19 +100,29 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.advance(AssessmentState.RUNNING_ADVISOR)
         advisor_recs = await _gather_advisor(client, subscription_ids)
         advisor_index = build_advisor_index(advisor_recs)
+        tracker.event(f"Azure Advisor returned {len(advisor_recs)} cost recommendations")
         reservation_recs = await _gather_reservation_recs(client, subscription_ids)
+        if reservation_recs:
+            tracker.event(f"Azure reservation engine returned {len(reservation_recs)} recommendations")
 
         # 4. Actual cost (Cost Management): per-resource for validation, per-service for total spend.
         #    The service query also tells us the subscription's billing currency, which we use to
         #    fetch Azure retail prices in that same currency (so estimates match what the client pays).
         tracker.advance(AssessmentState.CALCULATING_PRICES)
+        tracker.event("Reading billed cost from Azure Cost Management")
         # One monthly-history query per sub yields BOTH the last-month cost basis and the
         # month-over-month steadiness signal (half the load on the throttled billing API).
         cost_map, consistency, growth, complete_months = await _gather_cost_and_consistency(
             client, subscription_ids)
         service_costs, currency, spend_estimated, spend_period_days = await _gather_spend_baseline(
             client, subscription_ids, complete_month_exists=complete_months >= 2)
+        if cost_map:
+            tracker.event(f"Matched billed cost for {len(cost_map):,} resources")
+        else:
+            tracker.event("No billed cost returned — estimates will use list pricing")
         currency = currency or settings.pricing_currency
+        tracker.event(f"Billing currency: {currency}")
+        tracker.event("Fetching live Azure retail prices")
         pricing = get_pricing_engine(currency)
 
         # 5. Detect findings.
@@ -111,19 +138,24 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
             cost_consistency=consistency,
             currency=currency,
         )
+        tracker.event("Evaluating reservations, hybrid benefit, right-sizing and waste")
         findings = await _detect_all(
             engine, inventory, running_vms, advisor_recs, reservation_recs, active_asps,
             active_sql_dbs, active_sql_mis, premium_disks
         )
+        tracker.event(f"Identified {len(findings)} optimisation "
+                      f"{'opportunity' if len(findings) == 1 else 'opportunities'}")
 
         # 6. Persist findings + roll up totals (incl. actual spend when available).
         tracker.advance(AssessmentState.GENERATING_REPORT)
+        tracker.event("Building recommendations")
         _persist_findings_and_totals(
             db, assessment_id, findings, service_costs, total_resources, type_count, currency,
             observed_growth=growth, spend_estimated=spend_estimated, spend_period_days=spend_period_days,
         )
 
         tracker.advance(AssessmentState.COMPLETED)
+        tracker.event("Assessment complete")
 
     except Exception as exc:  # noqa: BLE001 — record failure, never crash the worker
         logger.exception("Assessment %s failed", assessment_id)
@@ -322,7 +354,8 @@ async def _gather_inventory_summary(client: AzureClient, subscription_ids: List[
     """Return (total_resources, distinct_type_count, major_types) across the subscriptions.
 
     `major_types` is the top resource types by count as [{"type": short_name, "count": n}] — used
-    for the report's Environment Details table. (0, 0, []) on failure.
+    for the report's Environment Details table (which takes the top 3) and for the live discovery
+    metrics on the running-assessment screen. (0, 0, []) on failure.
     """
     try:
         rows = await client.query_resource_graph(subscription_ids, all_resources_summary_query())
@@ -333,7 +366,7 @@ async def _gather_inventory_summary(client: AzureClient, subscription_ids: List[
     ranked = sorted(rows, key=lambda r: int(r.get("resourceCount") or 0), reverse=True)
     major = [
         {"type": _friendly_resource_type(r.get("type", "")), "count": int(r.get("resourceCount") or 0)}
-        for r in ranked[:3] if int(r.get("resourceCount") or 0) > 0
+        for r in ranked[:8] if int(r.get("resourceCount") or 0) > 0
     ]
     return total, len(rows), major
 
@@ -420,6 +453,25 @@ def _persist_inventory(db, assessment_id: int, inventory: Dict[str, List[Dict]])
                 resource_group=item.get("resourceGroup"),
                 data=item,
             ))
+    db.commit()
+
+
+def _persist_inventory_summary(
+    db, assessment_id: int, total: int, type_count: int, major_types: List[Dict] | None = None,
+) -> None:
+    """Store the scan counts as soon as inventory is collected.
+
+    The same values are re-stamped by `_persist_findings_and_totals` at the end; writing them here
+    too means the polling frontend can show REAL discovered counts mid-run instead of waiting for
+    the whole pipeline (or, worse, inventing a number).
+    """
+    assessment = db.get(Assessment, assessment_id)
+    if assessment is None:
+        return
+    assessment.total_resources = total
+    assessment.resource_type_count = type_count
+    if major_types:
+        assessment.major_resource_types = major_types
     db.commit()
 
 
