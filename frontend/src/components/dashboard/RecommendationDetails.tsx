@@ -16,11 +16,12 @@ import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined
 import RemoveCircleOutlineIcon from "@mui/icons-material/RemoveCircleOutline";
 import VisibilityOutlinedIcon from "@mui/icons-material/VisibilityOutlined";
 import ExpandLessIcon from "@mui/icons-material/ExpandLess";
+import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import { colors } from "../../theme";
 import type { Finding } from "../../types";
-import { areaForCategory } from "./area";
+import { areaForCategory, isConditionalSaving } from "./area";
 import { affectedResources, affectedLabel, metaFor } from "./categoryMeta";
-import { AreaTag, ImpactChip, ValidationChip } from "./badges";
+import { AreaTag, ImpactChip, ValidationChip, AdvisorImpactChip } from "./badges";
 import FindingEvidence, { hasSupportingMetrics } from "./FindingEvidence";
 import { AREA_ACCENT, SAVINGS_COLOR, fmtUSD, fmtPct } from "./tokens";
 
@@ -34,6 +35,30 @@ function Section({ icon, title, children }: { icon: React.ReactNode; title: stri
         </Typography>
       </Box>
       {children}
+    </Box>
+  );
+}
+
+/** A section that starts collapsed — used for the secondary detail so the modal isn't a wall of text. */
+function CollapsibleSection({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
+  const [open, setOpen] = React.useState(false);
+  return (
+    <Box mb={1} sx={{ borderTop: `1px solid ${colors.border}`, pt: 1.5 }}>
+      <Box
+        role="button"
+        onClick={() => setOpen((o) => !o)}
+        display="flex" alignItems="center" gap={0.75}
+        sx={{ cursor: "pointer", color: colors.textSecondary, "&:hover": { color: colors.textPrimary } }}
+      >
+        {icon}
+        <Typography variant="caption" fontWeight={700} textTransform="uppercase" letterSpacing="0.06em" flex={1}>
+          {title}
+        </Typography>
+        <KeyboardArrowDownIcon sx={{ fontSize: 18, transform: open ? "rotate(180deg)" : "none", transition: "transform .2s ease" }} />
+      </Box>
+      <Collapse in={open} timeout="auto" unmountOnExit>
+        <Box mt={1.5}>{children}</Box>
+      </Collapse>
     </Box>
   );
 }
@@ -133,6 +158,15 @@ export default function RecommendationDetails({
     !isVm && actual && actual > 0 ? Math.min(100, (finding.estimated_savings_monthly / actual) * 100) : null;
   const showMetrics = hasSupportingMetrics(finding);
 
+  // Conditional (Azure Hybrid Benefit) savings only materialise if the customer already OWNS eligible
+  // licences — so we label the amount "Potential" and put the prerequisite front-and-centre, never
+  // implying the customer gets it automatically.
+  const conditional = isConditionalSaving(finding.category);
+  const d = (finding.details || {}) as Record<string, unknown>;
+  const excludedCount = typeof d.excluded_count === "number" ? d.excluded_count : 0;
+  const eligibleCount = typeof d.eligible_count === "number" ? d.eligible_count : undefined;
+  const partialBilling = d.partial_billing === true;
+
   return (
     <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth scroll="paper"
       PaperProps={{ sx: { borderRadius: 3, borderTop: `4px solid ${accent}` } }}>
@@ -145,13 +179,16 @@ export default function RecommendationDetails({
             <Box display="flex" gap={0.75} mt={1} flexWrap="wrap">
               <AreaTag area={area} />
               <ImpactChip severity={finding.severity} />
+              <AdvisorImpactChip finding={finding} />
             </Box>
           </Box>
           <Box textAlign="right" flexShrink={0}>
             <Typography fontWeight={800} color={SAVINGS_COLOR} sx={{ fontSize: "1.5rem", lineHeight: 1 }}>
               {fmtUSD(finding.estimated_savings_annual)}
             </Typography>
-            <Typography variant="caption" color={colors.textMuted}>per year</Typography>
+            <Typography variant="caption" color={colors.textMuted}>
+              {conditional ? "potential / year" : "per year"}
+            </Typography>
           </Box>
           <IconButton onClick={onClose} size="small" sx={{ color: colors.textMuted }}>
             <CloseIcon fontSize="small" />
@@ -174,42 +211,75 @@ export default function RecommendationDetails({
 
         {/* Financial Impact */}
         <Section icon={<PaidOutlinedIcon fontSize="small" />} title="Financial Impact">
+          {/* Conditional (AHB): the licence prerequisite is impossible to miss — shown BEFORE the number. */}
+          {conditional && (
+            <Box
+              sx={{
+                p: 1.75, mb: 1.5, borderRadius: 2, display: "flex", gap: 1, alignItems: "flex-start",
+                bgcolor: alpha(colors.warning, 0.1), border: `1px solid ${alpha(colors.warning, 0.4)}`,
+              }}
+            >
+              <ReportProblemOutlinedIcon sx={{ fontSize: 18, color: colors.warning, mt: "1px" }} />
+              <Typography variant="body2" color={colors.textPrimary} fontWeight={500}>
+                <b>Requires eligible Windows Server licences.</b> This is a <b>potential</b> saving — you
+                only realise it on VMs covered by Windows Server licences you already own with active
+                Software Assurance (or qualifying subscription licences). You do <b>not</b> receive this
+                amount automatically by enabling Azure Hybrid Benefit.
+              </Typography>
+            </Box>
+          )}
           <Box
             display="flex" gap={{ xs: 3, md: 4 }} flexWrap="wrap" alignItems="flex-end"
             sx={{ p: 2, borderRadius: 2, bgcolor: alpha(SAVINGS_COLOR, 0.06), border: `1px solid ${alpha(SAVINGS_COLOR, 0.22)}` }}
           >
-            <FinStat label="Annual savings" value={fmtUSD(finding.estimated_savings_annual)} accent={SAVINGS_COLOR} big />
-            <FinStat label="Monthly savings" value={fmtUSD(finding.estimated_savings_monthly)} accent={SAVINGS_COLOR} />
+            <FinStat
+              label={conditional ? "Potential annual savings" : "Annual savings"}
+              value={fmtUSD(finding.estimated_savings_annual)} accent={SAVINGS_COLOR} big
+            />
+            <FinStat
+              label={conditional ? "Potential monthly savings" : "Monthly savings"}
+              value={fmtUSD(finding.estimated_savings_monthly)} accent={SAVINGS_COLOR}
+            />
             {actual != null && actual > 0 && <FinStat label="Current resource cost" value={`${fmtUSD(actual)} / mo`} />}
             {costReductionPct != null && <FinStat label="Cost reduction" value={fmtPct(costReductionPct)} />}
             <Box flex={1} />
             <Box alignSelf="center"><ValidationChip finding={finding} /></Box>
           </Box>
+          {conditional && (eligibleCount != null || excludedCount > 0 || partialBilling) && (
+            <Typography variant="caption" color={colors.textMuted} sx={{ display: "block", mt: 1 }}>
+              {eligibleCount != null && (
+                <>Based on <b>{eligibleCount}</b> VM{eligibleCount === 1 ? "" : "s"} with billed cost and a live licence price</>
+              )}
+              {excludedCount > 0 && (
+                <> · <b>{excludedCount}</b> excluded (no billing or no live licence price)</>
+              )}
+              {partialBilling && <> · figures reflect a partial billing period — re-run after a full billing month</>}
+              .
+            </Typography>
+          )}
         </Section>
 
-        {/* Implementation Guidance */}
-        <Section icon={<BuildOutlinedIcon fontSize="small" />} title="Implementation Guidance">
+        {/* Affected Resources — count always visible; the list expands on request */}
+        <AffectedResourcesSection finding={finding} />
+
+        {/* Secondary detail — collapsed by default so the modal stays scannable, not a wall of text */}
+        <CollapsibleSection icon={<BuildOutlinedIcon fontSize="small" />} title="Implementation Guidance">
           <Typography variant="body2" color={colors.textPrimary}>{finding.recommendation || "—"}</Typography>
-        </Section>
+        </CollapsibleSection>
 
-        {/* Prerequisites */}
         {meta.prerequisites && (
-          <Section icon={<RuleOutlinedIcon fontSize="small" />} title="Prerequisites">
+          <CollapsibleSection icon={<RuleOutlinedIcon fontSize="small" />} title="Prerequisites">
             <Box sx={{ p: 1.75, borderRadius: 2, bgcolor: alpha(colors.warning, 0.07), border: `1px solid ${alpha(colors.warning, 0.28)}`, display: "flex", gap: 1, alignItems: "flex-start" }}>
               <ReportProblemOutlinedIcon sx={{ fontSize: 17, color: colors.warning, mt: "1px" }} />
               <Typography variant="body2" color={colors.textSecondary}>{meta.prerequisites}</Typography>
             </Box>
-          </Section>
+          </CollapsibleSection>
         )}
 
-        {/* Affected Resources — collapsed by default */}
-        <AffectedResourcesSection finding={finding} />
-
-        {/* Supporting Metrics */}
         {showMetrics && (
-          <Section icon={<InsightsOutlinedIcon fontSize="small" />} title="Supporting Metrics">
+          <CollapsibleSection icon={<InsightsOutlinedIcon fontSize="small" />} title="Supporting Metrics">
             <FindingEvidence finding={finding} variant="metrics" />
-          </Section>
+          </CollapsibleSection>
         )}
       </DialogContent>
 

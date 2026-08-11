@@ -137,6 +137,8 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
             reservation_basis=settings.reservation_basis,
             cost_consistency=consistency,
             currency=currency,
+            # Absolute ceiling so no single finding can ever exceed the customer's measured spend.
+            measured_monthly_spend=sum(service_costs.values()) if service_costs else None,
         )
         tracker.event("Evaluating reservations, hybrid benefit, right-sizing and waste")
         findings = await _detect_all(
@@ -209,8 +211,9 @@ async def _gather_cost_and_consistency(client: AzureClient, subscription_ids: Li
 async def _gather_reservation_recs(client: AzureClient, subscription_ids: List[str]) -> List[Dict]:
     """Azure's own reservation purchase recommendations, parsed + merged across subscriptions.
 
-    Empty when Cost Management access is unavailable (403/404) or no reservation is worthwhile —
-    the findings engine then falls back to the retail-estimate commitment detector.
+    This is the SOLE, authoritative source of Reserved Instance recommendations (VMs and non-VM alike).
+    Empty when Cost Management access is unavailable (403/404) or no reservation is worthwhile — in
+    which case NO RI recommendation is shown (we never fall back to a retail-estimated discount).
     """
     results = await asyncio.gather(
         *(client.get_reservation_recommendations(s) for s in subscription_ids),
@@ -320,25 +323,18 @@ async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_
                   for f in util_findings if f.get("category") == "idle_vms"}
     delete_ids |= {(vm.get("id") or "").lower()
                    for vm in inventory.get("deallocated_vms", []) if vm.get("id")}
-    # Commitments. Non-VM reserved capacity (SQL/Cosmos/App Service/Files/Disks) comes from Azure's own
-    # reservation engine (real usage + real prices). VMs are handled separately by detect_vm_commitments,
-    # which recommends Reserved Instances for PRODUCTION VMs (Savings Plans removed).
+    # Commitments — Reserved Instances for VMs AND non-VM capacity (SQL/Cosmos/App Service/Files/Disks)
+    # all come from Azure's own reservation-recommendations engine: real usage, real prices, real
+    # eligibility, only reservable SKUs the customer actually uses. We never compute a discount or
+    # recommend a reservation Azure didn't. (The old retail-estimate VM RI detector was retired — the
+    # Retail Prices API doesn't publish reservation prices for most VM SKUs.)
     findings += engine.commitments_from_recommendations(reservation_recs)
-    # VMs still paying the Windows licence (not on AHB) → the RI base must exclude that licence so RI and
-    # AHB savings don't overlap on the same VM.
-    win_ids = {vm["id"].lower() for vm in inventory.get("windows_vms_without_ahb", []) if vm.get("id")}
-    findings += await engine.detect_vm_commitments(running_vms, win_ids)
     # Windows AHB (licence, additive with reservations) — excludes VMs we'd delete (idle/stopped).
     findings += await engine.detect_windows_ahb(
         inventory.get("windows_vms_without_ahb", []), exclude_ids=delete_ids)
-    # SQL Server AHB — same idea for vCore SQL DB/MI; exclude paused/stopped SQL (no billable compute).
-    sql_delete_ids = {(db.get("id") or "").lower()
-                      for db in inventory.get("paused_sql_databases", []) if db.get("id")}
-    sql_delete_ids |= {(mi.get("id") or "").lower()
-                       for mi in inventory.get("stopped_sql_managed_instances", []) if mi.get("id")}
-    findings += await engine.detect_sql_ahb(
-        inventory.get("sql_ahb_eligible", []), exclude_ids=sql_delete_ids)
-    # Broad-coverage rule-driven orphans (snapshots, empty LBs, NAT gw, GRS vaults…).
+    # SQL Server AHB is RETIRED (detect_sql_ahb returns nothing): the SQL licence component can't be
+    # reliably derived from any authoritative Microsoft pricing API, so we don't fabricate a figure.
+    # Broad-coverage rule-driven orphans (snapshots, empty LBs, NAT gateways, Bastion).
     for bucket in ORPHAN_RULES:
         findings += await engine.detect_orphans(bucket, inventory.get(bucket, []))
     findings += engine.advisor_findings(advisor_recs)

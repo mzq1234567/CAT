@@ -12,9 +12,11 @@ Capabilities:
 
 Resilience:
   - Every query result is cached for 24h (configurable).
-  - If the API is unreachable, we serve the last-known-good cached value (`get_stale`).
-  - If there is no cache at all, a small STATIC_FALLBACK table keeps the assessment alive
-    (findings flag reduced confidence when this path is hit — see Step 6).
+  - If the API is unreachable, we serve the last-known-good cached value (`get_stale`) — that is a
+    REAL Azure price, just cached, so it never fabricates a number.
+  - If there is no cache at all, the price is reported as **unavailable** (`None` /
+    PricingUnavailableError). We NEVER substitute a hardcoded/dated estimate: a wrong price on a
+    client deliverable is worse than an unquantified finding (the finding is dropped downstream).
 
 The daily background refresh (`refresh_tracked`) re-fetches every filter currently in the
 cache so warm keys never go stale under normal operation.
@@ -28,13 +30,6 @@ from typing import Dict, List, Optional
 import httpx
 
 from .cache import CacheBackend, InMemoryTTLCache
-from .currency import from_usd
-from .estimates import (
-    APP_SERVICE_PLAN_MONTHLY_USD,
-    BASTION_MONTHLY_USD,
-    LOAD_BALANCER_MONTHLY_USD,
-    NAT_GATEWAY_MONTHLY_USD,
-)
 
 logger = logging.getLogger("cat.pricing")
 
@@ -55,14 +50,6 @@ _DISK_TIER_PREFIX = {
     "premium_lrs": "P", "premium_zrs": "P", "premiumv2_lrs": "P", "premium_v2_lrs": "P",
     "standardssd_lrs": "E", "standardssd_zrs": "E",
     "standard_lrs": "S",
-}
-
-# Last-resort fallback (per-GB/month, USD) used only when both the API and the cache miss.
-# Deliberately conservative; findings that rely on it are marked lower-confidence.
-STATIC_FALLBACK_DISK_PER_GB = {
-    "ultrassd_lrs": 0.125, "premiumv2_lrs": 0.17, "premium_v2_lrs": 0.17,
-    "premium_lrs": 0.135, "standardssd_zrs": 0.096, "standardssd_lrs": 0.075,
-    "standard_lrs": 0.045,
 }
 
 
@@ -260,11 +247,8 @@ class PricingEngine:
             if prices:
                 return round(min(prices), 2)
 
-        # Fallback: per-GB static estimate (USD, lower confidence) → billing currency.
-        per_gb = STATIC_FALLBACK_DISK_PER_GB.get((sku_name or "").lower())
-        if per_gb is not None:
-            logger.info("Using static per-GB fallback for disk sku=%s size=%s", sku_name, size_gb)
-            return from_usd(round(size_gb * per_gb, 2), self._currency)
+        # No live tier price (and no cached one) → report unavailable rather than invent a per-GB
+        # estimate. The caller drops the finding instead of quantifying it from a guess.
         return None
 
     # ── Public IP pricing ──────────────────────────────────────────────────────
@@ -282,8 +266,7 @@ class PricingEngine:
         hourly = [it.get("retailPrice") for it in items if it.get("retailPrice")]
         if hourly:
             return round(min(hourly) * HOURS_PER_MONTH, 2)
-        # Static fallback (USD ≈ $3.65 Standard / $2.88 Basic) → billing currency.
-        return from_usd(3.65 if sku.lower() == "standard" else 2.88, self._currency)
+        return None  # no live/cached price → unavailable, never a hardcoded fallback
 
     # ── Flat-rate resources (Load Balancer / NAT Gateway / Bastion / App Service) ─────
     async def _flat_hourly_monthly(
@@ -315,40 +298,23 @@ class PricingEngine:
             return None
         return round(min(prices) * HOURS_PER_MONTH, 2)
 
-    def _live_or_fallback(self, live: Optional[float], fallback_usd: float) -> float:
-        """Accept a live price only if it's in a sane band around the dated fallback, else use the
-        fallback. The band guards against a wrong meter match (Azure prices don't swing 4x), so a
-        misfetch can never produce a bad number — it degrades to the verified estimate."""
-        fb = from_usd(fallback_usd, self._currency)
-        if live is not None and fb > 0 and 0.25 * fb <= live <= 4 * fb:
-            return live
-        if live is not None and fb > 0:
-            logger.warning("Live price %.2f outside sane band around fallback %.2f; using fallback",
-                           live, fb)
-        return fb if fb > 0 else (live or 0.0)
+    async def get_load_balancer_monthly_price(self, region: str) -> Optional[float]:
+        """Live Standard Load Balancer monthly price, or None if the API/cache has no price."""
+        return await self._flat_hourly_monthly("Load Balancer", region, meter_contains="Rule")
 
-    async def get_load_balancer_monthly_price(self, region: str) -> float:
-        live = await self._flat_hourly_monthly("Load Balancer", region, meter_contains="Rule")
-        return self._live_or_fallback(live, LOAD_BALANCER_MONTHLY_USD)
+    async def get_nat_gateway_monthly_price(self, region: str) -> Optional[float]:
+        return await self._flat_hourly_monthly("NAT Gateway", region, meter_contains="Gateway")
 
-    async def get_nat_gateway_monthly_price(self, region: str) -> float:
-        live = await self._flat_hourly_monthly("NAT Gateway", region, meter_contains="Gateway")
-        return self._live_or_fallback(live, NAT_GATEWAY_MONTHLY_USD)
+    async def get_bastion_monthly_price(self, region: str, sku: str = "Basic") -> Optional[float]:
+        return await self._flat_hourly_monthly("Azure Bastion", region, meter_contains="Gateway")
 
-    async def get_bastion_monthly_price(self, region: str, sku: str = "Basic") -> float:
-        live = await self._flat_hourly_monthly("Azure Bastion", region, meter_contains="Gateway")
-        return self._live_or_fallback(live, BASTION_MONTHLY_USD)
-
-    async def get_app_service_plan_monthly_price(self, region: str, sku: str) -> float:
-        """Monthly App Service Plan price. Retail `skuName` carries a space before v2/v3 (e.g. the
-        Resource Graph 'P1v2' is 'P1 v2' in the price list), so we normalise before matching."""
+    async def get_app_service_plan_monthly_price(self, region: str, sku: str) -> Optional[float]:
+        """Live App Service Plan monthly price, or None if unavailable. Retail `skuName` carries a
+        space before v2/v3 (Resource Graph 'P1v2' is 'P1 v2' in the price list), so normalise first.
+        No hardcoded per-SKU fallback: an unpriced plan yields an unquantified (dropped) finding."""
         norm = (sku or "").strip()
         retail_sku = norm[:-2] + " " + norm[-2:] if norm[-2:].lower() in ("v2", "v3") else norm
-        live = await self._flat_hourly_monthly("Azure App Service", region, sku_equals=retail_sku)
-        fallback = APP_SERVICE_PLAN_MONTHLY_USD.get(norm.lower(), 0.0)
-        if fallback > 0:
-            return self._live_or_fallback(live, fallback)
-        return round(live, 2) if live is not None else 0.0
+        return await self._flat_hourly_monthly("Azure App Service", region, sku_equals=retail_sku)
 
     # ── Maintenance ────────────────────────────────────────────────────────────
 

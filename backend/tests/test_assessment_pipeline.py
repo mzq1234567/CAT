@@ -237,7 +237,11 @@ async def test_pipeline_detects_billing_currency(pipeline_env):
 
 async def test_pipeline_without_cost_access(pipeline_env):
     TestSession, install, seed = pipeline_env
-    # Cost Management denied (no billing access) — findings must still be produced.
+    # Cost Management denied (no billing access). ARG-authoritative, live-retail-priced waste findings
+    # (unattached disk, orphaned IP) are still produced — a flat-rate resource's list price is a fair
+    # proxy for its real cost. But savings that MUST be grounded in per-resource billing to be defensible
+    # — idle/oversized VM right-sizing and Windows AHB — are correctly SUPPRESSED (not fabricated from
+    # list prices that could dwarf actual spend). So 2 findings, not 3.
     install(_composite_handler(cost_status=403))
     aid = seed()
 
@@ -246,7 +250,9 @@ async def test_pipeline_without_cost_access(pipeline_env):
     s = TestSession()
     a = s.get(Assessment, aid)
     assert a.status == "completed"
-    assert a.findings_count == 3                 # savings still found without cost access
+    assert a.findings_count == 2                 # disk + IP (live retail); no ungrounded VM/AHB savings
+    cats = {f.category for f in s.query(Finding).all()}
+    assert "idle_vms" not in cats and "windows_ahb" not in cats  # grounded-only → suppressed
     assert a.total_savings_annual > 0
     assert a.cost_data_available == 0            # but no spend data
     assert a.current_monthly_spend is None

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from app.models.db import Finding
 from app.services import assessment as pipeline
-from app.services import estimates
 from app.services.currency import from_usd
 from app.services.findings import (
     FindingsEngine,
@@ -33,10 +32,23 @@ DEFAULT_SP = {("Standard_D16s_v3", "1 Year"): 450.0, ("Standard_D2s_v3", "1 Year
 DEFAULT_WIN = {"Standard_D2s_v3": 137.24, "Standard_D16s_v3": 900.0}
 
 
+# Live-retail prices the fake engine returns for flat-rate resources (USD; converted to the billing
+# currency like the real engine). These stand in for the Retail Prices API — there are no hardcoded
+# fallbacks in production any more, so the double returns a concrete live price or None.
+_FAKE_FLAT_USD = {"lb": 18.0, "nat": 32.0, "bastion": 138.0}
+_FAKE_ASP_USD = {  # per-SKU live App Service Plan prices used by the ASP tests
+    "b1": 13.14, "b2": 26.28, "b3": 52.56, "s1": 56.94, "s2": 113.88, "s3": 227.76,
+    "p1v2": 73.0, "p2v2": 146.0, "p3v2": 292.0, "p0v3": 37.23, "p1v3": 75.0, "p2v3": 150.0, "p3v3": 300.0,
+}
+
+
 class FakePricing:
     """Deterministic stand-in for PricingEngine (no network). VM price is per-SKU so the engine's
-    'price current vs price target' downsize math can be tested against real deltas."""
-    def __init__(self, disk=19.71, pip=3.65, vm_prices=None, ri=None, sp=None, win=None, currency="USD"):
+    'price current vs price target' downsize math can be tested against real deltas. Flat-rate and disk
+    prices mimic the LIVE Retail Prices API (no hardcoded fallback); pass a value to `flat`/`asp`/`disk`
+    (or set to return None) to simulate the API having no price for a resource."""
+    def __init__(self, disk=19.71, pip=3.65, vm_prices=None, ri=None, sp=None, win=None, currency="USD",
+                 flat=None, asp=None):
         self.disk = disk
         self.pip = pip
         self.vm_prices = dict(DEFAULT_VM_PRICES if vm_prices is None else vm_prices)
@@ -44,6 +56,8 @@ class FakePricing:
         self.sp = dict(DEFAULT_SP if sp is None else sp)
         self.win = dict(DEFAULT_WIN if win is None else win)
         self.currency = currency  # flat-rate methods return in this currency (like the real engine)
+        self.flat = dict(_FAKE_FLAT_USD if flat is None else flat)
+        self.asp = dict(_FAKE_ASP_USD if asp is None else asp)
 
     async def get_managed_disk_monthly_price(self, region, sku, size):
         return self.disk
@@ -51,17 +65,22 @@ class FakePricing:
     async def get_public_ip_monthly_price(self, region, sku="Standard"):
         return self.pip
 
+    def _flat(self, key):
+        usd = self.flat.get(key)
+        return from_usd(usd, self.currency) if usd is not None else None
+
     async def get_load_balancer_monthly_price(self, region):
-        return from_usd(estimates.LOAD_BALANCER_MONTHLY_USD, self.currency)
+        return self._flat("lb")
 
     async def get_nat_gateway_monthly_price(self, region):
-        return from_usd(estimates.NAT_GATEWAY_MONTHLY_USD, self.currency)
+        return self._flat("nat")
 
     async def get_bastion_monthly_price(self, region, sku="Basic"):
-        return from_usd(estimates.BASTION_MONTHLY_USD, self.currency)
+        return self._flat("bastion")
 
     async def get_app_service_plan_monthly_price(self, region, sku):
-        return from_usd(estimates.APP_SERVICE_PLAN_MONTHLY_USD.get((sku or "").lower(), 0.0), self.currency)
+        usd = self.asp.get((sku or "").lower())
+        return from_usd(usd, self.currency) if usd is not None else None
 
     async def get_vm_monthly_price(self, region, sku):
         return self.vm_prices.get(sku)
@@ -96,7 +115,9 @@ def test_severity_from_savings_bands():
     assert severity_from_savings(150) == "high"
     assert severity_from_savings(50) == "medium"
     assert severity_from_savings(5) == "low"
-    assert severity_from_savings(5, advisor_impact="High") == "high"  # impact raises
+    # Severity is savings-only now: a tiny saving stays "low" even if Advisor rates it High, so a small
+    # finding can never outrank a larger one. (Advisor's own rating is shown as a separate UI tag.)
+    assert severity_from_savings(5, advisor_impact="High") == "low"
 
 
 def test_severity_bands_are_currency_normalised():
@@ -144,18 +165,20 @@ async def test_debug_reason_only_when_enabled():
 # ── Utilisation: idle / downsize (peak CPU + peak memory, real target SKU) ──────
 
 async def test_idle_vm_requires_both_signals_low():
-    # Peak CPU 3%, peak memory 6% — both under the idle bars → idle → full-cost saving.
-    engine = FindingsEngine(pricing=FakePricing())
+    # Peak CPU 3%, peak memory 6% — both under the idle bars → idle → saving = VM's actual billed cost.
+    # Grounded-only: the VM must have measured per-resource cost (here $600, ≥ the $560.64 list price so
+    # the saving reads as the full compute price, capped at what it actually costs).
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 600.0})
     f = (await engine.detect_vm_utilisation_findings([_vm(max_cpu=3.0, peak_memory=6.0)]))[0]
     assert f["category"] == "idle_vms"
-    assert f["estimated_savings_monthly"] == 560.64  # full D16s_v3 price
+    assert f["estimated_savings_monthly"] == 560.64  # full D16s_v3 price, ≤ actual cost
 
 
 async def test_spiky_cpu_vm_not_flagged_idle_or_downsized():
     # Real HyperV-Demo case: peak CPU 44% on a D16s_v3. Even D8 can't absorb it (44%*16/8=88%>70%)
     # → no candidate fits → well-utilised, left alone. This is the exact scenario that was
     # wrongly flagged "idle → delete" under the old average-CPU-only logic.
-    engine = FindingsEngine(pricing=FakePricing())
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 600.0})
     findings = await engine.detect_vm_utilisation_findings(
         [_vm(max_cpu=44.0, peak_memory=30.0, avg_cpu=1.2)]
     )
@@ -166,7 +189,7 @@ async def test_high_memory_low_cpu_not_flagged_idle():
     # The "Redis cache" case: peak CPU only 2% (would look idle alone) but peak memory 85% —
     # real work is happening in memory. Must NOT be idle, and must NOT be downsizable either
     # (memory doesn't fit even on the next size down: 85%*64/32 = 170%).
-    engine = FindingsEngine(pricing=FakePricing())
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 600.0})
     findings = await engine.detect_vm_utilisation_findings(
         [_vm(max_cpu=2.0, peak_memory=85.0)]
     )
@@ -176,7 +199,7 @@ async def test_high_memory_low_cpu_not_flagged_idle():
 async def test_downsize_recommends_real_target_sku_and_real_price_delta():
     # Peak CPU 15% (2.4 cores of 16), peak memory 20% (12.8 GB of 64) on a D16s_v3.
     # D8s_v3 fits both (30% CPU, 40% memory); D4s_v3 doesn't (60% CPU, 80% memory) → target = D8s_v3.
-    engine = FindingsEngine(pricing=FakePricing())
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 600.0})
     f = (await engine.detect_vm_utilisation_findings(
         [_vm(max_cpu=15.0, peak_memory=20.0)]
     ))[0]
@@ -195,7 +218,7 @@ async def test_downsize_recommends_real_target_sku_and_real_price_delta():
 
 async def test_no_candidate_fits_is_well_utilised():
     # Peak CPU 55% (8.8 cores) — even D8s_v3 can't absorb it (8.8/8=110%) → no finding.
-    engine = FindingsEngine(pricing=FakePricing())
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 600.0})
     findings = await engine.detect_vm_utilisation_findings(
         [_vm(max_cpu=55.0, peak_memory=60.0)]
     )
@@ -206,7 +229,8 @@ async def test_memory_unavailable_still_allows_cpu_only_downsize_but_lower_confi
     # CPU very low (2%) but memory could NOT be measured. Must NOT be treated as idle (that was
     # exactly the earlier bug) — instead a conservative CPU-only downsize using the ladder, at
     # reduced confidence, with the caveat recorded.
-    engine = FindingsEngine(pricing=FakePricing())
+    engine = FindingsEngine(pricing=FakePricing(),
+                            cost_map={VM_RID.lower(): 600.0, (VM_RID + "-2").lower(): 600.0})
     with_memory = (await engine.detect_vm_utilisation_findings(
         [_vm(max_cpu=2.0, peak_memory=6.0, memory_available=True)]
     ))
@@ -223,7 +247,7 @@ async def test_downsize_skipped_when_target_price_unavailable():
     # Target SKU price can't be fetched → skip rather than guess at savings.
     prices = dict(DEFAULT_VM_PRICES)
     prices["Standard_D8s_v3"] = None
-    engine = FindingsEngine(pricing=FakePricing(vm_prices=prices))
+    engine = FindingsEngine(pricing=FakePricing(vm_prices=prices), cost_map={VM_RID.lower(): 600.0})
     findings = await engine.detect_vm_utilisation_findings(
         [_vm(max_cpu=15.0, peak_memory=20.0)]
     )
@@ -236,65 +260,83 @@ async def test_vm_without_cpu_metrics_is_skipped():
     assert findings == []
 
 
-# ── Commitments: Reserved Instances (production-targeted; Savings Plans removed) ──
-
-def _steady_vm(max_cpu=50.0, peak_memory=40.0, datapoints=30, rid=VM_RID):
-    # Well-utilised (not idle, not downsizable) + full metric coverage → steady.
-    return _vm(max_cpu=max_cpu, peak_memory=peak_memory, datapoints=datapoints, rid=rid)
-
-
-async def test_vm_commitment_recommends_ri_with_all_options():
-    engine = FindingsEngine(pricing=FakePricing())  # D16: payg 560.64, ri1 400, ri3 350
-    findings = await engine.detect_vm_commitments([_steady_vm()])
-    ri = [f for f in findings if f["category"] == "ri_vm"][0]
-    assert ri["resource_id"] is None                       # aggregated → resource-less
-    assert ri["estimated_savings_monthly"] == round(560.64 - 350, 2)  # best case 3yr = 210.64
-    labels = [o["label"] for o in ri["details"]["reservation_options"]]
-    assert labels == ["3-year Reserved Instance", "1-year Reserved Instance"]  # best case first
-    assert ri["details"]["total_1yr_monthly"] == round(560.64 - 400, 2)  # 160.64
-    assert ri["details"]["total_3yr_monthly"] == round(560.64 - 350, 2)  # 210.64
-    assert ri["details"]["item_count"] == 1
-    assert ri["details"]["reservation_items"][0]["sku"] == "Standard_D16s_v3"
-    assert ri["confidence"] >= 0.8
+async def test_vm_rightsizing_requires_per_resource_cost():
+    # GROUNDED-ONLY: without per-resource billed cost we can't cap a list-price delta, so we never emit
+    # an idle/oversized saving that could dwarf actual spend (the ₹318K-against-₹34K case). Empty
+    # cost_map → no VM utilisation findings, even for a clearly oversized VM.
+    engine = FindingsEngine(pricing=FakePricing())  # no cost_map
+    assert await engine.detect_vm_utilisation_findings([_vm(max_cpu=15.0, peak_memory=20.0)]) == []
+    # And an oversized saving is always capped at the VM's actual cost when that's smaller than the delta.
+    partial = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 40.0})  # partial billing
+    f = (await partial.detect_vm_utilisation_findings([_vm(max_cpu=15.0, peak_memory=20.0)]))[0]
+    assert f["estimated_savings_monthly"] == 40.0            # capped at actual, NOT the 280.32 list delta
 
 
-async def test_commitment_skips_idle_vm():
+async def test_no_finding_ever_exceeds_measured_spend():
+    # ABSOLUTE GUARANTEE: even a list-price finding is clamped so it can never exceed the subscription's
+    # total measured monthly spend — savings > spend must never be shown again.
+    engine = FindingsEngine(
+        pricing=FakePricing(),  # no cost_map → orphan LB uses the live retail price (18.0)
+        measured_monthly_spend=5.0,  # tiny measured spend
+    )
+    f = (await engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1", skuName="Standard")]))[0]
+    assert f["estimated_savings_monthly"] == 5.0            # 18.0 live price clamped to measured spend
+    assert f["details"]["savings_capped_at_measured_spend"] is True
+
+
+# ── Commitments: Reserved Instances (authoritative — Azure reservation engine only) ──
+# VM RIs (and every non-VM RI) come SOLELY from Azure's Consumption reservationRecommendations, parsed
+# into groups and turned into findings by commitments_from_recommendations. The old retail-estimate VM
+# detector (detect_vm_commitments) was retired: the Retail Prices API doesn't publish reservation
+# prices for most VM SKUs, so it either fabricated a discount or under-covered. There is no longer any
+# tool-computed RI discount, prod/nonprod guess, or retail RI fallback anywhere in the engine.
+
+def _vm_ri_group(sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=3, region="eastus"):
+    """A parsed VM reservationRecommendation group (what reservations.py produces for virtualmachines)."""
+    terms = {}
+    if p1 is not None:
+        terms["P1Y"] = {"monthly_savings": p1, "monthly_ondemand": 400.0,
+                        "monthly_reserved": round(400.0 - p1, 2), "quantity": qty}
+    if p3 is not None:
+        terms["P3Y"] = {"monthly_savings": p3, "monthly_ondemand": 400.0,
+                        "monthly_reserved": round(400.0 - p3, 2), "quantity": qty}
+    return {"resource_type": "virtualmachines", "category": "ri_vm", "product": "Virtual Machines",
+            "sku": sku, "region": region, "scope": "Single", "flexibility_group": None,
+            "subscription_id": "sub-1", "terms": terms}
+
+
+def test_vm_ri_comes_from_reservation_engine_with_real_numbers():
+    # A VM RI is surfaced ONLY because Azure's engine recommended it — using Azure's own SKU, quantity,
+    # term and net savings. Nothing is computed by the tool.
     engine = FindingsEngine(pricing=FakePricing())
-    # Idle (both signals low) → reserve makes no sense; idle detector handles it.
-    assert await engine.detect_vm_commitments([_vm(max_cpu=2.0, peak_memory=3.0)]) == []
-
-
-async def test_commitment_advisor_wins():
-    recs = [_advisor_rec(VM_RID)]
-    engine = FindingsEngine(pricing=FakePricing(), advisor_index=build_advisor_index(recs))
-    assert await engine.detect_vm_commitments([_steady_vm()]) == []
-
-
-async def test_commitment_skips_dev_test_and_flags_untagged():
-    # RI for production (and unclassifiable-assumed-prod) VMs; dev/test VMs are skipped.
-    engine = FindingsEngine(pricing=FakePricing())
-    prod = _vm(max_cpu=50.0, peak_memory=40.0, rid="/s/p"); prod["tags"] = {"Environment": "Production"}
-    dev = _vm(max_cpu=50.0, peak_memory=40.0, rid="/s/d"); dev["tags"] = {"env": "dev"}
-    untagged = _vm(max_cpu=50.0, peak_memory=40.0, rid="/s/u")  # no tag → assumed production
-    for i, v in enumerate((prod, dev, untagged)):
-        v["name"] = f"vm{i}"
-    f = (await engine.detect_vm_commitments([prod, dev, untagged]))[0]
-    items = {it["name"]: it for it in f["details"]["reservation_items"]}
-    assert "vm1" not in items                        # dev VM skipped entirely
-    assert items["vm0"]["environment"] == "prod"     # tagged production → recommended
-    assert items["vm2"]["environment"] == "unknown"  # untagged → assumed production (flagged)
-
-
-async def test_commitment_combined_unconfirmed_lower_confidence():
-    engine = FindingsEngine(pricing=FakePricing(), reservation_basis="combined")
-    f = (await engine.detect_vm_commitments([_steady_vm(datapoints=5)]))[0]
+    f = engine.commitments_from_recommendations([_vm_ri_group(p1=100.0, p3=160.0, qty=3)])[0]
     assert f["category"] == "ri_vm"
-    assert f["confidence"] < 0.7  # always-on fallback (usage unconfirmed) → lower confidence
+    assert f["resource_id"] is None                       # aggregated → resource-less
+    assert f["estimated_savings_monthly"] == 160.0        # Azure's 3-year net saving, verbatim
+    assert f["details"]["total_1yr_monthly"] == 100.0     # Azure's 1-year net saving, verbatim
+    assert f["details"]["source"] == "azure_reservation_recommendations"
+    assert f["details"]["reservation_items"][0]["quantity"] == 3
+    assert f["confidence"] >= 0.85                         # Azure-computed → high confidence
 
 
-async def test_commitment_advisor_basis_produces_nothing():
-    engine = FindingsEngine(pricing=FakePricing(), reservation_basis="advisor")
-    assert await engine.detect_vm_commitments([_steady_vm()]) == []
+def test_vm_with_no_azure_ri_recommendation_produces_nothing():
+    # Azure returned no VM reservation recommendation → we recommend no RI (never fabricate one),
+    # even for a busy, steadily-running VM.
+    engine = FindingsEngine(pricing=FakePricing())
+    assert engine.commitments_from_recommendations([]) == []
+
+
+def test_vm_ri_dropped_when_azure_reports_no_saving():
+    # A VM group Azure returned but with no positive saving → not surfaced (no fabricated figure).
+    empty = _vm_ri_group(p1=None, p3=None)
+    assert FindingsEngine(pricing=FakePricing()).commitments_from_recommendations([empty]) == []
+
+
+def test_savings_plan_vm_is_not_recommended():
+    # We recommend Reserved Instances, not Savings Plans.
+    sp = _vm_ri_group()
+    sp["category"] = "savings_plan_vm"
+    assert FindingsEngine(pricing=FakePricing()).commitments_from_recommendations([sp]) == []
 
 
 # ── Commitments from Azure's own reservation engine (authoritative) ──────────────
@@ -313,10 +355,13 @@ def _ri_group(category="sql_db_reserved_capacity", sku="SQLDB_GP_Gen5", p1=100.0
             "subscription_id": "sub-1", "terms": terms}
 
 
-def test_recommendations_exclude_vms():
-    # VM reservation recs are NOT surfaced here — VMs go through the production-targeted VM detector.
+def test_recommendations_include_vms_authoritatively():
+    # VM reservation recs ARE surfaced here now — this is the ONLY (authoritative) source of VM RIs.
     engine = FindingsEngine(pricing=FakePricing())
-    assert engine.commitments_from_recommendations([_ri_group(category="ri_vm")]) == []
+    f = engine.commitments_from_recommendations([_ri_group(category="ri_vm", sku="Standard_D2s_v3")])[0]
+    assert f["category"] == "ri_vm"
+    assert f["estimated_savings_monthly"] == 160.0    # Azure's net saving, verbatim
+    assert f["details"]["source"] == "azure_reservation_recommendations"
 
 
 def test_recommendations_build_ri_finding_best_case_3yr():
@@ -366,56 +411,113 @@ def test_recommendations_skip_when_no_positive_saving():
     assert engine.commitments_from_recommendations([empty]) == []
 
 
-async def test_commitment_ri_estimated_when_retail_ri_missing():
-    # A SKU with no Reserved Instance price in retail (ri={}) still gets a Reserved Instance
-    # recommendation using a typical RI discount, clearly flagged estimated (never a Savings Plan).
-    engine = FindingsEngine(pricing=FakePricing(ri={}))  # D16: payg 560.64, no RI retail
-    f = (await engine.detect_vm_commitments([_steady_vm()]))[0]
-    assert f["category"] == "ri_vm"
-    assert f["details"]["ri_price_estimated"] is True
-    # base = payg 560.64 (no cost data); 3yr default discount 0.60 → 336.38.
-    assert f["estimated_savings_monthly"] == round(560.64 * 0.60, 2)
+def test_no_ri_is_ever_computed_from_retail_prices():
+    # Guard: even with full retail VM + reservation prices available, the engine surfaces NO VM RI
+    # unless Azure's reservation engine recommended one. Retail RI pricing is never a source of RIs.
+    engine = FindingsEngine(pricing=FakePricing())  # DEFAULT_RI has retail RI prices for some SKUs
+    # Pass VM inventory nowhere near the reservation path; only reservation recs drive RIs.
+    assert engine.commitments_from_recommendations([]) == []
 
 
-async def test_commitment_burstable_still_gets_ri_estimate():
-    # B-series with no RI retail price still gets an (estimated) Reserved Instance — Savings Plans gone.
-    engine = FindingsEngine(pricing=FakePricing(vm_prices={"Standard_B2ms": 60.0}, ri={}))
-    vm = _vm(max_cpu=50.0, peak_memory=40.0, sku="Standard_B2ms")
-    findings = await engine.detect_vm_commitments([vm])
-    assert {f["category"] for f in findings} == {"ri_vm"}
-    f = findings[0]
-    assert f["details"]["ri_price_estimated"] is True
-    assert f["estimated_savings_monthly"] == round(60.0 * 0.60, 2)  # 36.0
+# ── Windows Azure Hybrid Benefit (grounded, conditional, never fabricated) ───────
+# AHB saving per VM = actual billed cost × (Windows − Linux)/Windows licence fraction, capped at the
+# SKU's list licence premium. A VM with no live licence price OR no measured billing is EXCLUDED (never
+# priced at list). The finding is always conditional on the customer owning the licences.
+
+# Golden retail figures (Azure calculator, US): D16s v3 Windows $1,097.92, Linux $560.64 →
+# licence premium $537.28, licence fraction 0.48936. D2s v3 Windows $137.24, Linux $70.08.
+_AHB_PRICING = FakePricing(
+    vm_prices={"Standard_D2s_v3": 70.08, "Standard_D16s_v3": 560.64},
+    win={"Standard_D2s_v3": 137.24, "Standard_D16s_v3": 1097.92},
+)
+_D16_FRAC = (1097.92 - 560.64) / 1097.92
 
 
-# ── Windows Azure Hybrid Benefit (aggregated into one finding) ───────────────────
-
-async def test_windows_ahb_aggregates_eligible_vms():
-    # Consistent per-vCore prices (33.58/vCore): D2s_v3 (2) → 67.16, D16s_v3 (16) → 537.28.
-    pricing = FakePricing(
-        vm_prices={"Standard_D2s_v3": 70.08, "Standard_D16s_v3": 560.64},
-        win={"Standard_D2s_v3": 137.24, "Standard_D16s_v3": 1097.92},
-    )
-    vms = [
-        _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/vm-a"),
-        _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/vm-b"),
-    ]
-    for i, vm in enumerate(vms):
-        vm["name"] = f"win-{i}"
-    out = await FindingsEngine(pricing=pricing).detect_windows_ahb(vms)
-    assert len(out) == 1                       # ONE classified finding, not one per VM
-    f = out[0]
+async def test_windows_ahb_saving_is_licence_share_of_actual_cost():
+    # TEST 1: Windows VM with a live licence premium AND actual billing → saving = actual × fraction.
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/win": 300.0})
+    f = (await engine.detect_windows_ahb([vm]))[0]
     assert f["category"] == "windows_ahb"
-    assert f["resource_id"] is None            # resource-less → escapes per-resource dedupe
-    assert f["estimated_savings_monthly"] == round(67.16 + 537.28, 2)
+    assert f["resource_id"] is None
+    assert f["estimated_savings_monthly"] == round(300.0 * _D16_FRAC, 2)   # NOT 537.28, NOT 300
+    assert f["estimated_savings_annual"] == round(round(300.0 * _D16_FRAC, 2) * 12, 2)
+    assert f["validation_status"] == "validated"                          # grounded in actual cost
+    d = f["details"]
+    assert d["eligible_count"] == 1 and d["excluded_count"] == 0
+    assert d["conditional"] is True and d["requires_license_ownership"] is True
+    item = d["eligible_vms"][0]
+    assert item["windows_price"] == 1097.92 and item["compute_only_price"] == 560.64
+    assert item["licence_charge"] == 537.28                                # per-VM list premium (ref)
+
+
+async def test_windows_ahb_never_exceeds_spend_on_partial_billing():
+    # TEST 6 + the ₹888K bug: a partial-billing subscription must ground AHB in the SMALL actual spend,
+    # never the full retail licence. Saving here is 5 × fraction ≈ 2.45, never 537.28.
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+    engine = FindingsEngine(
+        pricing=_AHB_PRICING,
+        cost_map={"/s/win": 5.0},                                          # only a few hours billed so far
+        cost_consistency={"/s/win": {"billed_months": 1, "stable": False}},
+    )
+    f = (await engine.detect_windows_ahb([vm]))[0]
+    assert f["estimated_savings_monthly"] == round(5.0 * _D16_FRAC, 2)     # ≈ 2.45, NOT 537.28
+    assert f["estimated_savings_monthly"] <= 5.0                           # can never exceed the bill
+    assert f["details"]["partial_billing"] is True
+    assert "billed SO FAR" in f["description"]
+
+
+async def test_windows_ahb_excludes_vm_with_no_billing_never_fabricates():
+    # TEST 7: no billing data → cannot ground → VM excluded, NO fabricated saving (empty finding).
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/other": 100.0})  # win not billed
+    assert await engine.detect_windows_ahb([vm]) == []
+
+
+async def test_windows_ahb_excludes_vm_with_no_licence_price():
+    # TEST 2 + 8: no live Windows/Linux price for the SKU → can't establish the premium → excluded,
+    # never estimated from a percentage. (win price present but not > linux → no premium.)
+    vm = _vm(max_cpu=40.0, sku="Standard_Zz9", rid="/s/win"); vm["name"] = "win"
+    engine = FindingsEngine(pricing=FakePricing(vm_prices={"Standard_Zz9": 100.0}, win={}),
+                            cost_map={"/s/win": 300.0})
+    assert await engine.detect_windows_ahb([vm]) == []
+
+
+async def test_windows_ahb_reports_excluded_counts():
+    # A mixed fleet: one groundable VM + one with no billing + one with no price → total reconciles to
+    # the single eligible VM, and the excluded VMs are surfaced (not silently dropped, not counted).
+    ok = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/ok"); ok["name"] = "ok"
+    nobill = _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/nobill"); nobill["name"] = "nobill"
+    noprice = _vm(max_cpu=40.0, sku="Standard_Zz9", rid="/s/noprice"); noprice["name"] = "noprice"
+    engine = FindingsEngine(
+        pricing=FakePricing(vm_prices={"Standard_D2s_v3": 70.08, "Standard_D16s_v3": 560.64,
+                                       "Standard_Zz9": 100.0},
+                            win={"Standard_D2s_v3": 137.24, "Standard_D16s_v3": 1097.92}),
+        cost_map={"/s/ok": 300.0})  # nobill & noprice absent / unpriced
+    f = (await engine.detect_windows_ahb([ok, nobill, noprice]))[0]
+    assert [v["name"] for v in f["details"]["eligible_vms"]] == ["ok"]
+    assert f["estimated_savings_monthly"] == round(300.0 * _D16_FRAC, 2)
+    assert f["details"]["excluded_count"] == 2
+    assert f["details"]["excluded_no_billing"] == 1
+    assert f["details"]["excluded_no_pricing"] == 1
+
+
+async def test_windows_ahb_aggregate_equals_sum_of_vm_level():
+    # TEST 5: aggregate saving == sum of the validated per-VM savings.
+    vms = [_vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/a"),
+           _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/b")]
+    vms[0]["name"], vms[1]["name"] = "win-a", "win-b"
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/a": 100.0, "/s/b": 400.0})
+    f = (await engine.detect_windows_ahb(vms))[0]
+    per_vm = [v["monthly_savings"] for v in f["details"]["eligible_vms"]]
+    assert f["estimated_savings_monthly"] == round(sum(per_vm), 2)
     assert f["details"]["eligible_count"] == 2
 
 
 async def test_windows_ahb_uses_each_vms_own_licence_delta_per_family():
     # The Windows Server licence is NOT uniform per vCore across families: a B-series (burstable) VM
-    # carries a far lower licence per vCore than a D-series one (verified against Azure retail — B2ms
-    # ~₹276/vCore vs D-series ~₹3,170/vCore). Each VM must use its OWN (Windows − Linux) delta; using a
-    # fleet average would inflate the B-series ~11× (the real bug this replaced).
+    # carries a far lower licence per vCore than a D-series one. Each VM uses its OWN (Windows − Linux)
+    # delta; a fleet average would inflate the B-series ~11× (a real bug this guards against).
     pricing = FakePricing(
         vm_prices={"Standard_D4s_v3": 158.76, "Standard_B2ms": 60.0},
         win={"Standard_D4s_v3": 311.00,   # licence 152.24 → 38.06/vCore (D-series, high)
@@ -423,17 +525,24 @@ async def test_windows_ahb_uses_each_vms_own_licence_delta_per_family():
     )
     vms = []
     for i, sku in enumerate(("Standard_D4s_v3", "Standard_B2ms")):
-        vm = _vm(max_cpu=40.0, sku=sku, rid=f"/s/vm-{i}")
-        vm["name"] = f"win-{i}"
+        vm = _vm(max_cpu=40.0, sku=sku, rid=f"/s/vm-{i}"); vm["name"] = f"win-{i}"
         vms.append(vm)
-    out = await FindingsEngine(pricing=pricing).detect_windows_ahb(vms)
+    engine = FindingsEngine(pricing=pricing, cost_map={"/s/vm-0": 500.0, "/s/vm-1": 500.0})
+    out = await engine.detect_windows_ahb(vms)
     items = {v["name"]: v for v in out[0]["details"]["eligible_vms"]}
-    # Each VM keeps its OWN delta — the B-series is NOT bumped up to the D-series rate.
-    assert items["win-0"]["licence_charge"] == 152.24        # D4s_v3
+    assert items["win-0"]["licence_charge"] == 152.24        # D4s_v3 (per-VM list premium)
     assert items["win-1"]["licence_charge"] == 6.60          # B2ms stays low
-    # The per-vCore licences genuinely differ across families.
     assert round(items["win-0"]["licence_charge"] / items["win-0"]["vcpu"], 2) == 38.06
     assert round(items["win-1"]["licence_charge"] / items["win-1"]["vcpu"], 2) == 3.30
+
+
+async def test_windows_ahb_linux_vm_never_included():
+    # TEST 4: a VM with no Windows licence premium (Windows price == Linux price) → excluded, never AHB.
+    vm = _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/lin"); vm["name"] = "lin"
+    engine = FindingsEngine(
+        pricing=FakePricing(vm_prices={"Standard_D2s_v3": 70.08}, win={"Standard_D2s_v3": 70.08}),
+        cost_map={"/s/lin": 300.0})
+    assert await engine.detect_windows_ahb([vm]) == []
 
 
 async def test_windows_ahb_empty_when_no_eligible_vms():
@@ -442,88 +551,21 @@ async def test_windows_ahb_empty_when_no_eligible_vms():
 
 
 async def test_grounded_aggregate_reads_as_validated_not_estimate():
-    # An AHB/commitment finding derived from ACTUAL cost must show as cost-validated — not the
-    # "estimate / upper bound" badge (which is exactly backwards for a grounded number).
+    # A grounded AHB/commitment finding must read as cost-validated — not an estimate badge.
     vm = _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid=VM_RID); vm["name"] = "win"
-    grounded_ahb = (await FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 100.0})
+    grounded_ahb = (await FindingsEngine(pricing=_AHB_PRICING, cost_map={VM_RID.lower(): 100.0})
                     .detect_windows_ahb([vm]))[0]
     assert grounded_ahb["validation_status"] == "validated"
-    ri = [f for f in await FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 80.0})
-          .detect_vm_commitments([_steady_vm()]) if f["category"] == "ri_vm"][0]
+    # An RI finding from Azure's engine is grounded (real usage at real prices) → validated.
+    ri = FindingsEngine(pricing=FakePricing()).commitments_from_recommendations([_vm_ri_group()])[0]
     assert ri["validation_status"] == "validated"
-    # Without billing data it's a genuine list-price estimate → NOT validated.
-    ungrounded = (await FindingsEngine(pricing=FakePricing()).detect_windows_ahb([vm]))[0]
-    assert ungrounded["validation_status"] in (None, "unvalidated")
-
-
-async def test_ahb_matches_azure_calculator_to_the_dollar():
-    # GOLDEN: Azure pricing calculator, D16s v3 (US) — Windows (licence incl.) $1,097.92/mo,
-    # compute-only (Linux) $560.64/mo. AHB removes the licence = $537.28/mo = $6,447.36/yr.
-    pricing = FakePricing(vm_prices={"Standard_D16s_v3": 560.64}, win={"Standard_D16s_v3": 1097.92})
-    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
-
-    # No billing → list-price (full-time) basis == what the calculator shows.
-    f = (await FindingsEngine(pricing=pricing).detect_windows_ahb([vm]))[0]
-    assert f["estimated_savings_monthly"] == 537.28
-    assert f["estimated_savings_annual"] == round(537.28 * 12, 2)   # 6,447.36
-    item = f["details"]["eligible_vms"][0]
-    assert item["windows_price"] == 1097.92 and item["compute_only_price"] == 560.64
-    assert item["licence_charge"] == 537.28
-
-    # Grounded: if the VM actually bills $300/mo, AHB = $300 x (537.28/1097.92).
-    frac = (1097.92 - 560.64) / 1097.92
-    grounded = FindingsEngine(pricing=pricing, cost_map={"/s/win": 300.0})
-    fg = (await grounded.detect_windows_ahb([vm]))[0]
-    assert fg["estimated_savings_monthly"] == round(300.0 * frac, 2)
-
-
-async def test_ahb_partial_billing_window_prices_at_run_rate():
-    # CRA-VM scenario: a 24×7 Windows VM whose subscription was migrated mid-month, so it has billed
-    # only ONE (partial) month. Grounding on that fragment understates the licence ~100×, so the tool
-    # must price at the full-month run-rate (the licence itself), flagged as an estimate.
-    pricing = FakePricing(vm_prices={"Standard_D16s_v3": 560.64}, win={"Standard_D16s_v3": 1097.92})
-    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
-
-    partial = FindingsEngine(
-        pricing=pricing,
-        cost_map={"/s/win": 5.0},                                    # only a few hours billed so far
-        cost_consistency={"/s/win": {"billed_months": 1, "stable": False}},
-    )
-    f = (await partial.detect_windows_ahb([vm]))[0]
-    assert f["estimated_savings_monthly"] == 537.28                  # run-rate licence, NOT 5.0 × frac
-    assert f["details"]["run_rate_estimated_count"] == 1
-    assert "run-rate" in f["description"]
-
-    # Once a complete month exists (billed_months ≥ 2) it grounds on the real bill again.
-    complete = FindingsEngine(
-        pricing=pricing, cost_map={"/s/win": 300.0},
-        cost_consistency={"/s/win": {"billed_months": 3, "stable": True}},
-    )
-    fc = (await complete.detect_windows_ahb([vm]))[0]
-    frac = (1097.92 - 560.64) / 1097.92
-    assert fc["estimated_savings_monthly"] == round(300.0 * frac, 2)
-    assert fc["details"]["run_rate_estimated_count"] == 0
-
-
-async def test_ri_partial_billing_window_prices_at_run_rate():
-    # Same migration scenario for Reserved Instances: a prod VM billed only a partial month must be
-    # reserved off its compute RUN-RATE, not the tiny fragment, so a 24×7 VM isn't under-reserved.
-    partial = FindingsEngine(
-        pricing=FakePricing(),                                       # D16: payg 560.64, ri3 350
-        cost_map={VM_RID.lower(): 4.0},                              # partial fragment
-        cost_consistency={VM_RID.lower(): {"billed_months": 1, "stable": False}},
-    )
-    ri = [f for f in await partial.detect_vm_commitments([_steady_vm()]) if f["category"] == "ri_vm"][0]
-    assert ri["estimated_savings_monthly"] == round(560.64 - 350, 2)  # run-rate base → 210.64, not 4×
-    assert "run-rate" in ri["description"]
 
 
 async def test_windows_ahb_excludes_deleted_vms():
-    # A Windows VM already recommended for deletion (idle) must NOT also earn an AHB licence saving —
-    # otherwise its cost is double-counted (delete = full cost, AHB = licence, on the same VM).
+    # A Windows VM already recommended for deletion (idle) must NOT also earn an AHB licence saving.
     keep = _vm(max_cpu=40.0, sku="Standard_D2s_v3", rid="/s/keep"); keep["name"] = "keep"
     dele = _vm(max_cpu=2.0, sku="Standard_D16s_v3", rid="/s/idle"); dele["name"] = "idle"
-    engine = FindingsEngine(pricing=FakePricing())  # no cost_map → retail path, both otherwise eligible
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/keep": 100.0, "/s/idle": 400.0})
     out = await engine.detect_windows_ahb([keep, dele], exclude_ids={"/s/idle"})
     assert [v["name"] for v in out[0]["details"]["eligible_vms"]] == ["keep"]
 
@@ -554,6 +596,33 @@ def test_deallocated_vm_is_zero_without_cost_data():
           "osDiskId": "/s/disk", "dataDisks": []}
     f = FindingsEngine(pricing=FakePricing()).detect_deallocated_vms([vm])[0]
     assert f["estimated_savings_monthly"] == 0.0
+
+
+def test_paused_sql_db_grounds_in_actual_cost():
+    # A paused SQL DB's saving is its ACTUAL billed (storage) cost — not $0, not a guess.
+    rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={rid.lower(): 45.0})
+    f = engine.detect_paused_sql_databases([{"id": rid, "name": "db1", "status": "Paused"}])[0]
+    assert f["category"] == "paused_sql_databases"
+    assert f["estimated_savings_monthly"] == 45.0
+    assert f["validation_status"] == "validated"
+
+
+def test_paused_sql_db_without_cost_is_zero_and_dropped():
+    # No billed cost → 0 (dropped by the pipeline zero-filter) rather than a fabricated $0 opportunity.
+    rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
+    f = FindingsEngine(pricing=FakePricing()).detect_paused_sql_databases(
+        [{"id": rid, "name": "db1", "status": "Paused"}])[0]
+    assert f["estimated_savings_monthly"] == 0.0
+
+
+def test_stopped_sql_mi_grounds_in_actual_cost():
+    rid = "/subscriptions/s/rg/providers/microsoft.sql/managedinstances/mi1"
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={rid.lower(): 1200.0})
+    f = engine.detect_stopped_sql_managed_instances([{"id": rid, "name": "mi1", "state": "Stopped"}])[0]
+    assert f["category"] == "stopped_sql_managed_instances"
+    assert f["estimated_savings_monthly"] == 1200.0
+    assert f["validation_status"] == "validated"
 
 
 def test_asp_downsize_target_respects_headroom():
@@ -711,53 +780,22 @@ async def test_windows_ahb_skips_non_billing_vms():
     assert out[0]["details"]["eligible_count"] == 1
 
 
-async def test_commitment_skips_non_billing_vm():
-    # A steadily-"running" VM with no measured cost yields no real reservation saving → excluded.
-    engine = FindingsEngine(pricing=FakePricing(), cost_map={"/s/other": 100.0})
-    vm = _steady_vm(rid="/s/vm-demo")  # not in cost_map
-    assert await engine.detect_vm_commitments([vm]) == []
-
-
-async def test_windows_ahb_falls_back_to_retail_delta_without_cost():
+async def test_windows_ahb_excluded_entirely_without_any_billing():
+    # With NO billing data at all, AHB cannot be grounded → the finding is empty. We never fall back to
+    # the raw retail licence delta (that was the source of the ₹888K-against-₹44K-spend bug).
     vm = _vm(max_cpu=40.0, sku="Standard_D2s_v3")
     engine = FindingsEngine(pricing=FakePricing())  # no cost_map
-    f = (await engine.detect_windows_ahb([vm]))[0]
-    assert f["estimated_savings_monthly"] == round(137.24 - 70.08, 2)  # raw retail fallback
-    assert f["details"]["eligible_vms"][0]["actual_cost_based"] is False
+    assert await engine.detect_windows_ahb([vm]) == []
 
 
-async def test_commitment_grounds_as_fraction_of_actual_cost():
-    # A commitment saves the DISCOUNT %, not the whole cost. D16 actually costs $80/mo (Linux VM →
-    # full cost is compute), 3yr RI discount = (560.64−350)/560.64 = 0.3757 → best case 80×0.3757.
-    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 80.0})
-    ri = [f for f in await engine.detect_vm_commitments([_steady_vm()]) if f["category"] == "ri_vm"][0]
-    ratio_3yr = (560.64 - 350) / 560.64
-    ratio_1yr = (560.64 - 400) / 560.64
-    assert ri["estimated_savings_monthly"] == round(80.0 * ratio_3yr, 2)   # 30.06, not 80
-    assert ri["details"]["total_1yr_monthly"] == round(80.0 * ratio_1yr, 2)  # 22.92 — 1yr ≠ 3yr
-    assert ri["details"]["total_1yr_monthly"] != ri["details"]["total_3yr_monthly"]
-
-
-async def test_commitment_strips_windows_licence_from_base():
-    # For a Windows VM not on AHB, the RI/SP discount applies to the COMPUTE portion only (Linux/
-    # Windows fraction), so it doesn't overlap the separate AHB licence saving on the same VM.
-    vm = _steady_vm(rid="/s/winvm")
-    vm["vmSize"] = "Standard_D2s_v3"
-    engine = FindingsEngine(pricing=FakePricing(), cost_map={"/s/winvm": 200.0})
-    as_linux = (await engine.detect_vm_commitments([vm], set()))[0]["estimated_savings_monthly"]
-    as_windows = (await engine.detect_vm_commitments([vm], {"/s/winvm"}))[0]["estimated_savings_monthly"]
-    frac = 70.08 / 137.24  # Linux / Windows retail
-    assert as_windows < as_linux
-    assert abs(as_windows - as_linux * frac) < 0.1  # licence stripped from the base
-
-
-async def test_backup_redundancy_rule():
+async def test_geo_redundant_vault_produces_no_fabricated_saving():
+    # RETIRED: the GRS→LRS backup-redundancy saving can't be isolated from the vault's total bill
+    # without an assumption, and Resource Graph doesn't expose backup volume — so no dollar figure is
+    # produced (the bucket is no longer a rule).
     engine = FindingsEngine(pricing=FakePricing())
-    f = (await engine.detect_orphans("geo_redundant_vaults", [
+    assert await engine.detect_orphans("geo_redundant_vaults", [
         {"id": "/s/vault-1", "name": "vault-1", "subscriptionId": "sub-1", "resourceGroup": "rg-a"},
-    ]))[0]
-    assert f["category"] == "backup_redundancy"
-    assert f["estimated_savings_monthly"] == 25.0
+    ]) == []
 
 
 # ── Broad-coverage orphan/waste (rule-driven) ────────────────────────────────────
@@ -767,25 +805,48 @@ def _row(rid, **extra):
             "location": "eastus", **extra}
 
 
-async def test_orphan_snapshot_priced_by_size():
-    engine = FindingsEngine(pricing=FakePricing())
+async def test_orphan_snapshot_grounded_in_actual_cost():
+    # Snapshots are quantified ONLY from their actual Cost Management billed cost (they bill on
+    # incremental used storage, not provisioned size) — never a per-GB estimate.
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={"/s/snap-1": 7.40})
     f = (await engine.detect_orphans("orphaned_snapshots", [_row("/s/snap-1", diskSizeGB=200)]))[0]
     assert f["category"] == "orphaned_snapshots"
-    assert f["estimated_savings_monthly"] == round(200 * 0.05, 2)  # 10.0
+    assert f["estimated_savings_monthly"] == 7.40           # the real bill, not 200 × per-GB
+    assert f["validation_status"] == "validated"            # grounded in actual cost
 
 
-async def test_empty_load_balancer_fixed_estimate():
+async def test_orphan_snapshot_without_cost_data_is_dropped():
+    # No actual cost → no fabricated per-GB estimate → the row is skipped entirely.
+    engine = FindingsEngine(pricing=FakePricing())          # empty cost_map
+    assert await engine.detect_orphans("orphaned_snapshots", [_row("/s/snap-1", diskSizeGB=200)]) == []
+
+
+async def test_empty_load_balancer_priced_live():
     engine = FindingsEngine(pricing=FakePricing())
     f = (await engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1", skuName="Standard")]))[0]
     assert f["category"] == "empty_load_balancers"
-    assert f["estimated_savings_monthly"] == 18.0
+    assert f["estimated_savings_monthly"] == 18.0           # live Retail Prices rate
 
 
-async def test_idle_nat_gateway_fixed_estimate():
+async def test_idle_nat_gateway_priced_live():
     engine = FindingsEngine(pricing=FakePricing())
     f = (await engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")]))[0]
     assert f["category"] == "idle_nat_gateways"
-    assert f["estimated_savings_monthly"] == 32.0
+    assert f["estimated_savings_monthly"] == 32.0           # live Retail Prices rate
+
+
+async def test_flat_orphan_dropped_when_no_live_price():
+    # No live retail price and no actual cost → don't quantify (finding dropped), never a fallback.
+    engine = FindingsEngine(pricing=FakePricing(flat={}))   # get_*_monthly_price → None
+    assert await engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1")]) == []
+
+
+async def test_flat_orphan_prefers_actual_cost_over_live():
+    # When Cost Management has the resource's real cost, that grounds the saving (and caps the live rate).
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={"/s/nat-1": 12.0})
+    f = (await engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")]))[0]
+    assert f["estimated_savings_monthly"] == 12.0           # actual billed cost, not the 32.0 live rate
+    assert f["validation_status"] == "validated"
 
 
 async def test_orphan_finding_keys_match_model():
@@ -825,44 +886,21 @@ async def test_advisor_finding_and_correlation_index():
     assert f["severity"] == "high"  # 120/mo is the 100–300 "high" band
 
 
-async def test_sql_ahb_grounds_on_vcores_capped_at_actual_cost():
-    from app.services.findings import SQL_AHB_LICENCE_PER_VCORE_MONTHLY_USD as PVC
+async def test_sql_ahb_is_retired_never_fabricates_a_saving():
+    # SQL AHB is RETIRED: the SQL licence component can't be reliably derived from any Microsoft
+    # pricing API (the Retail Prices API exposes only ONE compute price per vCore, no separate
+    # base/AHB meter), so we surface NO SQL AHB figure — even with full cost data available.
     db_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
     mi_rid = "/subscriptions/s/rg/providers/microsoft.sql/managedinstances/mi1"
-    tiny_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/tiny"
-    # db: 8 vCores × 112 = 896 < 2000 actual → 896. mi: 16 × 112 = 1792 < 5000 → 1792.
-    # tiny: 4 × 112 = 448 but actual only 100 → capped to 100 (can't save more than you pay).
-    cost_map = {db_rid.lower(): 2000.0, mi_rid.lower(): 5000.0, tiny_rid.lower(): 100.0}
+    cost_map = {db_rid.lower(): 2000.0, mi_rid.lower(): 5000.0}
     engine = FindingsEngine(pricing=FakePricing(), cost_map=cost_map)
     resources = [
         {"id": db_rid, "name": "db1", "subscriptionId": "s", "location": "eastus",
          "skuName": "GP_Gen5", "tier": "GeneralPurpose", "vcores": 8},
         {"id": mi_rid, "name": "mi1", "subscriptionId": "s", "location": "eastus",
          "skuName": "GP_Gen5", "tier": "GeneralPurpose", "vcores": 16},
-        {"id": tiny_rid, "name": "tiny", "subscriptionId": "s", "location": "eastus",
-         "skuName": "GP_Gen5", "tier": "GeneralPurpose", "vcores": 4},
     ]
-    out = await engine.detect_sql_ahb(resources)
-    assert len(out) == 1
-    f = out[0]
-    assert f["category"] == "sql_ahb"
-    assert f["details"]["eligible_count"] == 3
-    assert f["details"]["licence_kind"] == "SQL Server"
-    assert f["estimated_savings_monthly"] == round(8 * PVC + 16 * PVC + 100.0, 2)
-    assert f["validation_status"] == "validated"  # every one grounded in actual cost
-
-
-async def test_sql_ahb_skips_non_billing_and_excluded():
-    db_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/db1"
-    dead_rid = "/subscriptions/s/rg/providers/microsoft.sql/servers/srv/databases/dead"
-    engine = FindingsEngine(pricing=FakePricing(), cost_map={db_rid.lower(): 2000.0})
-    resources = [
-        {"id": db_rid, "name": "db1", "vcores": 8, "skuName": "GP_Gen5", "location": "eastus"},
-        {"id": dead_rid, "name": "dead", "vcores": 8, "skuName": "GP_Gen5", "location": "eastus"},
-    ]
-    # dead has no measured cost → skipped; db1 is excluded (e.g. paused) → nothing left.
-    out = await engine.detect_sql_ahb(resources, exclude_ids={db_rid.lower()})
-    assert out == []
+    assert await engine.detect_sql_ahb(resources) == []
 
 
 async def test_zero_savings_findings_are_filtered_from_pipeline():

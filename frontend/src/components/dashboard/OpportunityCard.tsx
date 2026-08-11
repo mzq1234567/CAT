@@ -4,11 +4,30 @@ import ArrowForwardIcon from "@mui/icons-material/ArrowForward";
 import DnsOutlinedIcon from "@mui/icons-material/DnsOutlined";
 import { colors } from "../../theme";
 import type { Finding } from "../../types";
-import { areaForCategory } from "./area";
+import LockOutlinedIcon from "@mui/icons-material/LockOutlined";
+import { areaForCategory, isConditionalSaving } from "./area";
 import { AREA_ICON } from "./areaIcons";
 import { affectedResources, affectedLabel, metaFor } from "./categoryMeta";
-import { AreaTag, ImpactChip } from "./badges";
+import { AreaTag, ImpactChip, AdvisorImpactChip } from "./badges";
 import { AREA_ACCENT, SAVINGS_COLOR, fmtCompact, fmtUSD } from "./tokens";
+
+/** A compact "conditional saving" chip for Azure Hybrid Benefit — makes the licence prerequisite
+ *  visible on the card itself, so a large AHB number never reads as guaranteed. */
+function RequiresLicenceChip() {
+  return (
+    <Chip
+      size="small"
+      icon={<LockOutlinedIcon sx={{ fontSize: 13 }} />}
+      label="Requires licences"
+      sx={{
+        height: 20, fontSize: 11, fontWeight: 700,
+        bgcolor: alpha(colors.warning, 0.14), color: colors.warning,
+        border: `1px solid ${alpha(colors.warning, 0.34)}`,
+        "& .MuiChip-icon": { color: colors.warning },
+      }}
+    />
+  );
+}
 
 function clamp(lines: number) {
   return { display: "-webkit-box", WebkitLineClamp: lines, WebkitBoxOrient: "vertical" as const, overflow: "hidden" };
@@ -26,7 +45,12 @@ export default function OpportunityCard({
   const area = areaForCategory(finding.category);
   const accent = AREA_ACCENT[area];
   const meta = metaFor(finding.category);
-  const summary = meta.summary(Math.max(affectedResources(finding).count, 1));
+  const conditional = isConditionalSaving(finding.category);
+  // Advisor findings carry a specific, real recommendation — show that, not the generic category blurb.
+  const summary =
+    finding.category === "advisor_cost"
+      ? finding.recommendation || meta.summary(Math.max(affectedResources(finding).count, 1))
+      : meta.summary(Math.max(affectedResources(finding).count, 1));
 
   const AffectedChip = (
     <Chip
@@ -58,6 +82,8 @@ export default function OpportunityCard({
             </Box>
             <AreaTag area={area} />
             <ImpactChip severity={finding.severity} />
+            <AdvisorImpactChip finding={finding} />
+            {conditional && <RequiresLicenceChip />}
           </Box>
 
           <Typography variant="h6" fontWeight={800} color={colors.textPrimary} mb={0.75}>
@@ -73,7 +99,7 @@ export default function OpportunityCard({
                 {fmtCompact(finding.estimated_savings_annual)}
               </Typography>
               <Typography variant="caption" color={colors.textMuted}>
-                per year · {fmtUSD(finding.estimated_savings_monthly)} / mo
+                {conditional ? "potential / year" : "per year"} · {fmtUSD(finding.estimated_savings_monthly)} / mo
               </Typography>
             </Box>
             <Button variant="contained" onClick={onViewDetails} endIcon={<ArrowForwardIcon />} sx={{ flexShrink: 0 }}>
@@ -101,6 +127,8 @@ export default function OpportunityCard({
         <Box display="flex" gap={0.75} mb={1} flexWrap="wrap">
           <AreaTag area={area} />
           <ImpactChip severity={finding.severity} />
+          <AdvisorImpactChip finding={finding} />
+          {conditional && <RequiresLicenceChip />}
         </Box>
         <Typography variant="subtitle1" fontWeight={700} color={colors.textPrimary} sx={{ ...clamp(1) }}>
           {finding.display_name}
@@ -115,7 +143,7 @@ export default function OpportunityCard({
               {fmtCompact(finding.estimated_savings_annual)}
             </Typography>
             <Typography variant="caption" color={colors.textMuted}>
-              per year
+              {conditional ? "potential / year" : "per year"}
             </Typography>
           </Box>
           <Button size="small" onClick={onViewDetails} endIcon={<ArrowForwardIcon sx={{ fontSize: 16 }} />} sx={{ textTransform: "none", color: colors.accentBlue, flexShrink: 0 }}>

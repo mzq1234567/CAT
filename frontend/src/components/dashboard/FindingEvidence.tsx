@@ -46,7 +46,6 @@ interface EvidenceDetails {
   downsize_ceiling_pct?: number;
   // commitments (RI / Savings Plan)
   payg_monthly?: number;
-  ri_price_estimated?: boolean;
   reservation_options?: ReservationOption[];
   // authoritative reservation recs (Azure Consumption engine)
   source?: string;
@@ -61,6 +60,10 @@ interface EvidenceDetails {
   eligible_vms?: EligibleVm[];
   eligible_count?: number;
   licence_kind?: string; // "Windows Server" (default) | "SQL Server"
+  excluded_count?: number;
+  excluded_no_billing?: number;
+  excluded_no_pricing?: number;
+  partial_billing?: boolean;
 }
 
 /** Does this finding have chart-worthy evidence (meters / resize / cost-impact / commitment modelling)?
@@ -144,7 +147,7 @@ function CommitmentPanel({
   return (
     <Panel>
       <Heading icon={<SavingsOutlinedIcon fontSize="small" />}>
-        Commitment options{d.ri_price_estimated ? " (RI est.)" : ""}
+        Commitment options
       </Heading>
 
       {d.source === "azure_reservation_recommendations" && (
@@ -225,13 +228,6 @@ function CommitmentPanel({
             );
           })}
         </Box>
-      )}
-
-      {d.ri_price_estimated && (
-        <Typography variant="caption" color={colors.textMuted} mt={1} display="block">
-          Reserved Instance price estimated from Azure's typical VM discount (retail reservation
-          price wasn't published for this SKU/region). Treat as indicative.
-        </Typography>
       )}
 
       {/* Per-SKU breakdown — reflects the selected term above. No separate toggle. */}
@@ -446,7 +442,14 @@ export default function FindingEvidence({
             )}
           </Box>
           <Typography variant="caption" color={colors.textMuted} mt={1} display="block">
-            Savings assume you hold eligible {ahbLicence} licences with Software Assurance to apply.
+            Potential savings — you realise them only on VMs covered by eligible {ahbLicence} licences you
+            already own (with active Software Assurance or qualifying subscription licences), applied to
+            each VM's actual billed cost.
+            {(d.excluded_count ?? 0) > 0 && (
+              <> {d.excluded_count} additional {ahbNoun}{(d.excluded_count ?? 0) !== 1 ? "s" : ""} could
+              not be quantified (no billing data or no live licence price) and are excluded from the total.</>
+            )}
+            {d.partial_billing && <> Figures reflect a partial billing period — re-run after a full billing month.</>}
           </Typography>
         </Panel>
       )}

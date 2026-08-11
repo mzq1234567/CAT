@@ -21,9 +21,13 @@ genuinely offers for each resource.
 Every resource type in the subscription (not just VMs), each a **single classified finding**, grounded
 and quantified:
 
-- **Reserved Instances (1yr & 3yr)** and **Savings Plans (1yr & 3yr)** — from Azure's own usage-based
-  reservation engine (or a real-retail fallback). A VM goes into *either* RI *or* SP, never both.
-- **Azure Hybrid Benefit** — Windows Server AHB (VMs) and SQL Server AHB (vCore SQL DB/MI).
+- **Reserved Instances (1yr & 3yr)** — recommended for **production** VMs (a provisioned prod VM is
+  almost always long-lived); **dev/test/staging are skipped**, and untagged VMs are **assumed production
+  and flagged**. VM RIs are grounded in each VM's real compute cost; Azure's own usage-based reservation
+  engine covers **non-VM** reserved capacity (SQL, Cosmos, App Service, Disks, …). *(Savings Plans were
+  removed — a VM gets an RI or nothing.)*
+- **Azure Hybrid Benefit** — Windows Server AHB (VMs) and SQL Server AHB (vCore SQL DB/MI). Counted in the
+  headline savings, with an info note that savings may include AHB where applicable.
 - **Right-sizing** (metric-driven, conservative, grounded): VMs, App Service Plans, SQL Databases, SQL
   Managed Instances, and **disk Premium → Standard SSD** (disks on SQL VMs excluded — SQL needs Premium
   latency even at low IOPS).
@@ -32,9 +36,12 @@ and quantified:
   vaults, idle App Service Plans, paused SQL DBs, stopped SQL MIs, Bastion review.
 - **Azure Advisor** cost recommendations, re-scored and validated.
 
-Output: an interactive **executive dashboard** (drill-down per finding, exclude/restore support) and a
-branded **PDF report** with a 3-year spend projection computed from the environment's *measured*
-growth trend.
+Output: a **FinOps-style executive dashboard** — three *Current spend → Savings → Projected spend* KPI
+cards, savings charts (by-category, top opportunities, spend waterfall), optimization-category filter
+tiles, and featured/compact **opportunity cards** that open a per-finding **details modal** (business
+value, why, financial impact, guidance, prerequisites, collapsible affected-resources, supporting
+metrics — with reversible *exclude/restore*) — plus a branded **PDF report** with a 3-year spend
+projection computed from the environment's *measured* growth trend.
 
 While a run is in flight the client watches a **live assessment screen** — an abstract flow
 composition, the current stage, an eased progress filament, and discovered counts that surface one at
@@ -48,21 +55,27 @@ so a slow subscription visibly holds the run where it is rather than advancing o
 **Never show a fabricated number as if it were real.**
 
 - **Grounded in actual cost** — every headline saving is a fraction of the resource's real Cost-Management
-  bill (discount % for RI/SP, licence fraction for AHB, vCore-reduction ratio for rightsizing). List
+  bill (discount % for RI, licence fraction for AHB, vCore-reduction ratio for rightsizing). List
   price is only a labelled fallback.
-- **Last complete month**, validated against **6 months of history**; **savings can never exceed spend**
-  (each finding is capped at its own resource's cost); **no double-counting** (AHB licence + RI compute
-  are additive but never overlap; deletion candidates excluded from AHB).
+- **Last complete month**, validated against **6 months of history**; each finding is **capped at its own
+  resource's cost**; **no double-counting** (AHB licence + RI compute are additive but never overlap;
+  deletion candidates excluded from AHB).
+- **New / recently-migrated subscriptions** (no complete billing month) get a **run-rate baseline**
+  instead: average daily spend over the observed billing period (first billed day → last), normalised to
+  a month — clearly flagged in the UI as an *estimated run rate*. For resources without a full month of
+  billing, AHB/RI savings likewise price at the full-month run rate (flagged), so spend and savings stay
+  on the same basis.
 - **Only what Azure offers**, **currency-correct** (USD/CAD/INR/GBP/AUD/…, severity normalised to
   USD-equivalent), **rightsizing is cautious** (peak not average, all load dimensions under a 70%
   ceiling, real price deltas only, SQL only where real cost exists).
 - **Validation badges** — "Cost-validated" (grounded) vs "Estimate" (small nominal figures). Confidence
   is tracked for ranking but **not shown to clients**.
 
-**AHB, plainly:** a Windows VM's price = compute + a Windows Server licence. The licence is a flat
-per-vCore charge, estimated as the **median across the environment's Windows VMs** (robust to a bad
-per-SKU price fetch) and applied to each VM's real bill — realised only if you own the licence with
-Software Assurance. SQL AHB works the same way (fixed per-vCore SQL licence).
+**AHB, plainly:** a Windows VM's price = compute + a Windows Server licence. The licence is **each VM's
+own live `Windows − Linux` retail-price delta** — it is *not* uniform per vCore across families (a
+B-series burstable VM carries a far lower licence per vCore than a D/E-series one), so every VM uses its
+own delta, applied to its real bill — realised only if you own the licence with Software Assurance. SQL
+AHB uses a fixed per-vCore SQL licence.
 
 ---
 
@@ -100,7 +113,10 @@ frontend/          React + Vite + MUI + Recharts (currency-aware, interactive ch
     pages/         Login, SelectSubscriptions, Results
     components/assessment/  Running-assessment experience (FlowField, StageCaption,
                             ProgressThread, DiscoveryMetrics, stages)
-    components/dashboard/   ExecutiveSummary, RecommendationCard, FindingEvidence, charts/
+    components/dashboard/   ExecutiveSummary (3 KPI cards), RecommendationInsights (charts band),
+                            OptimizationCategories (Level-1 filter tiles), OpportunityCard +
+                            OpportunityGrid (Level-2 featured/compact cards), RecommendationDetails
+                            (Level-3 details modal + exclude/restore), FindingEvidence, categoryMeta, charts/
 backend/           FastAPI + SQLAlchemy + SQLite
   app/
     main.py        App wiring, routers, CORS, serves built frontend
@@ -133,7 +149,7 @@ backend/           FastAPI + SQLAlchemy + SQLite
 `services/findings.py` is the core. For each detector it: (1) reads the resource's utilisation +
 **actual cost**, (2) computes a **grounded** saving (discount/licence/vCore ratio × real cost), (3)
 **caps** it at the resource's actual cost, (4) **dedupes** to one finding per resource, (5) scores
-severity/confidence. Aggregates (AHB, RI, SP) roll many resources into one resource-less finding so they
+severity/confidence. Aggregates (AHB, RI) roll many resources into one resource-less finding so they
 escape dedupe and can be additive. `services/assessment.py` is the state machine that fans out inventory
 → metrics → advisor/reservations → cost, runs every detector, and persists. `scripts/reconcile_assessment.py`
 re-derives every finding and asserts the integrity invariants (Σfindings = total, savings ≤ spend, no
@@ -251,11 +267,11 @@ Redis.
 
 | Table | Purpose | Key columns |
 |-------|---------|-------------|
-| `assessments` | one per run | status/progress, `total_savings_monthly/annual`, `current_monthly/annual_spend`, `currency`, `cost_data_available`, `observed_annual_growth`, `spend_by_area`, `total_resources`, `major_resource_types` |
+| `assessments` | one per run | status/progress, `total_savings_monthly/annual`, `current_monthly/annual_spend`, `currency`, `cost_data_available`, `spend_estimated` + `spend_period_days` (run-rate baseline), `observed_annual_growth`, `spend_by_area`, `total_resources`, `major_resource_types` |
 | `findings` | one per opportunity | `category`, `estimated_savings_monthly/annual`, `severity`, `confidence`, `validation_status`, `actual_monthly_cost`, `dismissed`, `details` (JSON) |
 | `inventory_items` | scanned resources | `resource_id`, `resource_type`, `data` (JSON) |
 | `assessment_events` | live pipeline trail | `timestamp`, `stage`, `message` — written as each milestone is genuinely reached |
-| `audit_logs` | security trail | `event` (assessment_run / finding_dismissed / report_downloaded), user, timestamp |
+| `audit_logs` | security trail | `event` (assessment_run / finding_dismissed / finding_restored / report_downloaded), user, timestamp |
 
 > **Existing databases:** if `alembic upgrade head` fails with *"table assessments already exists"*,
 > the `alembic_version` marker is missing rather than the schema being old. Check `alembic current`

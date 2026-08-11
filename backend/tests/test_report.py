@@ -143,6 +143,37 @@ def test_projections_suppressed_when_savings_exceed_spend():
     assert len(pdf) > 5000                    # still a full report, just no broken projection bars
 
 
+def test_pdf_ahb_items_reconcile_with_finding_total():
+    """The PDF's per-VM AHB rows must sum to the SAME figure shown on the dashboard/recommendation —
+    no secondary calculation. `_ahb_items` reads each eligible VM's `monthly_savings` verbatim, so the
+    sum of its annual rows must equal the finding's estimated_savings_annual."""
+    from app.services.report import _ahb_items
+
+    per_vm = [146.75, 24.47]  # grounded per-VM licence-share savings (monthly)
+    monthly = round(sum(per_vm), 2)
+    f = Finding(
+        category="windows_ahb", display_name="Windows Azure Hybrid Benefit",
+        resource_type="microsoft.compute/virtualmachines",
+        estimated_savings_monthly=monthly, estimated_savings_annual=round(monthly * 12, 2),
+        severity="high", confidence=0.7, description="conditional", recommendation="apply AHB",
+        details={
+            "eligible_vms": [
+                {"name": "win-a", "sku": "Standard_D16s_v3", "monthly_savings": per_vm[0],
+                 "actual_monthly_cost": 300.0, "windows_price": 1097.92},
+                {"name": "win-b", "sku": "Standard_D2s_v3", "monthly_savings": per_vm[1],
+                 "actual_monthly_cost": 50.0, "windows_price": 137.24},
+            ],
+            "eligible_count": 2, "conditional": True, "requires_license_ownership": True,
+        },
+    )
+    items = _ahb_items([f])
+    assert len(items) == 2
+    assert round(sum(it["annual_savings"] for it in items), 2) == f.estimated_savings_annual
+    # Every per-VM saving is grounded ≤ that VM's actual billed cost (never the list licence premium).
+    for it, vm in zip(items, f.details["eligible_vms"]):
+        assert vm["monthly_savings"] <= vm["actual_monthly_cost"]
+
+
 def test_report_currency_symbols():
     from app.services.report import _set_currency, _usd
     _set_currency("GBP"); assert _usd(1000) == "£1,000.00"

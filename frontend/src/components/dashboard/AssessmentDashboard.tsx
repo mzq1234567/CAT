@@ -1,7 +1,6 @@
 import React from "react";
 import { Alert, Box, Typography } from "@mui/material";
 import { alpha } from "@mui/material/styles";
-import TravelExploreIcon from "@mui/icons-material/TravelExplore";
 import { colors } from "../../theme";
 import type { Assessment } from "../../types";
 import { Area, areaForCategory } from "./area";
@@ -52,35 +51,17 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
         <ExecutiveSummary assessment={assessment} />
       </Box>
 
-      {/* Coverage banner — the inventory that was scanned (resource breakdown), below the money */}
+      {/* Scan coverage — quiet metadata caption, not a prominent band */}
       {assessment.total_resources != null && assessment.total_resources > 0 && (
-        <Box
-          display="flex"
-          alignItems="center"
-          gap={1}
-          mb={4}
-          px={2}
-          py={1.25}
-          sx={{
-            borderRadius: 2,
-            bgcolor: alpha(colors.accentBlue, 0.06),
-            border: `1px solid ${alpha(colors.accentBlue, 0.2)}`,
-          }}
+        <Typography
+          variant="caption"
+          color={colors.textMuted}
+          sx={{ display: "block", mt: -0.5, mb: 3.5, letterSpacing: "0.01em" }}
         >
-          <TravelExploreIcon sx={{ fontSize: 18, color: colors.accentBlue }} />
-          <Typography variant="body2" color={colors.textSecondary}>
-            Scanned{" "}
-            <Box component="span" sx={{ color: colors.textPrimary, fontWeight: 700 }}>
-              {assessment.total_resources.toLocaleString()}
-            </Box>{" "}
-            Azure resources across{" "}
-            <Box component="span" sx={{ color: colors.textPrimary, fontWeight: 700 }}>
-              {assessment.resource_type_count}
-            </Box>{" "}
-            resource types · {findings.length} optimization{" "}
-            {findings.length === 1 ? "opportunity" : "opportunities"} identified.
-          </Typography>
-        </Box>
+          {assessment.total_resources.toLocaleString()} resources scanned
+          {" · "}{assessment.resource_type_count} resource types
+          {" · "}{findings.length} optimization {findings.length === 1 ? "opportunity" : "opportunities"} identified
+        </Typography>
       )}
 
       {/* 02 — the Recommendations experience */}

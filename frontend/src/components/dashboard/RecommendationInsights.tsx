@@ -7,7 +7,7 @@ import { rollupByArea } from "./area";
 import { Donut } from "./charts/Donut";
 import { HBars } from "./charts/HBars";
 import { Waterfall } from "./charts/Waterfall";
-import { AREA_ACCENT, SAVINGS_COLOR, fmtCompact, fmtUSD, fmtPct } from "./tokens";
+import { AREA_ACCENT, SAVINGS_COLOR, fmtCompact } from "./tokens";
 
 function ChartCard({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
   return (
@@ -81,23 +81,19 @@ export default function RecommendationInsights({
                   format={(v) => fmtCompact(v)}
                 />
               </Box>
-              <Box mt={1.5} display="flex" flexDirection="column" gap={0.5}>
+              {/* Compact legend (labels only) — the per-category ₹/% live in the tiles below, so we
+                  don't repeat the whole breakdown twice. */}
+              <Box mt={1.5} display="flex" justifyContent="center" gap={2} flexWrap="wrap">
                 {donutData.map((d, i) => (
                   <Box
                     key={d.name}
                     onMouseEnter={() => setActive(i)}
                     onMouseLeave={() => setActive(null)}
-                    display="flex" alignItems="center" gap={1}
-                    sx={{ px: 1, py: 0.4, mx: -1, borderRadius: 1.5, cursor: "default",
-                      bgcolor: active === i ? alpha(d.color, 0.1) : "transparent",
-                      opacity: active != null && active !== i ? 0.5 : 1, transition: "all .15s ease" }}
+                    display="flex" alignItems="center" gap={0.75}
+                    sx={{ cursor: "default", opacity: active != null && active !== i ? 0.45 : 1, transition: "opacity .15s ease" }}
                   >
                     <Box sx={{ width: 9, height: 9, borderRadius: "3px", bgcolor: d.color }} />
-                    <Typography variant="body2" color="text.secondary" flex={1}>{d.name}</Typography>
-                    <Typography variant="body2" fontWeight={700} color={colors.textPrimary}>{fmtCompact(d.value)}</Typography>
-                    <Typography variant="caption" color={colors.textMuted} sx={{ width: 40, textAlign: "right" }}>
-                      {fmtPct(totalAnnual ? (d.value / totalAnnual) * 100 : 0)}
-                    </Typography>
+                    <Typography variant="caption" color="text.secondary">{d.name}</Typography>
                   </Box>
                 ))}
               </Box>

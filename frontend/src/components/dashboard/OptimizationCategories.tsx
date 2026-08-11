@@ -56,7 +56,11 @@ export default function OptimizationCategories({
           sx={{
             fontWeight: 700,
             ...(selected === null
-              ? { bgcolor: colors.textPrimary, color: "#fff", "& .MuiChip-icon": { color: "#fff" } }
+              ? {
+                  bgcolor: alpha(colors.accentBlue, 0.14), color: colors.accentBlue,
+                  border: `1px solid ${alpha(colors.accentBlue, 0.35)}`,
+                  "& .MuiChip-icon": { color: colors.accentBlue },
+                }
               : { borderColor: colors.border, color: colors.textSecondary }),
           }}
         />

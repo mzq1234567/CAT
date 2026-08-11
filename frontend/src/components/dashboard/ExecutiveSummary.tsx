@@ -14,7 +14,11 @@ import { AnimatedValue } from "./charts/AnimatedValue";
 import { SAVINGS_COLOR, SPEND_COLOR, fmtCompact, fmtUSD, fmtPct } from "./tokens";
 import { conditionalSavingsAnnual } from "./area";
 
-const AHB_INFO = "Estimated savings may include Azure Hybrid Benefit where applicable.";
+const ahbInfo = (conditionalAnnual: number, fmt: (n: number) => string) =>
+  `Includes ~${fmt(conditionalAnnual)}/yr of POTENTIAL Azure Hybrid Benefit savings — conditional on ` +
+  `already owning eligible Windows Server licences (with active Software Assurance or a qualifying ` +
+  `subscription). That portion is not automatic; you realise it only on VMs your licences cover. All ` +
+  `AHB figures are the licence share of each VM's actual billed cost.`;
 
 /**
  * The 5-second story. Three KPI cards answer, in one glance:
@@ -213,7 +217,8 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
   const projectedAnnual = reconciles ? (currentAnnual ?? 0) - savingsAnnual : null;
   const savingsPct = reconciles && currentAnnual ? (savingsAnnual / currentAnnual) * 100 : null;
 
-  const ahbInSavings = conditionalSavingsAnnual(findings) > 0;
+  const conditionalAnnual = conditionalSavingsAnnual(findings);
+  const ahbInSavings = conditionalAnnual > 0;
 
   // Spend baseline is an estimated run rate when the subscription has no complete billing month yet.
   const spendEstimated = hasSpend && !!assessment.spend_estimated;
@@ -282,7 +287,7 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
             emphasize
             monthly={savingsMonthly}
             annual={savingsAnnual}
-            info={ahbInSavings ? AHB_INFO : undefined}
+            info={ahbInSavings ? ahbInfo(conditionalAnnual, fmtUSD) : undefined}
           />
         </Box>
         <Connector symbol="equals" />

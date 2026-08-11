@@ -23,6 +23,22 @@ export function ImpactChip({ severity }: { severity: Severity }) {
   );
 }
 
+/** Azure Advisor's own impact rating, shown separately so it never inflates the savings-based severity. */
+export function AdvisorImpactChip({ finding }: { finding: Finding }) {
+  const impact = (finding.details as { impact?: string } | null)?.impact;
+  if (finding.category !== "advisor_cost" || !impact) return null;
+  return (
+    <Tooltip title="Azure Advisor's own impact rating for this recommendation. It's informational — the Impact chip reflects the size of the saving.">
+      <Chip
+        size="small"
+        variant="outlined"
+        label={`Advisor: ${impact}`}
+        sx={{ color: colors.textSecondary, borderColor: colors.border, fontWeight: 600, cursor: "help" }}
+      />
+    </Tooltip>
+  );
+}
+
 export function AreaTag({ area }: { area: Area }) {
   const c = AREA_ACCENT[area];
   return (

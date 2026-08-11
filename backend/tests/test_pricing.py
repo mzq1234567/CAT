@@ -90,11 +90,12 @@ async def test_managed_disk_tier_price_from_api():
     assert price == 19.71  # P10 LRS from API
 
 
-async def test_managed_disk_static_fallback_for_ultrassd():
-    # UltraSSD has no tier; falls back to per-GB static table (0.125/GB).
+async def test_managed_disk_returns_none_when_no_tier_price():
+    # UltraSSD has no per-disk tier and the API has no matching price → unavailable (None).
+    # No hardcoded per-GB fallback any more: the caller drops the finding rather than guess.
     engine = make_engine(retail_prices_handler())
     price = await engine.get_managed_disk_monthly_price("eastus", "ultrassd_lrs", 100)
-    assert price == round(100 * 0.125, 2)
+    assert price is None
 
 
 # ── Public IP pricing ────────────────────────────────────────────────────────────
@@ -178,14 +179,8 @@ async def test_load_balancer_uses_live_price_when_sane():
     assert price == round(0.025 * HOURS_PER_MONTH, 2)  # 18.25 — straight from the live meter
 
 
-async def test_flat_price_falls_back_when_empty():
-    from app.services.estimates import LOAD_BALANCER_MONTHLY_USD
+async def test_flat_price_is_none_when_no_live_price():
+    # No live price and no cache → unavailable (None). No hardcoded/dated fallback any more: the
+    # caller drops the finding rather than show a stale estimate.
     empty = lambda _req: httpx.Response(200, json={"Items": [], "NextPageLink": None})
-    assert await make_engine(empty).get_load_balancer_monthly_price("eastus") == LOAD_BALANCER_MONTHLY_USD
-
-
-async def test_flat_price_rejects_out_of_band_meter():
-    # A wrong meter match (10x the fallback) is rejected in favour of the dated estimate.
-    from app.services.estimates import LOAD_BALANCER_MONTHLY_USD
-    price = await make_engine(_flat_response(5.0, meter="Rule")).get_load_balancer_monthly_price("eastus")
-    assert price == LOAD_BALANCER_MONTHLY_USD
+    assert await make_engine(empty).get_load_balancer_monthly_price("eastus") is None

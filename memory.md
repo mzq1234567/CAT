@@ -2061,6 +2061,50 @@ throttling reproduces the user's condition; unthrottled it measured 144fps and l
   subtrees behind `React.memo`.
 - Verify: backend **243 passing**; tsc + build clean.
 
+### Post-ship 38 — Severity is savings-only; Advisor rating moved to its own tag (2026-08-07)
+Validation run #62 (LABS-Subscription, clean full month): tool spend ₹6.5K/mo == Azure Cost Analysis
+₹6,507.38 (Jul 2026) → **spend baseline validated on a normal env; everything reconciles** (waterfall
+renders, projected 3% lower, no estimated-run-rate flag). Savings honestly modest (₹2K, 3%): Linux VMs
+(no AHB), serverless SQL = 74% of bill but AHB/RI/rightsizing correctly N/A (verified: kql.py excludes
+serverless from AHB/rightsizing by design — correct Azure behavior). Flagged coverage ceiling:
+serverless→provisioned+RI is the one advanced lever the tool doesn't model.
+- **Bug fixed:** a ₹432/yr Advisor rec showed **High impact** next to a ₹1.6K RI showing **Low** —
+  because `severity_from_savings` let Advisor's "High" rating jump a tiny saving to high (old line 287-8).
+  Now **severity is SAVINGS-MAGNITUDE ONLY** (critical≥$300/mo, high≥$100, medium≥$20, else low; USD-
+  normalised) so a smaller finding can NEVER outrank a larger one. `advisor_impact` param kept but
+  ignored; removed now-orphaned `SEV_ORDER`. Test flipped: `severity_from_savings(5, advisor_impact="High")`
+  now == "low".
+- **Advisor's rating preserved separately:** new `AdvisorImpactChip` (badges.tsx) shows "Advisor: High"
+  on `advisor_cost` findings (reads `details.impact`), added to OpportunityCard (both variants) +
+  RecommendationDetails. Backend **243 passing**; FE clean.
+
+### Post-ship 39 — Stop fabricating RIs; specific Advisor cards; declutter banner/pill (2026-08-10)
+User (#64) caught the tool recommending an RI (₹1,581/yr) for **Standard_D2s_v3**, which has **no
+reservation** available. **Verified via live retail API**: the Azure Retail Prices API publishes
+reservation prices for only SOME VM SKUs (M-series yes; **Dsv3/D4s_v3 = ZERO reservation rows**, any
+currency/region). The tool's `detect_vm_commitments` fell back to a fabricated 40%/60% discount
+(`_RI_DEFAULT_DISCOUNT_*`) → invented a rupee saving for an unpriceable reservation. NOTE: retail-API
+quirk — you FILTER by `priceType` but the response JSON field is `type`.
+- **#1 Fix (accuracy):** removed the estimated-discount fallback. If neither term has a REAL retail
+  reservation price (`r1 is None and r3 is None`) → **skip the VM** (never fabricate). Deleted
+  `_RI_DEFAULT_DISCOUNT_1YR/3YR`, `ri_estimated`, `any_estimated`, `ri_price_estimated` (backend +
+  FindingEvidence "RI est." note + interface field). Tests flipped:
+  `test_commitment_skips_vm_when_no_retail_ri_price`, `_burstable_skipped_when_no_retail_ri_price`.
+  **Consequence:** D-series VMs no longer get retail-estimate RIs; only real-priced RIs (retail OR
+  Azure's reservation engine) surface. On #64 this drops the fabricated ₹1,581 → savings = just the
+  Advisor rec. **OPEN follow-up offered:** route VMs through Azure's reservation engine (authoritative,
+  real prices for reservable SKUs) to restore D-series RI coverage credibly.
+- **#2 Advisor cards specific:** `advisor_findings` now sets `display_name = short.problem` (the actual
+  rec, e.g. "Right-size or shut down underutilized VMs") instead of generic "Azure Advisor Cost
+  Recommendation"; description=problem, recommendation=solution. OpportunityCard shows the SOLUTION as
+  the card summary for `advisor_cost`. Source still conveyed by the "Advisor: High" tag.
+- **#3 Coverage banner:** replaced the tinted full-width "Scanned N resources…" band with a quiet muted
+  caption line (no box/tint/icon). Removed TravelExploreIcon import.
+- **#4 Category filter pill:** the near-black "All categories · N" chip → brand-teal tint
+  (`alpha(accentBlue,.14)`), theme-consistent.
+- Also (prior turn, same session): modal → progressive disclosure (essentials visible; Implementation/
+  Prerequisites/Supporting-Metrics collapsed); donut legend de-duped (labels only). Backend **243**; FE clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD
