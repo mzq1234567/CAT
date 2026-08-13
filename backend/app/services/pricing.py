@@ -38,6 +38,23 @@ RETAIL_API_VERSION = "2023-01-01-preview"  # supports savingsPlan + reservationT
 HOURS_PER_MONTH = 730  # Azure's standard billing month
 DEFAULT_TTL_SECONDS = 24 * 3600
 
+# Currencies the Azure Retail Prices API can return prices in (its `currencyCode` parameter). If a
+# subscription's billing currency isn't one of these, the API silently answers in USD — which we must
+# NEVER relabel as the billing currency. `pricing_currency_supported()` lets callers detect that case up
+# front; `_fetch_all` additionally drops any item whose returned `currencyCode` doesn't match what we
+# asked for, so a mismatched/ignored request yields NO price (→ the finding degrades to REVIEW) rather
+# than a USD figure wearing a ₹/€/A$ symbol.
+RETAIL_SUPPORTED_CURRENCIES = frozenset({
+    "USD", "AUD", "BRL", "CAD", "CHF", "CNY", "DKK", "EUR", "GBP", "INR",
+    "JPY", "KRW", "NOK", "NZD", "RUB", "SEK", "TWD",
+})
+
+
+def pricing_currency_supported(currency: Optional[str]) -> bool:
+    """True when the Azure Retail Prices API can quote prices in `currency` (so a request in it is
+    honoured, not silently answered in USD)."""
+    return (currency or "").upper() in RETAIL_SUPPORTED_CURRENCIES
+
 # Azure managed-disk size → tier breakpoints (max GB for each tier).
 # This is a stable Azure *spec* (not pricing), safe to hard-code. A disk is billed at the
 # smallest tier whose capacity >= its provisioned size.
@@ -114,12 +131,13 @@ class PricingEngine:
     def _cache_key(self, filter_str: str) -> str:
         return f"retail:{self._currency}:{filter_str}"
 
-    async def _fetch_all(self, filter_str: str) -> List[Dict]:
+    async def _fetch_all(self, filter_str: str, currency: Optional[str] = None) -> List[Dict]:
+        cur = (currency or self._currency).upper()
         items: List[Dict] = []
         params = {
             "api-version": RETAIL_API_VERSION,
             "$filter": filter_str,
-            "currencyCode": self._currency,
+            "currencyCode": cur,
         }
         async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
             next_url: Optional[str] = None
@@ -135,7 +153,11 @@ class PricingEngine:
                 next_url = data.get("NextPageLink")
                 if not next_url:
                     break
-        return items
+        # Financial integrity: only trust prices the API actually returned in the currency we asked for.
+        # If it ignored the request (unsupported currency) and answered in USD, those items are DROPPED —
+        # so the price comes back unavailable and the finding degrades to REVIEW, never a USD magnitude
+        # mislabelled with the billing symbol. Items with no currencyCode are kept (defensive).
+        return [it for it in items if str(it.get("currencyCode") or cur).upper() == cur]
 
     # ── VM pricing ─────────────────────────────────────────────────────────────
 
@@ -188,35 +210,11 @@ class PricingEngine:
             return None
         return round(min(candidates) * HOURS_PER_MONTH, 2)
 
-    async def get_vm_reserved_monthly_price(
-        self, region: str, arm_sku_name: str, term: str = "1 Year"
-    ) -> Optional[float]:
-        """Reserved Instance price amortised to a monthly figure.
-
-        Reservation `retailPrice` is the total upfront cost for the whole term, so we divide
-        by the number of months in the term (12 or 36).
-        """
-        months = 12 if term == "1 Year" else 36 if term == "3 Years" else None
-        if months is None:
-            raise ValueError("term must be '1 Year' or '3 Years'")
-        filter_str = (
-            "serviceName eq 'Virtual Machines' "
-            f"and armRegionName eq '{region}' "
-            f"and armSkuName eq '{arm_sku_name}' "
-            "and priceType eq 'Reservation' "
-            f"and reservationTerm eq '{term}'"
-        )
-        items = await self.query(filter_str)
-        totals = [
-            it.get("retailPrice")
-            for it in items
-            if it.get("reservationTerm") == term
-            and it.get("retailPrice")
-            and "Windows" not in (it.get("productName") or "")
-        ]
-        if not totals:
-            return None
-        return round(min(totals) / months, 2)
+    # NOTE: a retail *reservation* price helper was intentionally REMOVED. Reserved Instance
+    # recommendations come exclusively from Azure's own reservation-recommendations engine (real usage
+    # at the customer's real prices — see reservations.py / commitments_from_recommendations). The Retail
+    # Prices API's reservation rate is a generic list price, NOT what this customer would pay, and mixing
+    # it in risks presenting a retail rate as a reservation saving — exactly the confusion to avoid.
 
     # ── Managed disk pricing ───────────────────────────────────────────────────
 
@@ -329,9 +327,11 @@ class PricingEngine:
             parts = key.split(":", 2)
             if len(parts) != 3 or parts[0] != "retail":
                 continue
-            filter_str = parts[2]
+            key_currency, filter_str = parts[1], parts[2]
             try:
-                items = await self._fetch_all(filter_str)
+                # Re-fetch in the KEY's own currency (not this engine's), so refreshing the shared cache
+                # never overwrites an INR/EUR entry with USD prices.
+                items = await self._fetch_all(filter_str, currency=key_currency)
                 self._cache.set(key, items, self._ttl)
                 refreshed += 1
             except httpx.HTTPError as exc:
@@ -359,6 +359,13 @@ def get_pricing_engine(currency: Optional[str] = None) -> PricingEngine:
             currency=settings.pricing_currency,
         )
     want = (currency or settings.pricing_currency).upper()
+    if not pricing_currency_supported(want):
+        # The Retail Prices API will answer in USD for this currency; the _fetch_all filter drops those,
+        # so list-priced findings degrade to REVIEW rather than showing a USD figure under a wrong symbol.
+        logger.warning(
+            "Billing currency %s is not supported by the Azure Retail Prices API — list-priced findings "
+            "will be shown as 'not quantified' (never converted to USD).", want,
+        )
     if want == _engine_singleton._currency.upper():
         return _engine_singleton
     return PricingEngine(

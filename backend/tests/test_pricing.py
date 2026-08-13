@@ -57,24 +57,15 @@ async def test_vm_monthly_price():
     assert monthly == round(0.096 * HOURS_PER_MONTH, 2)
 
 
-async def test_vm_reserved_monthly_price_1yr_and_3yr():
-    engine = make_engine(retail_prices_handler())
-    one_yr = await engine.get_vm_reserved_monthly_price("eastus", "Standard_D2s_v3", "1 Year")
-    three_yr = await engine.get_vm_reserved_monthly_price("eastus", "Standard_D2s_v3", "3 Years")
-    assert one_yr == round(840.0 / 12, 2)     # 70.0
-    assert three_yr == round(1800.0 / 36, 2)  # 50.0
+# NOTE: the retail *reservation* price helper (get_vm_reserved_monthly_price) was intentionally REMOVED —
+# Reserved Instance recommendations come exclusively from Azure's own reservation engine (real usage at
+# the customer's real prices), never a generic retail reservation rate. Its tests were removed with it.
 
 
 async def test_vm_windows_monthly_price_for_ahb():
     engine = make_engine(retail_prices_handler())
     win = await engine.get_vm_windows_monthly_price("eastus", "Standard_D2s_v3")
     assert win == round(0.188 * HOURS_PER_MONTH, 2)  # Windows image (compute + licence)
-
-
-async def test_reserved_price_rejects_bad_term():
-    engine = make_engine(retail_prices_handler())
-    with pytest.raises(ValueError):
-        await engine.get_vm_reserved_monthly_price("eastus", "Standard_D2s_v3", "2 Years")
 
 
 async def test_unknown_sku_returns_none():

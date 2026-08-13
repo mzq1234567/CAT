@@ -1,7 +1,8 @@
+import re
 from datetime import datetime
 from typing import List
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -9,16 +10,21 @@ from sqlalchemy.orm import Session
 from ...api.dependencies import get_current_user
 from ...database import get_db
 from ...models.db import Assessment, Finding
+
+_GUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 from ...models.schemas import (
     AssessmentCreate,
     AssessmentResponse,
     AssessmentSummary,
     FindingResponse,
     FindingsByCategoryResponse,
+    PreflightResponse,
 )
 from ...security.rate_limit import enforce_assessment_rate_limit
 from ...security.rbac import verify_subscription_access
 from ...services.assessment import run_assessment
+from ...services.preflight import run_preflight
+from ...services.findings import CONDITIONAL_CATEGORIES
 from ...services.audit import (
     ASSESSMENT_RUN,
     FINDING_DISMISSED,
@@ -41,6 +47,20 @@ def _owned_assessment(db: Session, assessment_id: int, user: dict) -> Assessment
     ):
         raise HTTPException(status_code=404, detail="Assessment not found.")
     return assessment
+
+
+@router.get("/preflight", response_model=PreflightResponse)
+async def preflight(
+    subscription_id: str = Query(..., description="Subscription to check readiness for"),
+    user: dict = Depends(get_current_user),
+):
+    """Self-service readiness check for a subscription — probes each data source (subscription access,
+    resource inventory, cost, metrics, pricing) in the signed-in user's context so missing access is
+    surfaced BEFORE running an assessment. Client-safe: no raw HTTP/SDK errors are returned."""
+    if not _GUID_RE.match(subscription_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid subscription id.")
+    client = AzureClient(user["token"])
+    return await run_preflight(client, subscription_id, user_email=user.get("email"))
 
 
 @router.post("/", response_model=AssessmentSummary, status_code=202)
@@ -131,8 +151,21 @@ def dismiss_finding(
     # Re-roll the headline totals from the surviving findings so the dashboard stays consistent
     # (a dismissed opportunity no longer counts toward savings). Mirrors the initial roll-up.
     active = [f for f in assessment.findings if not f.dismissed]
-    assessment.total_savings_monthly = round(sum(f.estimated_savings_monthly for f in active), 2)
-    assessment.total_savings_annual = round(sum(f.estimated_savings_annual for f in active), 2)
+    # Headline totals count only QUANTIFIED, non-conditional savings — conditional AHB and REVIEW
+    # ("not quantified") findings are surfaced separately and never folded into the total (mirrors the
+    # initial roll-up in _persist_findings_and_totals).
+    realisable = [
+        f for f in active
+        if f.category not in CONDITIONAL_CATEGORIES and (f.evidence_state or "quantified") == "quantified"
+    ]
+    # Sum the NON-OVERLAPPING contribution (counted_savings) so RI + right-sizing on the same VM never
+    # double-count. counted defaults to estimated for non-overlapping findings.
+    def _counted_m(f):
+        return f.counted_savings_monthly if f.counted_savings_monthly is not None else f.estimated_savings_monthly
+    def _counted_a(f):
+        return f.counted_savings_annual if f.counted_savings_annual is not None else f.estimated_savings_annual
+    assessment.total_savings_monthly = round(sum(_counted_m(f) for f in realisable), 2)
+    assessment.total_savings_annual = round(sum(_counted_a(f) for f in realisable), 2)
     assessment.findings_count = len(active)
 
     db.commit()
@@ -160,8 +193,21 @@ def restore_finding(
     finding.dismissed_at = None
 
     active = [f for f in assessment.findings if not f.dismissed]
-    assessment.total_savings_monthly = round(sum(f.estimated_savings_monthly for f in active), 2)
-    assessment.total_savings_annual = round(sum(f.estimated_savings_annual for f in active), 2)
+    # Headline totals count only QUANTIFIED, non-conditional savings — conditional AHB and REVIEW
+    # ("not quantified") findings are surfaced separately and never folded into the total (mirrors the
+    # initial roll-up in _persist_findings_and_totals).
+    realisable = [
+        f for f in active
+        if f.category not in CONDITIONAL_CATEGORIES and (f.evidence_state or "quantified") == "quantified"
+    ]
+    # Sum the NON-OVERLAPPING contribution (counted_savings) so RI + right-sizing on the same VM never
+    # double-count. counted defaults to estimated for non-overlapping findings.
+    def _counted_m(f):
+        return f.counted_savings_monthly if f.counted_savings_monthly is not None else f.estimated_savings_monthly
+    def _counted_a(f):
+        return f.counted_savings_annual if f.counted_savings_annual is not None else f.estimated_savings_annual
+    assessment.total_savings_monthly = round(sum(_counted_m(f) for f in realisable), 2)
+    assessment.total_savings_annual = round(sum(_counted_a(f) for f in realisable), 2)
     assessment.findings_count = len(active)
 
     db.commit()

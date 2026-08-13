@@ -20,12 +20,22 @@ class Settings(BaseSettings):
     # Token security — verify the Azure AD RS256 signature (JWKS) on every request.
     # Secure by default; disabling it re-opens a tenant-isolation bypass (see security/token.py).
     verify_token_signature: bool = True
-    token_enforce_audience: bool = False
+    # Audience is now enforced by default: the token must have been issued for Azure Resource Manager
+    # (the resource we forward it to). The list covers every ARM audience form Entra mints (v1 URL with/
+    # without trailing slash, the legacy management.core URL, and the ARM App ID GUID).
+    token_enforce_audience: bool = True
     token_allowed_audiences: List[str] = [
         "https://management.azure.com/",
         "https://management.azure.com",
         "https://management.core.windows.net/",
+        "797f4846-ba00-4b28-9c31-92eee91bb9ba",  # Azure Service Management App ID (ARM)
     ]
+    # Verify the token was issued for THIS application (its `appid`/`azp` == our client id) and by a
+    # legitimate Microsoft issuer for the token's own tenant. Requires `azure_client_id` to be set for the
+    # app-id check; when unset (dev), the app-id check is skipped with a startup warning (issuer + audience
+    # still enforced). See security/token.py.
+    token_require_issuer: bool = True
+    token_require_delegated: bool = True   # reject app-only tokens (must represent a signed-in user)
 
     # Max subscriptions accepted per assessment request (bounds fan-out / abuse).
     max_subscriptions_per_assessment: int = 50
@@ -33,6 +43,15 @@ class Settings(BaseSettings):
     # Azure API resilience (Step 8)
     azure_max_retries: int = 4
     azure_retry_base_delay: float = 0.5
+
+    # Azure API concurrency (Batch 2) — TWO documented limits, no hidden per-stage caps (see
+    # azure_client.py header). `azure_max_concurrency` bounds ONE assessment's in-flight Azure requests;
+    # sized to respect Azure Resource Graph's per-tenant limit (~15 queries/5s, and one run = one tenant)
+    # with headroom while still parallelising — 8 keeps well under the limit yet far faster than serial.
+    # `azure_global_max_concurrency` bounds TOTAL simultaneous requests across ALL concurrent assessments
+    # (24 = 3 full-speed runs) so N runs can't multiply the per-run cap into uncontrolled aggregate traffic.
+    azure_max_concurrency: int = 8
+    azure_global_max_concurrency: int = 24
 
     # Reservation / Savings Plan recommendation basis:
     #   combined  — recommend for running VMs; high confidence when metrics show steady use, lower

@@ -27,6 +27,7 @@ export interface CategoryMeta {
 const NOUN: Record<string, string> = {
   windows_ahb: "Virtual Machine", ri_vm: "Virtual Machine", idle_vms: "Virtual Machine",
   oversized_vms: "Virtual Machine", vm_rightsizing: "Virtual Machine", deallocated_vms: "Virtual Machine",
+  vm_metrics_unavailable: "Virtual Machine",
   disk_rightsizing: "Managed Disk", unattached_managed_disks: "Managed Disk",
   managed_disk_reserved_capacity: "Managed Disk", orphaned_snapshots: "Snapshot",
   sql_db_rightsizing: "SQL Database", paused_sql_databases: "SQL Database",
@@ -100,6 +101,13 @@ const META: Record<string, CategoryMeta> = {
     effort: "Low",
     effortNote: "A reservation purchase in the portal — the running VMs are untouched.",
     prerequisites: "A 1- or 3-year commitment; best for VMs you'll keep running. Untagged VMs are assumed production — verify first.",
+    noun: "Virtual Machine",
+  },
+  vm_metrics_unavailable: {
+    summary: (n) => `${n} ${plural("VM", n)} could not be assessed — Azure Monitor utilisation metrics were unavailable this run.`,
+    businessValue: "Idle / right-sizing savings can't be evaluated without utilisation metrics, so these VMs are flagged for review rather than quantified — a missing metric is never read as idle.",
+    effort: "Low",
+    effortNote: "Re-run the assessment once Azure Monitor metrics are available.",
     noun: "Virtual Machine",
   },
   idle_vms: {
@@ -240,6 +248,11 @@ export function affectedResources(finding: Finding): { count: number; items: Aff
   const eligible = d.eligible_vms as AffectedResource[] | undefined;
   if (Array.isArray(eligible) && eligible.length) {
     return { count: (d.eligible_count as number) ?? eligible.length, items: eligible };
+  }
+  // VMs whose utilisation metrics could not be collected (a REVIEW finding) — no per-resource saving.
+  const affected = d.affected_vms as AffectedResource[] | undefined;
+  if (Array.isArray(affected) && affected.length) {
+    return { count: (d.affected_count as number) ?? affected.length, items: affected };
   }
   const items = d.reservation_items as (AffectedResource & { sku?: string })[] | undefined;
   if (Array.isArray(items) && items.length) {

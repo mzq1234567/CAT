@@ -10,6 +10,7 @@ const CATEGORY_TO_AREA: Record<string, Area> = {
   // Compute
   idle_vms: "Compute",
   oversized_vms: "Compute",
+  vm_metrics_unavailable: "Compute",
   ri_vm: "Compute",
   vm_rightsizing: "Compute",
   deallocated_vms: "Compute",
@@ -58,6 +59,21 @@ export function isConditionalSaving(category: string): boolean {
   return CONDITIONAL_CATEGORIES.has(category);
 }
 
+/** A REVIEW finding surfaces a real signal we can't price for this customer — it shows "Not quantified"
+ *  and NEVER contributes to any savings total. */
+export function isReviewFinding(f: { evidence_state?: string }): boolean {
+  return (f.evidence_state ?? "quantified") === "review";
+}
+
+/** A finding's NON-OVERLAPPING contribution to the total (RI vs right-sizing de-overlapped). Falls back
+ *  to the finding's own value when the backend didn't set it. Aggregates sum these; cards show estimated. */
+export function countedAnnual(f: Finding): number {
+  return f.counted_savings_annual ?? f.estimated_savings_annual ?? 0;
+}
+export function countedMonthly(f: Finding): number {
+  return f.counted_savings_monthly ?? f.estimated_savings_monthly ?? 0;
+}
+
 import type { Finding } from "../../types";
 
 /** Sum of conditional (AHB) annual savings — shown separately as "available if you own licences". */
@@ -67,19 +83,28 @@ export function conditionalSavingsAnnual(findings: Finding[]): number {
     .reduce((sum, f) => sum + (f.estimated_savings_annual || 0), 0);
 }
 
+/**
+ * Realisable findings — QUANTIFIED, non-conditional savings only. Every savings aggregate (headline
+ * total, donut, category tiles, waterfall, projected spend) is built on these, so neither
+ * licence-conditional AHB nor unquantifiable REVIEW findings ever inflate the numbers a client sees.
+ */
+export function realisableFindings(findings: Finding[]): Finding[] {
+  return findings.filter((f) => !isConditionalSaving(f.category) && !isReviewFinding(f));
+}
+
 export interface AreaRollup {
   area: Area;
   savings: number;
   count: number;
 }
 
-/** Group findings into areas, summing annual savings; sorted by savings desc. */
+/** Group findings into areas, summing NON-OVERLAPPING annual savings; sorted by savings desc. */
 export function rollupByArea(findings: Finding[]): AreaRollup[] {
   const map = new Map<Area, AreaRollup>();
   for (const f of findings) {
     const a = areaForCategory(f.category);
     const cur = map.get(a) ?? { area: a, savings: 0, count: 0 };
-    cur.savings += f.estimated_savings_annual;
+    cur.savings += countedAnnual(f);
     cur.count += 1;
     map.set(a, cur);
   }

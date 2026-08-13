@@ -4,7 +4,9 @@ from __future__ import annotations
 from datetime import datetime
 
 from app.models.db import Assessment, Finding
-from app.services.report import generate_pdf
+from app.services.report import (
+    generate_pdf, _pillar_rows, _pillar_options, _counts_total, _counted_annual,
+)
 
 
 def _assessment():
@@ -187,3 +189,113 @@ def test_pdf_renders_in_non_usd_currency():
     a.currency = "GBP"
     pdf = generate_pdf(a, _rich_findings())
     assert pdf[:4] == b"%PDF"
+
+
+# ── Evidence semantics in the PDF (parity with the web dashboard) ─────────────────────
+
+def _review_finding():
+    return Finding(
+        category="bastion_hosts", display_name="Azure Bastion — Review", resource_name="networkbastion",
+        resource_group="rg", subscription_id="sub-1", resource_type="microsoft.network/bastionhosts",
+        estimated_savings_monthly=0.0, estimated_savings_annual=0.0,
+        counted_savings_monthly=0.0, counted_savings_annual=0.0,
+        severity="low", confidence=0.4, description="bastion", recommendation="verify",
+        validation_status="unvalidated", evidence_state="review",
+        details={"financial_impact": "Not quantified", "reference_monthly_price": 138.0,
+                 "reference_price_source": "AUTHORITATIVE_RETAIL_PRICE"},
+    )
+
+
+def test_pdf_review_finding_is_not_quantified_and_excluded_from_totals():
+    review = _review_finding()
+    quantified = _findings()[0]                       # idle_vms, 1200/yr, Compute pillar
+    findings = [quantified, review]
+
+    # The Network catch-all row shows "Not quantified" + a clearly-labelled reference list price, never $.
+    rows = _pillar_rows(findings, "Network")
+    assert len(rows) == 1
+    assert rows[0]["annual_savings"] == "Not quantified"
+    assert "reference list price" in rows[0]["opportunity"].lower()
+    assert rows[0]["annual_cost"] is None
+
+    # It never counts toward any total, and is absent from the pillar savings chart.
+    assert _counts_total(review) is False
+    assert _counts_total(quantified) is True
+    assert _pillar_options(findings, "Network") == []
+
+
+def test_pdf_uses_counted_savings_not_estimated_for_totals():
+    # A finding superseded by an RI overlap (counted 0) is displayed but excluded from the total.
+    superseded = Finding(
+        category="oversized_vms", display_name="Oversized Virtual Machines", resource_name="vm-2",
+        subscription_id="sub-1", resource_type="microsoft.compute/virtualmachines",
+        estimated_savings_monthly=30.0, estimated_savings_annual=360.0,
+        counted_savings_monthly=0.0, counted_savings_annual=0.0,
+        severity="medium", confidence=0.8, description="oversized", recommendation="resize",
+        evidence_state="quantified", details={"overlap_superseded_by_ri": True},
+    )
+    assert _counted_annual(superseded) == 0.0          # counted, not the 360 estimated
+    rows = _pillar_rows([superseded], "Compute")
+    assert rows[0]["annual_savings"] == "Counted under Reserved Instances"
+
+
+def test_pdf_generates_with_review_and_overlap_findings():
+    pdf = generate_pdf(_assessment(), [_findings()[0], _review_finding()])
+    assert pdf[:4] == b"%PDF"
+
+
+# ── Completeness + quantified-vs-review + basis disclosures (Phase F) ─────────────────
+
+def test_context_complete_run_has_no_scope_note():
+    from app.services.report import _context
+    a = _rich_assessment()
+    a.data_quality = "complete"
+    a.billing_detail_unavailable = 0
+    ctx = _context(a, _rich_findings())
+    assert ctx["data_incomplete"] is False
+    assert ctx["completeness_note"] == ""
+    assert ctx["has_findings"] is True                     # basis note still renders
+
+
+def test_context_partial_run_discloses_scope():
+    from app.services.report import _context
+    a = _rich_assessment()
+    a.data_quality = "partial"
+    a.data_quality_message = "Resource metrics were throttled for 3 subscriptions."
+    ctx = _context(a, _rich_findings())
+    assert ctx["data_incomplete"] is True
+    assert ctx["completeness_note"] == "Resource metrics were throttled for 3 subscriptions."
+
+
+def test_context_billing_unavailable_discloses_scope_without_raw_errors():
+    from app.services.report import _context
+    a = _rich_assessment()
+    a.billing_detail_unavailable = 1
+    ctx = _context(a, _rich_findings())
+    assert ctx["data_incomplete"] is True
+    note = ctx["completeness_note"]
+    assert "withheld" in note and "403" not in note and "throttle" in note.lower()
+
+
+def test_context_review_split_is_counted_and_excluded():
+    from app.services.report import _context
+    a = _assessment()
+    ctx = _context(a, [_findings()[0], _review_finding()])   # 1 quantified + 1 review
+    assert ctx["has_review"] is True
+    assert ctx["review_count"] == 1
+    assert "Not quantified" in ctx["review_note"] and "excluded" in ctx["review_note"].lower()
+
+
+def test_context_no_review_has_empty_note():
+    from app.services.report import _context
+    ctx = _context(_assessment(), [_findings()[0]])          # only quantified
+    assert ctx["has_review"] is False and ctx["review_note"] == ""
+
+
+def test_pdf_builds_with_partial_run_and_review():
+    a = _rich_assessment()
+    a.data_quality = "partial"
+    a.data_quality_message = "Some metrics were unavailable."
+    pdf = generate_pdf(a, _rich_findings() + [_review_finding()])
+    assert pdf[:4] == b"%PDF"
+    assert len(pdf) > 5000

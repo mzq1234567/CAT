@@ -2,7 +2,9 @@ import axios from "axios";
 import { useMsal } from "@azure/msal-react";
 import { InteractionRequiredAuthError } from "@azure/msal-browser";
 import { armTokenRequest } from "../auth/msalConfig";
-import { Assessment, AssessmentSummary, Finding, FindingsByCategory, Subscription } from "../types";
+import {
+  Assessment, AssessmentSummary, Finding, FindingsByCategory, PreflightResponse, Subscription,
+} from "../types";
 
 const http = axios.create({ baseURL: "/api" });
 
@@ -31,6 +33,14 @@ export function useApi() {
   return {
     async getSubscriptions(): Promise<Subscription[]> {
       const { data } = await http.get<Subscription[]>("/subscriptions/", {
+        headers: await authHeaders(),
+      });
+      return data;
+    },
+
+    async preflight(subscriptionId: string): Promise<PreflightResponse> {
+      const { data } = await http.get<PreflightResponse>("/assessments/preflight", {
+        params: { subscription_id: subscriptionId },
         headers: await authHeaders(),
       });
       return data;

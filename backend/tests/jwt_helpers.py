@@ -26,13 +26,27 @@ def make_keypair(kid: str = "test-kid"):
     return priv_pem, jwk
 
 
+TEST_CLIENT_ID = "test-client-id"
+
+
 def make_token(priv_pem, kid: str = "test-kid", **claims) -> str:
+    """Mint a realistic RS256 Entra token. Defaults model a delegated ARM token for our app:
+    `aud`=ARM, `iss`=login.microsoftonline.com/<tid>/v2.0, `appid`/`azp`=our client id, `scp`=delegated.
+    Override any claim via kwargs (e.g. tid, aud, appid, iss) to exercise the verifier's checks."""
     now = int(time.time())
+    tid = claims.get("tid", "tenant-1")
     payload = {
-        "oid": "user-1", "tid": "tenant-1", "upn": "u@x.com",
-        "aud": "https://management.azure.com/", "iat": now, "exp": now + 3600,
+        "oid": "user-1", "tid": tid, "upn": "u@x.com",
+        "aud": "https://management.azure.com/",
+        "iss": f"https://login.microsoftonline.com/{tid}/v2.0",
+        "appid": TEST_CLIENT_ID, "azp": TEST_CLIENT_ID,
+        "scp": "user_impersonation",
+        "iat": now, "exp": now + 3600,
     }
     payload.update(claims)
+    # Keep iss consistent with an overridden tid unless the caller set iss explicitly.
+    if "tid" in claims and "iss" not in claims:
+        payload["iss"] = f"https://login.microsoftonline.com/{claims['tid']}/v2.0"
     return jwt.encode(payload, priv_pem, algorithm="RS256", headers={"kid": kid})
 
 

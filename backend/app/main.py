@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .database import Base, engine
+from .database import Base, engine, ensure_runtime_columns
 from .api.routes import assessments, subscriptions
 from .errors import register_error_handlers
 from .logging_config import configure_logging
@@ -28,6 +28,8 @@ if not settings.verify_token_signature:
 
 # Auto-create tables (Alembic handles migrations in production)
 Base.metadata.create_all(bind=engine)
+# Top up any columns added after the dev DB was first created (no-op once migrated).
+ensure_runtime_columns()
 
 
 @asynccontextmanager

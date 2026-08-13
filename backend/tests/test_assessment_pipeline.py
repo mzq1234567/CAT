@@ -18,8 +18,14 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base
 from app.models.db import Assessment, AssessmentEvent, Finding, InventoryItem
 from app.services import assessment as pipeline
+from app.services import resilience
 from app.services.azure_client import AzureClient
 from app.services.pricing import PricingEngine
+
+
+async def _instant_sleep(_seconds):
+    """Patch-in for resilience._sleep so retry backoff doesn't actually wait during tests."""
+    return None
 from tests.azure_mocks import (
     ARG_ORPHANED_IP,
     ARG_RUNNING_VM,
@@ -90,9 +96,21 @@ def _composite_handler(*, metric_values=(2.0,) * 7, max_metric_values=None, advi
         if "/providers/Microsoft.CostManagement/query" in path:
             if cost_status != 200:
                 return httpx.Response(cost_status, json={"error": {"message": "no cost access"}})
-            grouping = json.loads(request.content.decode())["dataset"]["grouping"][0]["name"]
+            body = json.loads(request.content.decode())
+            grouping = body["dataset"]["grouping"][0]["name"]
             if grouping == "ServiceName":
                 return httpx.Response(200, json={"properties": {"columns": SERVICE_COLUMNS, "rows": service_rows}})
+            # Per-resource cost. The MONTHLY-history query (granularity=Monthly) returns each resource
+            # across TWO steady complete months (→ stable, so the representative basis = last month =
+            # the row's cost). The month-to-date query (granularity=None) returns the single MTD figure.
+            if body["dataset"].get("granularity") == "Monthly":
+                month_cols = [{"name": "Cost"}, {"name": "ResourceId"},
+                              {"name": "BillingMonth"}, {"name": "Currency"}]
+                month_rows = []
+                for cost, rid, cur in cost_rows:
+                    month_rows.append([cost, rid, "2025-06-01", cur])
+                    month_rows.append([cost, rid, "2025-07-01", cur])
+                return httpx.Response(200, json={"properties": {"columns": month_cols, "rows": month_rows}})
             return httpx.Response(200, json={"properties": {"columns": COST_COLUMNS, "rows": cost_rows}})
         if "/providers/microsoft.insights/metrics" in path:
             metric_name = request.url.params.get("metricnames", "")
@@ -120,8 +138,10 @@ def pipeline_env(monkeypatch):
 
     def _install(handler):
         transport = httpx.MockTransport(handler)
+        # Forward **kw (max_concurrency, stats, retries, base_delay) so the pipeline's real client
+        # config — concurrency caps and the shared RetryStats — is exercised end-to-end, not dropped.
         monkeypatch.setattr(pipeline, "AzureClient",
-                            lambda token, **kw: AzureClient(token, transport=transport))
+                            lambda token, **kw: AzureClient(token, transport=transport, **kw))
         monkeypatch.setattr(pipeline, "get_pricing_engine",
                             lambda currency=None: PricingEngine(transport=transport))
 
@@ -160,9 +180,11 @@ async def test_full_pipeline_produces_findings_and_totals(pipeline_env):
     assert categories == {"unattached_managed_disks", "orphaned_public_ips", "idle_vms"}
     assert a.findings_count == 3
 
-    # Totals: disk 19.71 + IP 3.65 + idle VM 70.08 = 93.44 (live retail prices).
-    assert a.total_savings_monthly == 93.44
-    assert a.total_savings_annual == round(93.44 * 12, 2)
+    # Every saving is GROUNDED in the resource's actual billed cost (Cost Management), never the retail
+    # list price: disk 25.0 + IP 4.0 + idle VM 70.08 (payg ≤ its actual 72) = 99.08.
+    assert a.total_savings_monthly == 99.08
+    assert a.total_savings_annual == round(99.08 * 12, 2)
+    assert all(f.evidence_state == "quantified" for f in findings)
 
     # All three validated against actual cost (estimate within tolerance).
     assert a.needs_review_count == 0
@@ -237,11 +259,10 @@ async def test_pipeline_detects_billing_currency(pipeline_env):
 
 async def test_pipeline_without_cost_access(pipeline_env):
     TestSession, install, seed = pipeline_env
-    # Cost Management denied (no billing access). ARG-authoritative, live-retail-priced waste findings
-    # (unattached disk, orphaned IP) are still produced — a flat-rate resource's list price is a fair
-    # proxy for its real cost. But savings that MUST be grounded in per-resource billing to be defensible
-    # — idle/oversized VM right-sizing and Windows AHB — are correctly SUPPRESSED (not fabricated from
-    # list prices that could dwarf actual spend). So 2 findings, not 3.
+    # Cost Management denied (no billing access). With NO per-resource billed cost, orphan findings
+    # (unattached disk, orphaned IP) cannot be quantified — a retail list price is NOT customer spend —
+    # so they surface as REVIEW ("not quantified", reference price only) and contribute ZERO to the
+    # savings total. Grounded-only savings (idle/oversized VM, AHB) are SUPPRESSED entirely.
     install(_composite_handler(cost_status=403))
     aid = seed()
 
@@ -250,13 +271,166 @@ async def test_pipeline_without_cost_access(pipeline_env):
     s = TestSession()
     a = s.get(Assessment, aid)
     assert a.status == "completed"
-    assert a.findings_count == 2                 # disk + IP (live retail); no ungrounded VM/AHB savings
-    cats = {f.category for f in s.query(Finding).all()}
+    findings = s.query(Finding).filter(Finding.assessment_id == aid).all()
+    assert a.findings_count == 2                 # disk + IP, both REVIEW
+    cats = {f.category for f in findings}
     assert "idle_vms" not in cats and "windows_ahb" not in cats  # grounded-only → suppressed
-    assert a.total_savings_annual > 0
-    assert a.cost_data_available == 0            # but no spend data
+    assert all(f.evidence_state == "review" for f in findings)   # never a fabricated saving
+    assert all(f.estimated_savings_monthly == 0 for f in findings)
+    assert a.total_savings_annual == 0           # REVIEW findings never count toward the total
+    assert a.cost_data_available == 0
     assert a.current_monthly_spend is None
     assert a.current_annual_spend is None
+
+
+async def test_pipeline_degraded_billing_marks_findings_review(pipeline_env, monkeypatch):
+    # The SUBSCRIPTION total came through but the PER-RESOURCE cost query returned nothing (Cost
+    # Management throttled the heavier query). With no billed cost to ground them, orphan findings
+    # (unattached disk, orphaned IP) are REVIEW ("not quantified", reference price only) — never a
+    # fabricated saving — the run is flagged billing_detail_unavailable, and the total stays zero.
+    TestSession, install, seed = pipeline_env
+    monkeypatch.setattr(pipeline, "COST_MAP_RETRY_DELAY_SECONDS", 0)  # don't wait out the (mock) throttle
+    install(_composite_handler(cost_rows=[]))   # empty per-resource cost; service-level spend present
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    a = s.get(Assessment, aid)
+    assert a.status == "completed"
+    assert a.billing_detail_unavailable == 1
+    findings = s.query(Finding).filter(Finding.assessment_id == aid).all()
+    assert findings and all(f.evidence_state == "review" for f in findings)  # nothing fabricated
+    assert a.total_savings_annual == 0                                       # no quantified savings
+    assert a.current_monthly_spend is not None and a.current_monthly_spend > 0  # sub total still shown
+
+
+# ── Data-collection completeness (Batch 2): missing data is NOT zero / never a false "complete" ─────
+
+async def test_inventory_bucket_failure_marks_run_partial(pipeline_env, monkeypatch):
+    # One Resource Graph bucket fails (throttle/error after retries). It must NOT read as "no resources
+    # of that type": the run is flagged PARTIAL with a concise client message, still completing.
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())
+    aid = seed()
+
+    real = pipeline.collect_inventory
+
+    async def _one_bucket_fails(client, subs):
+        inventory, errors = await real(client, subs)
+        errors["orphaned_public_ips"] = "throttled after retries"   # simulate a failed bucket
+        inventory["orphaned_public_ips"] = []
+        return inventory, errors
+    monkeypatch.setattr(pipeline, "collect_inventory", _one_bucket_fails)
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    assert a.status == "completed"
+    assert a.data_quality == "partial"
+    assert a.data_quality_message and "could not be collected" in a.data_quality_message
+    assert a.collection_diagnostics["inventory_failed_buckets"] == ["orphaned_public_ips"]
+
+
+async def test_inventory_summary_failure_leaves_count_unknown_not_zero(pipeline_env, monkeypatch):
+    # The resource-COUNT query fails. The count must be recorded as UNKNOWN (None), not a fabricated 0,
+    # and the run flagged PARTIAL.
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())
+    aid = seed()
+
+    async def _summary_fails(client, subs):
+        return 0, 0, [], False   # ok=False → count unknown
+    monkeypatch.setattr(pipeline, "_gather_inventory_summary", _summary_fails)
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    assert a.data_quality == "partial"
+    assert a.collection_diagnostics["resources_discovered"] is None       # UNKNOWN, never a false 0
+    assert a.collection_diagnostics["inventory_summary_failed"] is True
+
+
+async def test_metrics_failure_marks_partial_not_idle(pipeline_env, monkeypatch):
+    # Metrics collection fails for the VMs. A failed metric must NOT be read as 0% utilisation / idle —
+    # the VM is left un-classifiable (no idle finding) and the run is flagged PARTIAL.
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())
+    aid = seed()
+
+    async def _metrics_fail(client, vms, days=30, report=None):
+        if report is not None:
+            report.note_metrics(len(vms), len(vms))    # every VM's metric call failed
+        return [{**vm, "max_cpu": None, "avg_cpu": None, "cpu_datapoints": 0,
+                 "peak_memory_used_pct": None, "memory_available": False,
+                 "metric_window_days": days, "metrics_failed": True} for vm in vms]
+    monkeypatch.setattr(pipeline, "enrich_vms_with_metrics", _metrics_fail)
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    cats = {f.category for f in TestSession().query(Finding).filter(Finding.assessment_id == aid)}
+    assert "idle_vms" not in cats                       # failed metrics never become "idle"
+    assert a.data_quality == "partial"
+    assert a.collection_diagnostics["metrics_failed"] >= 1
+
+
+async def test_billing_transient_failure_marks_partial(pipeline_env, monkeypatch):
+    # A transient 500 on Cost Management (after retries) is a FAILURE, not "zero spend" → PARTIAL.
+    TestSession, install, seed = pipeline_env
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)   # don't actually wait out the backoff
+    install(_composite_handler(cost_status=500))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    assert a.status == "completed"
+    assert a.data_quality == "partial"
+    assert a.collection_diagnostics["billing_failed_subs"] >= 1
+
+
+async def test_all_inventory_failed_marks_failed_no_false_complete(pipeline_env, monkeypatch):
+    # Every inventory bucket fails → no defensible view of the environment → FAILED (never a clean
+    # "complete, no findings" assessment that would read as "well-optimised").
+    from app.services.kql import filtered_inventory_queries
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())
+    aid = seed()
+
+    async def _all_fail(client, subs):
+        buckets = list(filtered_inventory_queries().keys())
+        return {b: [] for b in buckets}, {b: "throttled after retries" for b in buckets}
+    monkeypatch.setattr(pipeline, "collect_inventory", _all_fail)
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    assert a.data_quality == "failed"
+    assert a.findings_count == 0
+    assert a.total_savings_annual == 0
+    assert a.data_quality_message and "could not be collected" in a.data_quality_message
+
+
+async def test_pipeline_derives_spend_from_per_resource_when_service_query_empty(pipeline_env):
+    TestSession, install, seed = pipeline_env
+    # Cost Management returned PER-RESOURCE cost (findings are grounded) but the SERVICE-level spend query
+    # came back empty (a common transient throttle). The current spend must be DERIVED from the
+    # per-resource cost — not left blank as "Awaiting billing data" — and projected spend must show.
+    install(_composite_handler(service_rows=[]))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    a = s.get(Assessment, aid)
+    assert a.status == "completed"
+    assert a.cost_data_available == 1                    # we DO have cost (per-resource), so not "awaiting"
+    assert a.current_monthly_spend is not None and a.current_monthly_spend > 0
+    assert a.spend_estimated == 1                        # derived from per-resource cost → flagged estimate
+    # Derived spend = sum of the per-resource cost basis (disk 25 + VM 72 + IP 4 = 101).
+    assert a.current_monthly_spend == 101.0
+    assert a.current_annual_spend == round(101.0 * 12, 2)
 
 
 async def test_pipeline_caps_overestimate_to_actual_cost(pipeline_env):
@@ -332,7 +506,7 @@ async def test_scan_counts_are_published_before_the_run_finishes(pipeline_env, m
     seen = {}
     original = pipeline.enrich_vms_with_metrics
 
-    async def _spy(client, vms):
+    async def _spy(client, vms, **kwargs):
         # Step 2 (metrics) runs after inventory — the counts must already be readable by now.
         s = TestSession()
         a = s.get(Assessment, aid)
@@ -340,7 +514,7 @@ async def test_scan_counts_are_published_before_the_run_finishes(pipeline_env, m
         seen["types"] = a.resource_type_count
         seen["status"] = a.status
         s.close()
-        return await original(client, vms)
+        return await original(client, vms, **kwargs)
 
     monkeypatch.setattr(pipeline, "enrich_vms_with_metrics", _spy)
 
@@ -351,9 +525,11 @@ async def test_scan_counts_are_published_before_the_run_finishes(pipeline_env, m
     assert seen["types"] and seen["types"] > 0
 
 
-def test_all_savings_including_ahb_counted_in_headline_total(pipeline_env):
-    # Every identified saving — including Azure Hybrid Benefit — contributes to the headline total
-    # (the UI carries an info note that savings may include AHB where applicable).
+def test_only_realisable_savings_counted_in_headline_total(pipeline_env):
+    # Conditional Azure Hybrid Benefit savings (windows_ahb / sql_ahb) are realised ONLY if the customer
+    # already owns eligible licences, so they must NOT inflate the headline total — they're surfaced
+    # separately as "potential". Only realisable findings (e.g. the RI) count toward the total; every
+    # finding still contributes to findings_count.
     TestSession, _install, seed = pipeline_env
     aid = seed()
     findings = [
@@ -369,6 +545,6 @@ def test_all_savings_including_ahb_counted_in_headline_total(pipeline_env):
     s.close()
 
     a = TestSession().get(Assessment, aid)
-    assert a.total_savings_monthly == 1050.0    # 100 + 900 + 50
-    assert a.total_savings_annual == 12600.0    # 1200 + 10800 + 600
-    assert a.findings_count == 3
+    assert a.total_savings_monthly == 100.0     # RI only; AHB (900 + 50) excluded from the headline
+    assert a.total_savings_annual == 1200.0     # RI only; AHB (10800 + 600) excluded
+    assert a.findings_count == 3                # all three are still recorded as findings

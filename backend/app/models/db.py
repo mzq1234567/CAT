@@ -30,6 +30,17 @@ class Assessment(Base):
     current_annual_spend = Column(Float, nullable=True)
     spend_by_area = Column(JSON, nullable=True)  # {area: monthly_cost}
     cost_data_available = Column(Integer, default=0)  # 0/1 — did we get any cost data?
+    # Set when the SUBSCRIPTION-level spend was obtained but the PER-RESOURCE billed-cost detail was NOT
+    # (Cost Management throttled the heavier per-resource query). In that state grounded findings can't be
+    # quantified, so ungrounded list-price findings are withheld and the UI shows a "re-run" banner. 0/1.
+    billing_detail_unavailable = Column(Integer, default=0)
+    # Azure data-collection quality: "complete" | "partial" | "failed". PARTIAL/FAILED means some Azure
+    # data could not be collected (throttle/timeout/error after retries) — missing data is NOT zero, so
+    # such a run must never present as a clean complete assessment. `data_quality_message` is the concise
+    # client-facing line; `collection_diagnostics` is the detailed internal record (for logs/debug).
+    data_quality = Column(String, default="complete")
+    data_quality_message = Column(String, nullable=True)
+    collection_diagnostics = Column(JSON, nullable=True)
     # Spend is an ESTIMATED run rate (no complete billing month — new/migrated sub) rather than a real
     # last-month bill. `spend_period_days` = days of billing the estimate was averaged over.
     spend_estimated = Column(Integer, default=0)  # 0/1
@@ -64,6 +75,12 @@ class Finding(Base):
     resource_type = Column(String, nullable=True)
     estimated_savings_monthly = Column(Float, default=0.0)
     estimated_savings_annual = Column(Float, default=0.0)
+    # Non-overlapping contribution to Total Identified Savings (RI vs right-sizing de-overlapped). Equals
+    # estimated_savings_* unless this finding overlaps another on the same VM's compute; the total sums
+    # these, while the UI still displays each finding's own estimated_savings_*. NULL (never set) → callers
+    # fall back to estimated_savings_*, so a superseded 0 is distinguishable from an unset value.
+    counted_savings_monthly = Column(Float, nullable=True)
+    counted_savings_annual = Column(Float, nullable=True)
     severity = Column(String, default="medium")
     confidence = Column(Float, default=0.0)  # 0..1 (Step 6)
     description = Column(Text)
@@ -73,6 +90,9 @@ class Finding(Base):
     validation_status = Column(String, nullable=True)  # validated | needs_review | unvalidated
     validation_variance_pct = Column(Float, nullable=True)
     actual_monthly_cost = Column(Float, nullable=True)
+    # Financial evidence state — "quantified" (defensible, countable saving) or "review" (real signal,
+    # unquantifiable for this customer → shown as "Not quantified", excluded from every savings total).
+    evidence_state = Column(String, default="quantified")
     # DEV-ONLY reasoning; gated by DEBUG_FINDINGS_REASONING.
     # TODO: remove or gate behind admin-only role before prod.
     debug_reason = Column(Text, nullable=True)

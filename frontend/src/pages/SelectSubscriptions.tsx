@@ -9,8 +9,12 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 import AssessmentIcon from "@mui/icons-material/Assessment";
 import SearchIcon from "@mui/icons-material/Search";
 import CloudOffIcon from "@mui/icons-material/CloudOff";
+import FactCheckIcon from "@mui/icons-material/FactCheck";
+import ArrowBackIcon from "@mui/icons-material/ArrowBack";
 import Layout from "../components/Layout";
+import PreflightReadiness from "../components/PreflightReadiness";
 import { useApi } from "../services/api";
+import { errorMessage } from "../services/errors";
 import { colors } from "../theme";
 
 export default function SelectSubscriptions() {
@@ -18,6 +22,10 @@ export default function SelectSubscriptions() {
   const navigate = useNavigate();
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
   const [search, setSearch] = React.useState("");
+  // Two-step flow: pick subscriptions → verify readiness → run. `checking` gates the readiness step;
+  // `allReady` (reported up by PreflightReadiness) gates the "Run assessment" button.
+  const [checking, setChecking] = React.useState(false);
+  const [allReady, setAllReady] = React.useState(false);
 
   const { data: subscriptions, isLoading, error } = useQuery({
     queryKey: ["subscriptions"],
@@ -39,6 +47,11 @@ export default function SelectSubscriptions() {
   const selectAll = () => setSelected(new Set(subscriptions?.map((s) => s.id) ?? []));
   const deselectAll = () => setSelected(new Set());
 
+  const selectedSubs = React.useMemo(
+    () => (subscriptions ?? []).filter((s) => selected.has(s.id)),
+    [subscriptions, selected]
+  );
+
   const filtered = React.useMemo(() => {
     if (!subscriptions) return [];
     const q = search.trim().toLowerCase();
@@ -53,8 +66,7 @@ export default function SelectSubscriptions() {
     return (
       <Layout title="Select Subscriptions" subtitle="Choose the Azure subscriptions to assess.">
         <Alert severity="error">
-          Failed to load subscriptions. Ensure your token has{" "}
-          <strong>Azure Management</strong> access and try again.
+          We couldn't load your Azure subscriptions. Please refresh to try again.
         </Alert>
       </Layout>
     );
@@ -65,15 +77,16 @@ export default function SelectSubscriptions() {
   return (
     <Layout
       title="Select Subscriptions"
-      subtitle="Choose one or more Azure subscriptions to analyse. The assessment scans all resources using your Reader access."
+      subtitle="Choose the Azure subscriptions you want to assess. We use your existing Azure access to review the environment — read-only, with no changes to your resources."
     >
       <Box maxWidth={820} sx={{ pb: 12 }}>
         {mutation.isError && (
           <Alert severity="error" sx={{ mb: 2 }}>
-            {String((mutation.error as Error).message)}
+            {errorMessage(mutation.error)}
           </Alert>
         )}
 
+        {!checking && (
         <Card sx={{ mb: 3 }}>
           <CardContent sx={{ p: 3 }}>
             <Box
@@ -191,6 +204,18 @@ export default function SelectSubscriptions() {
             </Box>
           </CardContent>
         </Card>
+        )}
+
+        {checking && (
+          <Card sx={{ mb: 3 }}>
+            <CardContent sx={{ p: { xs: 2.5, md: 3.5 } }}>
+              <PreflightReadiness
+                subscriptions={selectedSubs}
+                onReadyChange={setAllReady}
+              />
+            </CardContent>
+          </Card>
+        )}
       </Box>
 
       {/* Sticky action bar */}
@@ -218,18 +243,50 @@ export default function SelectSubscriptions() {
           </Box>{" "}
           of {total} selected
         </Typography>
-        <Button
-          variant="contained"
-          size="large"
-          startIcon={
-            mutation.isPending ? <CircularProgress size={18} color="inherit" /> : <AssessmentIcon />
-          }
-          disabled={selected.size === 0 || mutation.isPending}
-          onClick={() => mutation.mutate(Array.from(selected))}
-          sx={{ px: 4, py: 1.25, fontSize: 15 }}
-        >
-          {mutation.isPending ? "Starting…" : "Run Assessment"}
-        </Button>
+
+        {!checking ? (
+          <Button
+            variant="contained"
+            size="large"
+            startIcon={<FactCheckIcon />}
+            disabled={selected.size === 0}
+            onClick={() => {
+              setAllReady(false);
+              setChecking(true);
+            }}
+            sx={{ px: 4, py: 1.25, fontSize: 15 }}
+          >
+            Check access & continue
+          </Button>
+        ) : (
+          <Box display="flex" gap={1.5} alignItems="center">
+            <Button
+              size="large"
+              color="inherit"
+              startIcon={<ArrowBackIcon />}
+              disabled={mutation.isPending}
+              onClick={() => {
+                setChecking(false);
+                setAllReady(false);
+              }}
+              sx={{ py: 1.25 }}
+            >
+              Change selection
+            </Button>
+            <Button
+              variant="contained"
+              size="large"
+              startIcon={
+                mutation.isPending ? <CircularProgress size={18} color="inherit" /> : <AssessmentIcon />
+              }
+              disabled={!allReady || mutation.isPending}
+              onClick={() => mutation.mutate(Array.from(selected))}
+              sx={{ px: 4, py: 1.25, fontSize: 15 }}
+            >
+              {mutation.isPending ? "Starting…" : "Run Assessment"}
+            </Button>
+          </Box>
+        )}
       </Box>
     </Layout>
   );

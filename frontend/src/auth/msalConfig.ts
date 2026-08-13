@@ -9,7 +9,10 @@ export const msalConfig: Configuration = {
     postLogoutRedirectUri: window.location.origin,
   },
   cache: {
-    cacheLocation: "localStorage",
+    // Security: keep Azure access/refresh tokens in sessionStorage, NOT localStorage — they are then
+    // scoped to the tab/session and cleared on close, reducing the window and blast radius of an XSS
+    // token theft. (Tradeoff: a new tab requires a silent re-auth, which MSAL handles via the session.)
+    cacheLocation: "sessionStorage",
     storeAuthStateInCookie: false,
   },
 };

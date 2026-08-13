@@ -278,8 +278,10 @@ async def get_runrate_baseline(
 
     For a subscription with no complete previous billing month (new or recently migrated), the last
     "month" is a partial fragment that badly under- or mis-states spend. Instead we take the observed
-    billing period (first day with cost → last day with cost), compute the average daily spend, and
-    normalise it to a representative month. Returns None when no daily cost data is available.
+    billing period (first day with cost → last day with cost — the DAILY data is authoritative on which
+    days actually billed, so a subscription that only started billing part-way through last month is
+    correctly measured from that day, not from the 1st), compute the average daily spend, and normalise
+    it to a representative month. Returns None when no daily cost data is available.
     """
     payload = await client.query_cost_management(
         subscription_id, build_daily_service_cost_query(now=now, days_back=days_back))
@@ -425,27 +427,128 @@ def linear_growth_rate(monthly_totals: List[float], min_months: int = 3,
     return round(min(rate, max_rate), 4)
 
 
+# ── Representative monthly cost (the single grounding basis for every finding) ──────
+#
+# The problem this solves: grounding savings in ONE arbitrary month is wrong in two ways —
+#   * partial billing (new/migrated sub): the "last month" is a fragment → understates (AHB #72);
+#   * bursty/erratic resource: the last complete month may be a quiet one → understates vs the real
+#     current activity (the LABS training subscription: quiet July, busy August).
+# So per resource we choose a REPRESENTATIVE monthly figure, distinguishing four separate numbers and
+# never conflating them: actual billed spend, historical representative spend, current run-rate, and
+# the estimated saving derived from the chosen basis. See FIX_PLAN_COST_BASIS_AND_AHB.md §3-A.
+
+# A resource/subscription is flagged high-variability when its current run-rate diverges from its
+# historical mean by this factor or more (ratio outside [1/2, 2]).
+DIVERGENCE_FACTOR = 2.0
+
+
+@dataclass
+class RepresentativeCost:
+    amount: float                        # the SAVINGS BASIS (what savings are computed from)
+    basis: str                           # "last_month" | "representative" | "run_rate" | "none"
+    is_estimate: bool                    # True for run-rate / averaged bases, False for a real last month
+    historical_monthly: Optional[float]  # mean of billed complete months (context)
+    current_run_rate: Optional[float]    # current month-to-date projected to a full month (context)
+    variability: str                     # "low" | "high"
+    material_divergence: bool            # current run-rate differs from historical mean by ≥ DIVERGENCE_FACTOR
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "cost_basis": self.basis, "cost_is_estimate": self.is_estimate,
+            "historical_monthly": self.historical_monthly, "current_run_rate": self.current_run_rate,
+            "cost_variability": self.variability, "cost_material_divergence": self.material_divergence,
+        }
+
+
+def _divergent(run_rate: Optional[float], mean: Optional[float]) -> bool:
+    if not run_rate or not mean or run_rate <= 0 or mean <= 0:
+        return False
+    ratio = run_rate / mean
+    return ratio >= DIVERGENCE_FACTOR or ratio <= (1.0 / DIVERGENCE_FACTOR)
+
+
+def representative_monthly_cost(
+    history: List[float], consistency_entry: Optional[Dict],
+    current_mtd: Optional[float], run_rate_factor: float,
+) -> RepresentativeCost:
+    """Choose a representative monthly cost for ONE resource (the savings basis) + its context numbers.
+
+    Rules (see the plan): stable → last complete month (actual); erratic → min(historical mean, current
+    run-rate) so it never over-states whether the spike is recent or old; partial (< 2 billed months) →
+    current run-rate (the only signal); no cost → amount 0 / basis "none" (caller suppresses the finding).
+    """
+    billed = [c for c in (history or []) if c and c > 0]
+    billed_months = len(billed)
+    last_month = round((history[-1] if history else 0.0) or 0.0, 2)
+    mean = round(sum(billed) / len(billed), 2) if billed else 0.0
+    stable = bool(consistency_entry.get("stable")) if consistency_entry else (
+        billed_months >= 2 and (consistency_entry or {}).get("cv", 1.0) <= 0.25)
+    run_rate = (round(current_mtd * run_rate_factor, 2)
+                if (current_mtd and current_mtd > 0 and run_rate_factor > 0) else None)
+    hist = mean if mean > 0 else None
+    diverge = _divergent(run_rate, mean)
+
+    if not billed and not (current_mtd and current_mtd > 0):
+        return RepresentativeCost(0.0, "none", False, None, None, "low", False)
+
+    if billed_months < 2:
+        # Partial billing: run-rate the fragment to a month (the only representative signal). Fall back
+        # to the raw MTD, then last month, if a factor isn't available.
+        amount = run_rate if run_rate is not None else round((current_mtd or last_month) or 0.0, 2)
+        return RepresentativeCost(amount, "run_rate", True, hist, run_rate, "high", diverge)
+    if stable:
+        return RepresentativeCost(last_month, "last_month", False, hist, run_rate, "low", diverge)
+    # Erratic: never over-state — take the lower of the historical mean and the current run-rate.
+    amount = round(min(mean, run_rate), 2) if run_rate is not None else mean
+    return RepresentativeCost(amount, "representative", True, hist, run_rate, "high", diverge)
+
+
 async def get_cost_map_and_consistency(
     client: AzureClient, subscription_id: str, months: int = 4, now: Optional[datetime] = None,
-) -> tuple[Dict[str, float], Dict[str, Dict], Dict[str, float]]:
-    """One monthly-history query → the last-month cost basis, month-over-month consistency, AND the
-    per-month spend totals (for the report's growth trend).
+) -> tuple[Dict[str, float], Dict[str, Dict], Dict[str, float], Dict[str, RepresentativeCost], Optional[str]]:
+    """Per-resource REPRESENTATIVE cost basis + month-over-month consistency + per-month totals +
+    per-resource cost-basis metadata.
 
-    Reading these from a single Cost Management call (instead of several) keeps load off the heavily
-    throttled billing API. `cost_map` = each resource's most recent complete month; if that's empty
-    (brand-new subscription) it falls back to month-to-date so cost data is never lost.
+    Two Cost Management calls: the monthly history (last `months` complete months → the basis, the
+    steadiness signal, and the growth-trend totals) and the current month-to-date (→ the current
+    run-rate). Each resource's `cost_map` figure is chosen by `representative_monthly_cost`, so a
+    partial-billing fragment is run-rated and a bursty resource uses a conservative representative
+    figure — never a single arbitrary month.
     """
+    now = now or datetime.now(timezone.utc)
     payload = await client.query_cost_management(
         subscription_id, build_monthly_history_query(months=months, now=now))
     history = parse_monthly_history(payload)
     consistency = cost_consistency(history)
     monthly_totals = parse_monthly_totals(payload)
-    cost_map = {rid: costs[-1] for rid, costs in history.items() if costs and costs[-1] > 0}
-    if not cost_map:  # new subscription with no complete month → current month so far
-        mtd = await client.query_cost_management(
+    # Billing currency from the per-resource billing response — a second authoritative source, so a
+    # throttled service-cost query can't leave the run without a currency (→ silent USD fallback).
+    currency = extract_currency(payload)
+
+    # Current month-to-date per resource → drives the run-rate. Only needed when the last complete month
+    # ISN'T a safe basis on its own: a partial-billing subscription (no complete month) or ≥1 erratic
+    # resource. When every resource is stable we use its last complete month and skip the extra
+    # (throttle-sensitive) Cost Management call entirely.
+    need_run_rate = (not history) or any(not c.get("stable", False) for c in consistency.values())
+    mtd: Dict[str, float] = {}
+    if need_run_rate:
+        mtd_payload = await client.query_cost_management(
             subscription_id, build_cost_query(now=now, month_to_date=True))
-        cost_map = parse_cost_rows(mtd)
-    return cost_map, consistency, monthly_totals
+        mtd = parse_cost_rows(mtd_payload)
+        currency = currency or extract_currency(mtd_payload)
+
+    days_elapsed = max(now.day, 1)                       # days into the current calendar month
+    run_rate_factor = AVG_DAYS_PER_MONTH / days_elapsed
+
+    cost_map: Dict[str, float] = {}
+    cost_basis: Dict[str, RepresentativeCost] = {}
+    for rid in set(history) | set(mtd):
+        rep = representative_monthly_cost(
+            history.get(rid, []), consistency.get(rid), mtd.get(rid), run_rate_factor)
+        cost_basis[rid] = rep
+        if rep.amount and rep.amount > 0:
+            cost_map[rid] = rep.amount
+    return cost_map, consistency, monthly_totals, cost_basis, currency
 
 
 def cost_consistency(history: Dict[str, list], min_stable_months: int = 2,

@@ -18,12 +18,17 @@ from typing import Awaitable, Callable, Optional
 
 import httpx
 
+from .collection import RetryStats
+
 logger = logging.getLogger("cat.resilience")
 
 _sleep = asyncio.sleep  # patched in tests
 # 429 = throttled; 500/502/503/504 = transient server errors Azure (esp. Cost Management) throws under
 # load. All are safe to retry with backoff — they self-heal within the run instead of losing data.
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# Upper bound on a single backoff wait, so an aggressive Retry-After or a high attempt count can never
+# stall the run indefinitely (the retry count is already bounded; this bounds each wait's duration).
+MAX_BACKOFF_SECONDS = 60.0
 
 
 class CircuitOpenError(RuntimeError):
@@ -80,40 +85,71 @@ async def retry_request(
     max_retries: int = 4,
     base_delay: float = 0.5,
     breaker: Optional[CircuitBreaker] = None,
+    label: str = "azure call",
+    stats: Optional[RetryStats] = None,
 ) -> httpx.Response:
-    """Call `send()` with retry/backoff on throttling + a circuit breaker.
+    """Call `send()` with bounded retry/backoff on throttling + a circuit breaker.
 
     Returns the final `httpx.Response` (the caller still decides via `raise_for_status`). Transport
     errors are retried and re-raised if they persist. When `breaker` is open, raises CircuitOpenError.
+
+    Retries are BOUNDED by `max_retries`; each wait is bounded by MAX_BACKOFF_SECONDS. Retryable
+    responses are 429 (throttled) and transient 5xx, honouring `Retry-After` when Azure supplies it,
+    else exponential backoff with full jitter. `label` names the API/resource for logs (never a token
+    or secret — headers are not logged). `stats` accrues run-level throttle/retry counters.
     """
     attempt = 0
     while True:
         if breaker is not None and not breaker.allow():
-            raise CircuitOpenError(f"Circuit '{breaker.name}' is open; failing fast.")
+            raise CircuitOpenError(f"Circuit '{breaker.name}' is open; failing fast for {label}.")
         try:
             response = await send()
         except httpx.TransportError as exc:
+            if stats is not None:
+                stats.transport_errors += 1
             if breaker is not None:
                 breaker.record_failure()
             if attempt >= max_retries:
-                logger.warning("Transport error after %d retries: %s", attempt, exc)
+                logger.warning("%s: transport error after %d retries: %s",
+                               label, attempt, type(exc).__name__)
                 raise
-            await _sleep(_backoff(base_delay, attempt))
-            attempt += 1
-            continue
-
-        if response.status_code in RETRYABLE_STATUS and attempt < max_retries:
-            delay = _retry_after_seconds(response) or _backoff(base_delay, attempt)
-            logger.info("Throttled (%d); retrying in %.2fs (attempt %d)",
-                        response.status_code, delay, attempt + 1)
+            delay = _backoff(base_delay, attempt)
+            if stats is not None:
+                stats.retries += 1
+            logger.info("%s: transport error (%s); retry %d/%d in %.2fs",
+                        label, type(exc).__name__, attempt + 1, max_retries, delay)
             await _sleep(delay)
             attempt += 1
             continue
 
-        if response.status_code in RETRYABLE_STATUS:
-            # Retries exhausted while still throttled → count as a failure.
+        status = response.status_code
+        if status in RETRYABLE_STATUS and stats is not None:
+            if status == 429:
+                stats.throttled_responses += 1
+            else:
+                stats.server_errors += 1
+
+        if status in RETRYABLE_STATUS and attempt < max_retries:
+            retry_after = _retry_after_seconds(response)
+            delay = min(retry_after, MAX_BACKOFF_SECONDS) if retry_after is not None else _backoff(base_delay, attempt)
+            reason = "throttled (429)" if status == 429 else f"server error ({status})"
+            if stats is not None:
+                stats.retries += 1
+            logger.info("%s: %s; retry %d/%d in %.2fs%s",
+                        label, reason, attempt + 1, max_retries, delay,
+                        " (Retry-After)" if retry_after is not None else "")
+            await _sleep(delay)
+            attempt += 1
+            continue
+
+        if status in RETRYABLE_STATUS:
+            # Retries exhausted while still throttled/erroring → count as a failure (never silently ok).
+            if stats is not None:
+                stats.exhausted += 1
             if breaker is not None:
                 breaker.record_failure()
+            logger.warning("%s: still %d after %d retries — giving up (data may be incomplete).",
+                           label, status, max_retries)
             return response
 
         if breaker is not None:
@@ -122,5 +158,5 @@ async def retry_request(
 
 
 def _backoff(base_delay: float, attempt: int) -> float:
-    """Exponential backoff with full jitter."""
-    return random.uniform(0, base_delay * (2 ** attempt))
+    """Exponential backoff with full jitter, capped at MAX_BACKOFF_SECONDS."""
+    return random.uniform(0, min(base_delay * (2 ** attempt), MAX_BACKOFF_SECONDS))

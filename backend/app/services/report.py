@@ -33,6 +33,9 @@ from reportlab.graphics.charts.legends import Legend
 
 from PIL import Image as PILImage
 
+from .financial_evidence import counts_toward_total
+from .findings import CONDITIONAL_CATEGORIES
+
 _ASSET_DIR = os.path.join(os.path.dirname(__file__), "..", "assets")
 _TEMPLATE_PATH = os.path.join(_ASSET_DIR, "report_template.yml")
 
@@ -192,6 +195,7 @@ _PILLAR = {
     "ri_vm": "Compute", "windows_ahb": "Compute",
     "sql_ahb": "Compute",
     "oversized_vms": "Compute", "idle_vms": "Compute", "deallocated_vms": "Compute",
+    "vm_metrics_unavailable": "Compute",
     "vm_rightsizing": "Compute", "idle_app_service_plans": "Compute",
     "app_service_plan_rightsizing": "Compute", "app_service_reserved_capacity": "Compute",
     "paused_sql_databases": "Compute", "stopped_sql_managed_instances": "Compute",
@@ -214,7 +218,38 @@ def _pillar_of(finding) -> str:
 
 
 def _annual(f) -> float:
+    """The finding's OWN displayed annual saving (individual recommendation value)."""
     return float(getattr(f, "estimated_savings_annual", 0.0) or 0.0)
+
+
+# ── Financial evidence semantics (identical to the web dashboard) ─────────────────────
+
+def _is_review(f) -> bool:
+    """A REVIEW / UNQUANTIFIED finding: a real signal we can't price for this customer."""
+    return (getattr(f, "evidence_state", None) or "quantified") == "review"
+
+
+def _counts_total(f) -> bool:
+    """Whether this finding contributes to Total Identified Savings — quantified AND not conditional."""
+    conditional = getattr(f, "category", "") in CONDITIONAL_CATEGORIES
+    return counts_toward_total(getattr(f, "evidence_state", None) or "quantified", conditional)
+
+
+def _counted_annual(f) -> float:
+    """The finding's NON-OVERLAPPING contribution to the total (RI vs right-sizing de-overlapped)."""
+    v = getattr(f, "counted_savings_annual", None)
+    return float(v if v is not None else _annual(f))
+
+
+def _reference_price(f) -> Optional[float]:
+    """A REVIEW finding's clearly-labelled reference list price (per month), or None."""
+    p = (getattr(f, "details", None) or {}).get("reference_monthly_price")
+    return float(p) if p else None
+
+
+def _superseded_by_ri(f) -> bool:
+    """A per-VM right-sizing/idle finding whose saving is counted under an RI instead (overlap)."""
+    return bool((getattr(f, "details", None) or {}).get("overlap_superseded_by_ri"))
 
 
 def _ordinal(n: int) -> str:
@@ -227,7 +262,7 @@ def _ri_items(findings: List) -> List[Dict]:
     """Per-VM Reserved Instance rows from the aggregated ri_vm finding's reservation items."""
     out: List[Dict] = []
     for f in findings:
-        if f.category != "ri_vm":
+        if f.category != "ri_vm" or _is_review(f):
             continue
         for item in (f.details or {}).get("reservation_items", []) or []:
             out.append({
@@ -251,7 +286,7 @@ def _ahb_items(findings: List) -> List[Dict]:
     """
     out: List[Dict] = []
     for f in findings:
-        if f.category != "windows_ahb":
+        if f.category != "windows_ahb" or _is_review(f):
             continue
         for vm in (f.details or {}).get("eligible_vms", []) or []:
             # None (not 0) when neither figure is present, so the cell reads "—" rather than
@@ -270,7 +305,7 @@ def _disk_sku_items(findings: List) -> List[Dict]:
     """Managed-disk SKU right-sizing rows (premium → standard SSD), when the engine emits them."""
     out: List[Dict] = []
     for f in findings:
-        if f.category != "disk_rightsizing":
+        if f.category != "disk_rightsizing" or _is_review(f):
             continue
         d = f.details or {}
         monthly_cost = getattr(f, "actual_monthly_cost", None) or d.get("monthly_cost")
@@ -286,30 +321,57 @@ def _disk_sku_items(findings: List) -> List[Dict]:
 
 
 def _pillar_rows(findings: List, pillar: str) -> List[Dict]:
-    """Catch-all rows for a pillar: every finding without a dedicated table of its own."""
+    """Catch-all rows for a pillar. Renders each finding with the SAME evidence semantics as the web:
+
+      * REVIEW / UNQUANTIFIED → "Financial impact: Not quantified" (+ reference list price, clearly
+        labelled), never a savings amount, never counted;
+      * a right-sizing/idle finding superseded by an RI (overlap) → shown, but not separately counted;
+      * otherwise → its non-overlapping counted saving.
+
+    A REVIEW finding of ANY category lands here (even if its category has a dedicated table) so it's shown
+    honestly rather than dropped.
+    """
     out: List[Dict] = []
     for f in findings:
-        if _pillar_of(f) != pillar or f.category in _DEDICATED:
+        if _pillar_of(f) != pillar:
             continue
+        if f.category in _DEDICATED and not _is_review(f):
+            continue
+        name = f.resource_name or f.display_name or "—"
+        opportunity = f.display_name or f.category
         monthly_cost = getattr(f, "actual_monthly_cost", None)
-        out.append({
-            "name": f.resource_name or f.display_name or "—",
-            "opportunity": f.display_name or f.category,
-            "annual_cost": (monthly_cost * 12) if monthly_cost else None,
-            "annual_savings": _annual(f),
-        })
-    out.sort(key=lambda r: r["annual_savings"], reverse=True)
+
+        if _is_review(f):
+            ref = _reference_price(f)
+            if ref:
+                opportunity = f"{opportunity} — reference list price {_usd(ref)}/mo (not billed cost)"
+            out.append({"name": name, "opportunity": opportunity, "annual_cost": None,
+                        "annual_savings": "Not quantified", "_sort": -1.0})
+        elif _superseded_by_ri(f):
+            out.append({"name": name,
+                        "opportunity": f"{opportunity} — alternative to a Reserved Instance",
+                        "annual_cost": (monthly_cost * 12) if monthly_cost else None,
+                        "annual_savings": "Counted under Reserved Instances", "_sort": -0.5})
+        else:
+            out.append({"name": name, "opportunity": opportunity,
+                        "annual_cost": (monthly_cost * 12) if monthly_cost else None,
+                        "annual_savings": _counted_annual(f), "_sort": _counted_annual(f)})
+    out.sort(key=lambda r: r["_sort"], reverse=True)
+    for r in out:
+        r.pop("_sort", None)
     return out
 
 
 def _pillar_options(findings: List, pillar: str) -> List[Dict]:
-    """Chart series for a pillar: annual savings grouped by opportunity type."""
+    """Chart series for a pillar: NON-OVERLAPPING counted savings grouped by opportunity type. Only
+    findings that count toward the total (quantified, non-conditional) appear — REVIEW and conditional
+    AHB are excluded so the chart reconciles with the pillar total."""
     totals: "OrderedDict[str, float]" = OrderedDict()
     for f in findings:
-        if _pillar_of(f) != pillar:
+        if _pillar_of(f) != pillar or not _counts_total(f):
             continue
         label = f.display_name or f.category
-        totals[label] = totals.get(label, 0.0) + _annual(f)
+        totals[label] = totals.get(label, 0.0) + _counted_annual(f)
     rows = [{"label": k, "value": v} for k, v in totals.items() if v > 0]
     rows.sort(key=lambda r: r["value"], reverse=True)
     return rows
@@ -339,6 +401,30 @@ def _environment_rows(assessment, findings: List) -> List[List[str]]:
         label = f"Last Month Consumption ({when})" if when else "Last Month Consumption"
         rows.append([label, _usd(assessment.current_monthly_spend, 0)])
     return rows
+
+
+def _completeness_note(assessment) -> Optional[str]:
+    """A client-safe disclosure when the run was NOT a complete assessment, so the PDF can never present
+    partial data as a finished, clean result. Prefers the stored client message; never leaks raw errors."""
+    if getattr(assessment, "billing_detail_unavailable", 0):
+        return (
+            "Azure Cost Management returned the subscription total but not per-resource billed cost for "
+            "this run (usually a temporary throttle on the billing API). Grounded savings — right-sizing, "
+            "Azure Hybrid Benefit and idle-resource savings — were withheld rather than estimated from list "
+            "price, so the figures below are a subset of what a complete run would show. Re-run in a few "
+            "minutes for complete, grounded numbers.")
+    quality = (getattr(assessment, "data_quality", None) or "complete").lower()
+    if quality == "complete":
+        return None
+    message = getattr(assessment, "data_quality_message", None)
+    if quality == "failed":
+        return message or (
+            "Azure data could not be fully collected for this assessment, so this is a partial result "
+            "rather than a complete assessment. Re-run once access and any throttling have cleared.")
+    return message or (
+        "Some Azure data could not be collected for this run, so the results are incomplete. Missing data "
+        "was never treated as zero — affected findings were withheld or listed as not quantified. Re-run "
+        "for complete figures.")
 
 
 def _context(assessment, findings: List) -> Dict:
@@ -373,7 +459,11 @@ def _context(assessment, findings: List) -> Dict:
 
     for pillar in _PILLARS:
         key = pillar.lower()
-        total = sum(_annual(f) for f in findings if _pillar_of(f) == pillar)
+        # Pillar savings = NON-OVERLAPPING counted savings of the findings that count toward the total
+        # (quantified, non-conditional). REVIEW and conditional AHB are excluded, so the pillar figures
+        # decompose the headline total exactly and never include an unquantified/list-price number.
+        total = sum(_counted_annual(f) for f in findings
+                    if _pillar_of(f) == pillar and _counts_total(f))
         ctx[f"{key}_savings"] = _usd(total)
         ctx[f"{key}_any"] = total > 0 or any(_pillar_of(f) == pillar for f in findings)
         ctx[f"{key}_options"] = _pillar_options(findings, pillar)
@@ -382,6 +472,30 @@ def _context(assessment, findings: List) -> Dict:
     ctx["vm_any"] = bool(ctx["ri_items"] or ctx["ahb_items"])
     ctx["compute_other"] = _pillar_rows(findings, "Compute")
     ctx["no_findings"] = not findings
+    ctx["has_findings"] = bool(findings)
+
+    # ── Assessment completeness — a partial/failed/billing-throttled run must never present as a clean,
+    # complete assessment. Surfaced as an honest disclosure note in the executive summary.
+    note = _completeness_note(assessment)
+    ctx["data_incomplete"] = note is not None
+    ctx["completeness_note"] = note or ""
+
+    # ── Quantified vs review split — REVIEW findings (a real signal we couldn't price for this customer)
+    # are listed as "Not quantified" in the tables and excluded from every total. State the count so the
+    # split is explicit, not buried in the tables.
+    review_count = sum(1 for f in findings if _is_review(f))
+    ctx["has_review"] = review_count > 0
+    ctx["review_count"] = review_count
+    plural = "opportunities" if review_count != 1 else "opportunity"
+    ctx["review_note"] = (
+        f"A further {review_count} {plural} could not be priced for your subscription (for example, a "
+        "resource with no billed cost available for this run). They are listed as “Not quantified” "
+        "in the tables that follow and are deliberately excluded from every savings figure above — we never "
+        "estimate a number we cannot ground in your data."
+    ) if review_count else ""
+
+    # AHB is present → the totals deliberately exclude it (conditional). Drives the basis note's AHB clause.
+    ctx["has_conditional"] = any(getattr(f, "category", "") in CONDITIONAL_CATEGORIES for f in findings)
     return ctx
 
 
@@ -671,6 +785,10 @@ def _decorate(tpl: Dict):
 def _fmt(value, kind: Optional[str]) -> str:
     if value is None or value == "":
         return "—"
+    # A pre-formatted string (e.g. "Not quantified" for a REVIEW finding) is rendered verbatim — a
+    # currency format must never coerce it, so evidence labels survive into the PDF exactly as intended.
+    if isinstance(value, str):
+        return value
     if kind == "currency":
         return _usd(value)
     if kind == "currency0":

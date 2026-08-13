@@ -128,12 +128,15 @@ def test_severity_bands_are_currency_normalised():
     assert severity_from_savings(150, currency="GBP") == "high"
 
 
-async def test_orphan_estimate_converts_to_billing_currency():
-    # The $32/mo NAT-gateway estimate must read as ~₹2,667 (not ₹32) on an INR assessment.
+async def test_orphan_reference_price_converts_to_billing_currency():
+    # With NO actual billed cost, the NAT gateway is a REVIEW finding (never a saving). The $32/mo retail
+    # rate is shown only as a REFERENCE price, and must read as ~₹2,667 (not ₹32) on an INR assessment.
     engine = FindingsEngine(pricing=FakePricing(currency="INR"), currency="INR")
     f = (await engine.detect_orphans("idle_nat_gateways", [{"id": "/s/nat", "name": "nat"}]))[0]
-    assert f["estimated_savings_monthly"] == round(32.0 / 0.012, 2)   # USD → INR
-    assert f["severity"] == "medium"                                   # ~$32 → medium, not critical
+    assert f["evidence_state"] == "review"
+    assert f["estimated_savings_monthly"] == 0.0                       # REVIEW: never a saving
+    assert f["details"]["reference_monthly_price"] == round(32.0 / 0.012, 2)   # USD → INR, reference only
+    assert f["details"]["reference_price_source"] == "AUTHORITATIVE_RETAIL_PRICE"
 
 
 def test_metrics_confidence_scales_with_datapoints():
@@ -144,15 +147,28 @@ def test_metrics_confidence_scales_with_datapoints():
 
 # ── Unattached disk (ARG-authoritative) ─────────────────────────────────────────
 
-async def test_unattached_disk_finding():
-    engine = FindingsEngine(pricing=FakePricing())
+async def test_unattached_disk_finding_grounded_in_actual_cost():
+    # With the disk's ACTUAL billed cost available, the saving is QUANTIFIED and grounded in that cost.
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={DISK_RID.lower(): 19.71})
     findings = await engine.detect_unattached_disks([_disk()])
     f = findings[0]
     assert f["category"] == "unattached_managed_disks"
-    assert f["estimated_savings_monthly"] == 19.71
+    assert f["evidence_state"] == "quantified"
+    assert f["estimated_savings_monthly"] == 19.71                     # = actual billed cost
     assert f["estimated_savings_annual"] == round(19.71 * 12, 2)
-    assert f["confidence"] >= 0.9
+    assert f["details"]["savings_source"] == "ACTUAL_BILLED_COST"
     assert f["debug_reason"] is None  # debug off by default
+
+
+async def test_unattached_disk_without_billed_cost_is_review_only():
+    # No actual billed cost → the disk is a REVIEW finding: the retail rate is a clearly-labelled
+    # reference, NEVER a saving. This is the no-fabrication rule (list price ≠ customer spend/savings).
+    engine = FindingsEngine(pricing=FakePricing())               # empty cost_map
+    f = (await engine.detect_unattached_disks([_disk()]))[0]
+    assert f["evidence_state"] == "review"
+    assert f["estimated_savings_monthly"] == 0.0
+    assert f["details"]["financial_impact"] == "Not quantified"
+    assert f["details"]["reference_monthly_price"] == 19.71
 
 
 async def test_debug_reason_only_when_enabled():
@@ -272,15 +288,60 @@ async def test_vm_rightsizing_requires_per_resource_cost():
     assert f["estimated_savings_monthly"] == 40.0            # capped at actual, NOT the 280.32 list delta
 
 
+async def test_finding_discloses_cost_basis_estimate_and_divergence():
+    # A finding grounded on a run-rate / representative basis must disclose that it's an estimate, and
+    # surface the historical average vs current run-rate when they materially diverge.
+    basis = {VM_RID.lower(): {
+        "cost_basis": "representative", "cost_is_estimate": True, "cost_variability": "high",
+        "cost_material_divergence": True, "historical_monthly": 18.0, "current_run_rate": 80.0,
+    }}
+    engine = FindingsEngine(pricing=FakePricing(), cost_map={VM_RID.lower(): 600.0}, cost_basis=basis)
+    f = (await engine.detect_vm_utilisation_findings([_vm(max_cpu=15.0, peak_memory=20.0)]))[0]
+    assert f["details"]["cost_is_estimate"] is True
+    assert f["details"]["cost_variability"] == "high"
+    assert f["details"]["historical_monthly"] == 18.0 and f["details"]["current_run_rate"] == 80.0
+
+
+async def test_ahb_flags_anomalously_low_billed_cost():
+    # When the billed cost is far below the VM's licence-free (Linux) list price — the CRA-VM case:
+    # ₹239 billed vs a ₹13,230 Linux rate — the figure is untrustworthy (sponsored sub or currency/scale
+    # issue). AHB still shows the grounded number but flags the anomaly loudly.
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/win": 5.0})  # 5 vs Linux 560.64 → <10%
+    f = (await engine.detect_windows_ahb([vm]))[0]
+    assert f["details"]["cost_anomaly"] is True
+    assert f["details"]["anomalous_low_count"] == 1
+    assert "far below their size" in f["description"]
+
+
+async def test_ahb_no_anomaly_when_cost_is_reasonable():
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/win": 300.0})  # 300 vs Linux 560 → 53%
+    f = (await engine.detect_windows_ahb([vm]))[0]
+    assert f["details"]["cost_anomaly"] is False
+
+
+async def test_ahb_discloses_estimate_when_grounded_on_run_rate():
+    # AHB on a partial/variable resource must flag cost_is_estimate so the UI shows the estimate chip.
+    vm = _vm(max_cpu=40.0, sku="Standard_D16s_v3", rid="/s/win"); vm["name"] = "win"
+    basis = {"/s/win": {"cost_basis": "run_rate", "cost_is_estimate": True, "cost_variability": "high"}}
+    engine = FindingsEngine(pricing=_AHB_PRICING, cost_map={"/s/win": 300.0}, cost_basis=basis)
+    f = (await engine.detect_windows_ahb([vm]))[0]
+    assert f["details"]["cost_is_estimate"] is True
+    assert f["details"]["cost_variability"] == "high"
+
+
 async def test_no_finding_ever_exceeds_measured_spend():
-    # ABSOLUTE GUARANTEE: even a list-price finding is clamped so it can never exceed the subscription's
-    # total measured monthly spend — savings > spend must never be shown again.
+    # ABSOLUTE GUARANTEE (last-resort net): even a grounded finding is clamped so it can never exceed the
+    # subscription's total measured monthly spend — savings > spend must never be shown.
     engine = FindingsEngine(
-        pricing=FakePricing(),  # no cost_map → orphan LB uses the live retail price (18.0)
-        measured_monthly_spend=5.0,  # tiny measured spend
+        pricing=FakePricing(),
+        cost_map={VM_RID.lower(): 100.0},  # the VM's actual cost exceeds the tiny measured spend
+        measured_monthly_spend=5.0,
     )
-    f = (await engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1", skuName="Standard")]))[0]
-    assert f["estimated_savings_monthly"] == 5.0            # 18.0 live price clamped to measured spend
+    f = (await engine.detect_vm_utilisation_findings([_vm(max_cpu=3.0, peak_memory=6.0)]))[0]
+    assert f["category"] == "idle_vms"
+    assert f["estimated_savings_monthly"] == 5.0            # grounded 100 clamped to measured spend 5
     assert f["details"]["savings_capped_at_measured_spend"] is True
 
 
@@ -821,18 +882,23 @@ async def test_orphan_snapshot_without_cost_data_is_dropped():
     assert await engine.detect_orphans("orphaned_snapshots", [_row("/s/snap-1", diskSizeGB=200)]) == []
 
 
-async def test_empty_load_balancer_priced_live():
+async def test_empty_load_balancer_without_billed_cost_is_review():
+    # No actual billed cost → REVIEW: the live retail rate is a reference only, never a saving.
     engine = FindingsEngine(pricing=FakePricing())
     f = (await engine.detect_orphans("empty_load_balancers", [_row("/s/lb-1", skuName="Standard")]))[0]
     assert f["category"] == "empty_load_balancers"
-    assert f["estimated_savings_monthly"] == 18.0           # live Retail Prices rate
+    assert f["evidence_state"] == "review"
+    assert f["estimated_savings_monthly"] == 0.0
+    assert f["details"]["reference_monthly_price"] == 18.0  # live Retail Prices rate, reference only
 
 
-async def test_idle_nat_gateway_priced_live():
+async def test_idle_nat_gateway_without_billed_cost_is_review():
     engine = FindingsEngine(pricing=FakePricing())
     f = (await engine.detect_orphans("idle_nat_gateways", [_row("/s/nat-1")]))[0]
     assert f["category"] == "idle_nat_gateways"
-    assert f["estimated_savings_monthly"] == 32.0           # live Retail Prices rate
+    assert f["evidence_state"] == "review"
+    assert f["estimated_savings_monthly"] == 0.0
+    assert f["details"]["reference_monthly_price"] == 32.0  # live Retail Prices rate, reference only
 
 
 async def test_flat_orphan_dropped_when_no_live_price():
@@ -925,14 +991,15 @@ async def test_inventory_finding_correlates_with_advisor_id():
     assert f["advisor_recommendation_id"] == "ADV-1"
 
 
-async def test_estimate_over_actual_is_capped_and_validated():
-    # Disk "saves" 19.71 but actual cost is only $5 → cap to $5. The figure is now the real cost, so
-    # it reads as validated (NOT a scary "needs review +294%" on a number that's now exactly right).
+async def test_orphan_saving_is_grounded_in_actual_billed_cost():
+    # An orphan's saving is its ACTUAL billed cost — never the retail list price. Disk actually costs $5
+    # (retail list is 19.71), so the saving IS $5 and reads as validated (grounded, not a list guess).
     engine = FindingsEngine(pricing=FakePricing(), cost_map={DISK_RID.lower(): 5.0})
     f = (await engine.detect_unattached_disks([_disk()]))[0]
-    assert f["estimated_savings_monthly"] == 5.0            # capped to actual
+    assert f["estimated_savings_monthly"] == 5.0            # = actual billed cost (not the 19.71 list rate)
     assert f["validation_status"] == "validated"
-    assert f["details"].get("savings_capped_at_actual_cost") is True
+    assert f["evidence_state"] == "quantified"
+    assert f["details"]["savings_source"] == "ACTUAL_BILLED_COST"
 
 
 async def test_validation_validated_within_tolerance():
@@ -942,21 +1009,14 @@ async def test_validation_validated_within_tolerance():
     assert f["actual_monthly_cost"] == 19.0
 
 
-async def test_savings_capped_at_actual_cost():
-    # Disk priced at 19.71 but it actually costs only $5/mo → savings clamped to $5.
-    engine = FindingsEngine(pricing=FakePricing(), cost_map={DISK_RID.lower(): 5.0})
-    f = (await engine.detect_unattached_disks([_disk()]))[0]
-    assert f["estimated_savings_monthly"] == 5.0
-    assert f["estimated_savings_annual"] == 60.0
-    assert f["details"].get("savings_capped_at_actual_cost") is True
-
-
-async def test_savings_not_capped_when_estimate_below_actual():
-    # Estimate 19.71 < actual 30 → no cap.
+async def test_orphan_saving_equals_actual_even_above_retail():
+    # The orphan saving tracks ACTUAL billed cost, whatever the retail list rate is. Disk actually costs
+    # $30/mo (retail list 19.71) → the saving is the real $30 you stop paying, grounded and validated.
     engine = FindingsEngine(pricing=FakePricing(), cost_map={DISK_RID.lower(): 30.0})
     f = (await engine.detect_unattached_disks([_disk()]))[0]
-    assert f["estimated_savings_monthly"] == 19.71
-    assert "savings_capped_at_actual_cost" not in f["details"]
+    assert f["estimated_savings_monthly"] == 30.0
+    assert f["estimated_savings_annual"] == 360.0
+    assert f["evidence_state"] == "quantified"
 
 
 # ── Output shape matches the DB model ────────────────────────────────────────────

@@ -1,11 +1,55 @@
+import asyncio
 import logging
+import weakref
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 import httpx
 
+from .collection import RetryStats
 from .resilience import CircuitBreaker, retry_request
 
 logger = logging.getLogger("cat.azure")
+
+
+# ── Concurrency: exactly TWO documented limits, no hidden per-stage caps ──────────────
+# 1. PER-RUN cap  (AzureClient._semaphore, settings.azure_max_concurrency, default 8): bounds a single
+#    assessment's in-flight Azure requests. Azure Resource Graph throttling is PER-TENANT (~15 queries
+#    /5s), and one assessment targets one tenant's subscriptions, so this is the limit that actually
+#    protects a tenant's rate bucket — 8 keeps well under the limit with headroom, far faster than serial.
+# 2. PROCESS-WIDE cap  (this module, settings.azure_global_max_concurrency, default 24 = 3×per-run):
+#    bounds TOTAL simultaneous Azure requests across ALL concurrently-running assessments, so N runs can't
+#    multiply the per-run cap into uncontrolled aggregate outbound traffic. ~3 assessments run full-speed;
+#    beyond that they share the global budget. Both are configurable via env.
+# Every request acquires BOTH (process-wide, then per-run) — there is no third/hidden concurrency limit.
+_GLOBAL_SEMAPHORES: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _global_semaphore() -> asyncio.Semaphore:
+    """The process-wide Azure-concurrency semaphore for the CURRENT event loop.
+
+    Cached per running loop so a fresh test loop gets a correctly-bound semaphore, while a real process
+    (one loop) shares ONE semaphore across every concurrent assessment. Resizes if the setting changes.
+    """
+    from ..config import settings
+    loop = asyncio.get_running_loop()
+    size = max(1, settings.azure_global_max_concurrency)
+    entry = _GLOBAL_SEMAPHORES.get(loop)
+    if entry is None or entry[1] != size:
+        entry = (asyncio.Semaphore(size), size)
+        _GLOBAL_SEMAPHORES[loop] = entry
+    return entry[0]
+
+
+def _label_for(method: str, url: str) -> str:
+    """Concise, secret-free label for a request, for retry logs (never includes the token/headers).
+
+    Uses the provider/type tail of the ARM path (e.g. "GET Microsoft.ResourceGraph/resources"), which
+    identifies the API/resource being queried without dumping the full resource id.
+    """
+    path = urlsplit(url).path
+    tail = path.split("/providers/")[-1] if "/providers/" in path else path
+    return f"{method} {tail[:80]}"
 
 ARM_BASE = "https://management.azure.com"
 SUBSCRIPTIONS_API = "2022-12-01"
@@ -21,6 +65,7 @@ class AzureClient:
         self, token: str, transport: Optional[httpx.AsyncBaseTransport] = None,
         max_retries: int = 4, base_delay: float = 0.5,
         breaker: Optional[CircuitBreaker] = None,
+        max_concurrency: int = 8, stats: Optional[RetryStats] = None,
     ):
         self._headers = {
             "Authorization": f"Bearer {token}",
@@ -32,15 +77,25 @@ class AzureClient:
         self._base_delay = base_delay
         # One breaker per client instance (per assessment run) so hard throttling fails fast.
         self._breaker = breaker if breaker is not None else CircuitBreaker(name="azure-arm")
+        # PER-RUN concurrency cap (see module header). Every outbound request also passes the PROCESS-WIDE
+        # semaphore, so no caller's fan-out (e.g. ~20 parallel Resource Graph queries, a metrics sweep)
+        # exceeds this per assessment, and no set of concurrent assessments exceeds the global budget. The
+        # slot is held only for the HTTP round-trip; retry backoff waits release it.
+        self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
+        # Run-level retry/throttle counters (feeds the data-quality report). Shared, so all calls tally
+        # into one place the pipeline can read after the run.
+        self.stats = stats if stats is not None else RetryStats()
 
     def _client(self, timeout: float) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=timeout, transport=self._transport)
 
     async def _send(
         self, client: httpx.AsyncClient, method: str, url: str,
-        *, max_retries: Optional[int] = None, use_breaker: bool = True, **kwargs,
+        *, max_retries: Optional[int] = None, use_breaker: bool = True,
+        label: Optional[str] = None, **kwargs,
     ) -> httpx.Response:
-        """Send a request with retry/backoff on 429/503 and (optionally) the shared circuit breaker.
+        """Send a request with bounded concurrency + retry/backoff on 429/5xx and (optionally) the
+        shared circuit breaker.
 
         Cost Management + Consumption are throttled far more aggressively than the fast ARM calls and
         return a `Retry-After`, so those callers pass a higher `max_retries` and `use_breaker=False`
@@ -48,13 +103,19 @@ class AzureClient:
         so a busy metrics run can't fail-fast the billing query (and vice-versa).
         """
         async def do() -> httpx.Response:
-            return await client.request(method, url, headers=self._headers, **kwargs)
+            # Acquire the process-wide budget first, then this run's slot — held only for the round-trip,
+            # released before any retry backoff sleep. Consistent order (global→per-run) → no deadlock.
+            async with _global_semaphore():
+                async with self._semaphore:
+                    return await client.request(method, url, headers=self._headers, **kwargs)
 
         return await retry_request(
             do,
             max_retries=self._max_retries if max_retries is None else max_retries,
             base_delay=self._base_delay,
             breaker=self._breaker if use_breaker else None,
+            label=label or _label_for(method, url),
+            stats=self.stats,
         )
 
     async def get_subscriptions(self) -> List[Dict]:
@@ -120,11 +181,19 @@ class AzureClient:
         scope filter so tenants that only surface `Shared`-scope recs still get results. Outcomes are
         logged (status/count/reason) so a run that returns nothing is diagnosable — Azure legitimately
         returns none when resources aren't run steadily enough to justify a reservation.
+
+        Look-back window: Azure evaluates steadiness over 7/30/60 days and defaults the API to the
+        STRICTEST (`Last7Days`), where a single day of shutdown suppresses the recommendation. We
+        explicitly request `Last30Days` — a month of steady usage is the right basis for a 1–3yr
+        commitment and is far more forgiving of a brief restart, so real steadily-run workloads aren't
+        dropped. (Ref: Microsoft "Reserved instance purchase recommendations" — lookBackPeriod.)
         """
-        recs, why = await self._fetch_reservation_recs(subscription_id, f"properties/scope eq '{scope}'")
+        lookback = "properties/lookBackPeriod eq 'Last30Days'"
+        recs, why = await self._fetch_reservation_recs(
+            subscription_id, f"properties/scope eq '{scope}' and {lookback}")
         if not recs and scope == "Single":
-            recs, why = await self._fetch_reservation_recs(subscription_id, None)  # any scope
-        logger.info("Reservation recommendations for %s: %d returned (%s).",
+            recs, why = await self._fetch_reservation_recs(subscription_id, lookback)  # any scope
+        logger.info("Reservation recommendations for %s: %d returned (30-day look-back; %s).",
                     subscription_id, len(recs), why)
         return recs
 

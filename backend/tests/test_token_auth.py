@@ -90,3 +90,46 @@ async def test_audience_enforced_when_configured():
     assert ok["oid"] == "user-1"
     with pytest.raises(TokenVerificationError):
         await verifier.verify(make_token(priv, aud="https://graph.microsoft.com/"))
+
+
+# ── Provenance hardening: issuer / app-id / tenant / delegated ──────────────────────
+
+async def test_untrusted_issuer_is_rejected():
+    priv, jwk = make_keypair()
+    verifier = _verifier(jwk, require_issuer=True)
+    with pytest.raises(TokenVerificationError):
+        await verifier.verify(make_token(priv, iss="https://evil.example.com/tenant-1/v2.0"))
+
+
+async def test_issuer_tenant_mismatch_is_rejected():
+    # A token whose issuer belongs to a DIFFERENT tenant than its `tid` claim is rejected.
+    priv, jwk = make_keypair()
+    verifier = _verifier(jwk, require_issuer=True)
+    with pytest.raises(TokenVerificationError):
+        await verifier.verify(make_token(
+            priv, tid="tenant-A", iss="https://login.microsoftonline.com/tenant-B/v2.0"))
+
+
+async def test_missing_tenant_is_rejected():
+    priv, jwk = make_keypair()
+    verifier = _verifier(jwk, require_issuer=True)
+    with pytest.raises(TokenVerificationError):
+        await verifier.verify(make_token(priv, tid=None))
+
+
+async def test_token_for_another_application_is_rejected():
+    # `appid`/`azp` must be OUR client id — a token minted for a different app is rejected.
+    priv, jwk = make_keypair()
+    verifier = _verifier(jwk, expected_appids=["our-client-id"])
+    ok = await verifier.verify(make_token(priv, appid="our-client-id", azp="our-client-id"))
+    assert ok["oid"] == "user-1"
+    with pytest.raises(TokenVerificationError):
+        await verifier.verify(make_token(priv, appid="some-other-app", azp="some-other-app"))
+
+
+async def test_app_only_token_is_rejected_when_delegated_required():
+    # An app-only token (has `roles`, no `scp`) does not represent a signed-in user → rejected.
+    priv, jwk = make_keypair()
+    verifier = _verifier(jwk, require_delegated=True)
+    with pytest.raises(TokenVerificationError):
+        await verifier.verify(make_token(priv, scp=None, roles=["Reader"]))

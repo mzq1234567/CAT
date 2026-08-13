@@ -230,10 +230,74 @@ async def test_cost_map_and_consistency_from_one_query():
             "rows": [[100.0, RID, "2025-05-01"], [110.0, RID, "2025-06-01"]]}})  # two months
 
     client = AzureClient("fake-token", transport=httpx.MockTransport(handler))
-    cost_map, cons, totals = await get_cost_map_and_consistency(client, "sub-1")
-    assert cost_map[RID.lower()] == 110.0                 # cost basis = most recent complete month
+    cost_map, cons, totals, basis, currency = await get_cost_map_and_consistency(client, "sub-1")
+    # Two steady months ([100, 110], cv≈0.05 → stable) → representative basis = most recent complete month.
+    assert cost_map[RID.lower()] == 110.0
     assert cons[RID.lower()]["billed_months"] == 2        # steadiness from the same single query
     assert totals == {"2025-05-01": 100.0, "2025-06-01": 110.0}  # per-month totals for the trend
+    assert basis[RID.lower()].basis == "last_month" and basis[RID.lower()].is_estimate is False
+
+
+def test_representative_cost_stable_uses_last_month():
+    from app.services.cost_management import representative_monthly_cost
+    hist = [100.0, 102.0, 98.0, 101.0]          # steady → stable
+    cons = {"billed_months": 4, "cv": 0.02, "stable": True}
+    r = representative_monthly_cost(hist, cons, current_mtd=50.0, run_rate_factor=2.0)
+    assert r.basis == "last_month" and r.amount == 101.0 and r.is_estimate is False
+    assert r.variability == "low"
+
+
+def test_representative_cost_partial_uses_run_rate():
+    from app.services.cost_management import representative_monthly_cost
+    # Partial billing: 1 billed month, and a current MTD fragment. Run-rate the fragment to a month.
+    # 12 days into the month → factor ≈ 30.44/12 ≈ 2.54; MTD 240 → run-rate ≈ 608.
+    r = representative_monthly_cost([240.0], {"billed_months": 1, "cv": 0.0, "stable": False},
+                                    current_mtd=240.0, run_rate_factor=30.4375 / 12)
+    assert r.basis == "run_rate" and r.is_estimate is True
+    assert r.amount == round(240.0 * (30.4375 / 12), 2)     # ≈ 608.75, NOT the raw 240 fragment
+
+
+def test_representative_cost_erratic_never_overstates():
+    from app.services.cost_management import representative_monthly_cost
+    # Reviewer's case: 5,6,5,7,6,80 → mean ≈ 18.2. Erratic (high cv).
+    hist = [5.0, 6.0, 5.0, 7.0, 6.0, 80.0]
+    cons = {"billed_months": 6, "cv": 1.5, "stable": False}
+    # (a) current run-rate LOW (spike was old, now quiet ~6) → min(mean, run-rate) = run-rate (6), never 18.
+    r_low = representative_monthly_cost(hist, cons, current_mtd=6.0, run_rate_factor=1.0)
+    assert r_low.amount == 6.0 and r_low.basis == "representative" and r_low.is_estimate is True
+    assert r_low.historical_monthly == round(sum(hist) / 6, 2)   # 18.17 shown as context, not used
+    # (b) current run-rate HIGH (~80) → min(mean, run-rate) = mean (18.17), never chases the spike.
+    r_high = representative_monthly_cost(hist, cons, current_mtd=80.0, run_rate_factor=1.0)
+    assert r_high.amount == round(sum(hist) / 6, 2)
+    assert r_high.current_run_rate == 80.0 and r_high.material_divergence is True   # both exposed + flagged
+
+
+def test_representative_cost_no_cost_is_none_basis():
+    from app.services.cost_management import representative_monthly_cost
+    r = representative_monthly_cost([0.0, 0.0], {"billed_months": 0, "stable": False},
+                                    current_mtd=0.0, run_rate_factor=2.0)
+    assert r.basis == "none" and r.amount == 0.0
+
+
+async def test_cost_map_run_rates_partial_billing_subscription():
+    from app.services.cost_management import get_cost_map_and_consistency
+
+    # No complete billing month (history empty) but a current MTD fragment → cost_map should be the
+    # RUN-RATE, not the raw fragment (this is the AHB #72 fix at the source).
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.content.decode()
+        if '"Monthly"' in body:                                   # monthly-history query → empty
+            return httpx.Response(200, json={"properties": {"columns": [
+                {"name": "Cost"}, {"name": "ResourceId"}, {"name": "BillingMonth"}], "rows": []}})
+        return httpx.Response(200, json={"properties": {"columns": [                # MTD query
+            {"name": "Cost"}, {"name": "ResourceId"}], "rows": [[120.0, RID]]}})
+
+    client = AzureClient("fake-token", transport=httpx.MockTransport(handler))
+    cost_map, cons, totals, basis, currency = await get_cost_map_and_consistency(
+        client, "sub-1", now=datetime(2025, 8, 13, tzinfo=timezone.utc))   # 13 days in → factor 30.44/13
+    expected = round(120.0 * (30.4375 / 13), 2)
+    assert cost_map[RID.lower()] == expected                      # run-rated, not the raw 120
+    assert basis[RID.lower()].basis == "run_rate" and basis[RID.lower()].is_estimate is True
 
 
 def test_parse_monthly_totals_sums_across_resources_by_month():
@@ -290,6 +354,26 @@ async def test_runrate_baseline_from_average_daily_spend():
     assert base["service_costs"]["Virtual Machines"] == round((20 / 10) * AVG_DAYS_PER_MONTH, 2)
     assert base["service_costs"]["Storage"] == round((10 / 10) * AVG_DAYS_PER_MONTH, 2)
     assert base["currency"] == "INR"
+
+
+async def test_runrate_baseline_measures_from_actual_first_billed_day():
+    # The DAILY data is authoritative on which days actually billed: a subscription that only started
+    # billing part-way through last month is measured from that day (not the 1st), so the run-rate
+    # reflects its true ~15-day history rather than being halved by an assumed full-month period.
+    from app.services.cost_management import AVG_DAYS_PER_MONTH
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"properties": {
+            "columns": [{"name": "Cost"}, {"name": "ServiceName"}, {"name": "UsageDate"}, {"name": "Currency"}],
+            "rows": [
+                [6507.0, "Databases", 20260729, "INR"],   # entire July total landed 29–31 July
+                [25169.0, "Databases", 20260812, "INR"],  # August so far (last billed day)
+            ]}})
+
+    client = AzureClient("fake-token", transport=httpx.MockTransport(handler))
+    base = await get_runrate_baseline(client, "sub-1", now=datetime(2026, 8, 12, tzinfo=timezone.utc))
+    assert base["period_days"] == 15                      # 29 Jul → 12 Aug inclusive, not 43
+    assert base["service_costs"]["Databases"] == round((31676 / 15) * AVG_DAYS_PER_MONTH, 2)
 
 
 async def test_runrate_baseline_none_when_no_data():

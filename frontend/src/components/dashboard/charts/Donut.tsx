@@ -1,5 +1,5 @@
 import { Box, Typography } from "@mui/material";
-import { Cell, Pie, PieChart, ResponsiveContainer, Sector } from "recharts";
+import { Cell, Pie, PieChart, ResponsiveContainer } from "recharts";
 import { colors } from "../../../theme";
 
 export interface DonutDatum {
@@ -8,31 +8,14 @@ export interface DonutDatum {
   color: string;
 }
 
-/** The hovered slice pops out slightly — the interaction cue, no floating tooltip needed.
- *  A near-full slice (e.g. one area at 99%) is NOT expanded: growing an almost-complete ring
- *  just makes the whole donut lurch/wobble. For dominant slices we brighten with a subtle inner
- *  ring instead, so the hover cue is clean at every proportion. */
-function ActiveSlice(props: any) {
-  const { cx, cy, innerRadius, outerRadius, startAngle, endAngle, fill } = props;
-  const dominant = Math.abs(endAngle - startAngle) > 200; // > ~55% of the circle
-  return (
-    <Sector
-      cx={cx}
-      cy={cy}
-      innerRadius={dominant ? innerRadius - 3 : innerRadius}
-      outerRadius={dominant ? outerRadius : outerRadius + 7}
-      startAngle={startAngle}
-      endAngle={endAngle}
-      fill={fill}
-      cornerRadius={3}
-    />
-  );
-}
-
 /**
- * Interactive donut: hovering a slice (or its legend row) pops the slice and swaps the CENTER
- * label to that segment's name + value + share — info lives in the empty center, so nothing
- * overlaps. `activeIndex`/`onActive` are controlled by the parent so the legend stays in sync.
+ * Informational donut — HOVERABLE, never CLICKABLE.
+ *
+ * Emphasis on hover is done purely by DIMMING the other slices (fill-opacity), so the geometry never
+ * changes: every segment reads identically at every proportion (no `activeShape`, no radius pop, so a
+ * small slice can't distort and a dominant slice can't wobble). The hovered segment's name/value/share
+ * surface in the empty centre. There is no click handler, no selection, cursor is `default`, and all
+ * SVG focus outlines are suppressed — so clicking a segment does nothing and leaves no black border.
  */
 export function Donut({
   data,
@@ -57,7 +40,21 @@ export function Donut({
   const sharePct = active && total ? Math.round((active.value / total) * 100) : 0;
 
   return (
-    <Box sx={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+    <Box
+      sx={{
+        position: "relative",
+        width: size,
+        height: size,
+        flexShrink: 0,
+        // The donut is not a control: default cursor, and no focus ring / outline on any SVG node so a
+        // click can never leave a black border or selection artefact.
+        cursor: "default",
+        "& svg, & path, & g, & .recharts-sector, & .recharts-wrapper, & *:focus, & *:focus-visible": {
+          outline: "none !important",
+        },
+        "& path": { cursor: "default" },
+      }}
+    >
       <ResponsiveContainer width="100%" height="100%">
         <PieChart>
           <Pie
@@ -69,14 +66,19 @@ export function Donut({
             paddingAngle={data.length > 1 ? 2 : 0}
             stroke={colors.surface}
             strokeWidth={2}
-            activeIndex={activeIndex ?? undefined}
-            activeShape={ActiveSlice}
-            onMouseEnter={(_: any, i: number) => onActive(i)}
+            isAnimationActive={false}
+            // No onClick, no activeIndex/activeShape → geometry is constant; hover only dims the rest.
+            onMouseEnter={(_: unknown, i: number) => onActive(i)}
             onMouseLeave={() => onActive(null)}
-            animationDuration={650}
           >
             {data.map((d, i) => (
-              <Cell key={i} fill={d.color} cursor="pointer" />
+              <Cell
+                key={i}
+                fill={d.color}
+                fillOpacity={activeIndex == null || activeIndex === i ? 1 : 0.32}
+                style={{ transition: "fill-opacity .18s ease", outline: "none", cursor: "default" }}
+                tabIndex={-1}
+              />
             ))}
           </Pie>
         </PieChart>

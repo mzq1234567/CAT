@@ -142,12 +142,38 @@ content:
       - {label: "Potential 3 Year Savings", value: "{savings_3year}"}
       - {label: "Potential Yearly Savings", value: "{savings_annual}"}
       - {label: "Potential Monthly Savings", value: "{savings_monthly}"}
+
+  # Assessment completeness — shown ONLY when the run was partial/failed/billing-throttled, so a client
+  # is never handed a clean-looking report that quietly hides incomplete data.
+  - type: paragraph
+    require: data_incomplete
+    style: note
+    text: "<b>Assessment scope note.</b> {completeness_note}"
+
   - type: paragraph
     text: >-
       The findings serve as a financial roadmap for <b>{client}</b> to enhance its cloud cost
       governance, optimize resource utilization, and maximize return on investment from its Azure
       environment. By implementing the recommendations, the organization can ensure long-term
       sustainability and alignment of cloud expenditures with its business objectives.
+
+  # Quantified-vs-review split — states, in plain terms, that items we couldn't price are shown as
+  # "Not quantified" and excluded from the totals (never estimated).
+  - {type: paragraph, require: has_review, style: note, text: "{review_note}"}
+
+  # Basis of figures — how every number above is grounded (the single-source language shared with the
+  # dashboard's "How this is calculated"). Prevents any figure reading as a fabricated or list-price number.
+  - type: paragraph
+    require: has_findings
+    style: note
+    text: >-
+      <b>How these figures are calculated.</b> Every saving is grounded in your own Azure data — a
+      resource&#8217;s actual billed cost from Azure Cost Management, or live Azure retail pricing
+      cross-checked against and capped at your billed cost, or Azure&#8217;s own reservation engine
+      computed on your real usage. A saving is never allowed to exceed what you actually pay. Reference
+      list prices, where shown, are Azure&#8217;s published rates for context only — not billed cost and
+      not a realised saving. Azure Hybrid Benefit is shown as <b>potential</b> (conditional on already
+      owning eligible licences) and is deliberately excluded from the savings totals above.
 
   # ── Pages 4-5 — Three-year projections (two charts per page) ────────────────────────
   # Rendered only when Cost Management returned billing data; without spend there is

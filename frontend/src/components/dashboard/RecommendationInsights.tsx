@@ -1,11 +1,12 @@
 import React from "react";
 import { Box, Card, CardContent, Grid, Typography } from "@mui/material";
 import { alpha } from "@mui/material/styles";
-import { colors, SEVERITY } from "../../theme";
-import type { Assessment, Finding, Severity } from "../../types";
-import { rollupByArea } from "./area";
+import { colors } from "../../theme";
+import type { Assessment, Finding } from "../../types";
+import {
+  rollupByArea, realisableFindings, conditionalSavingsAnnual, countedAnnual, isReviewFinding,
+} from "./area";
 import { Donut } from "./charts/Donut";
-import { HBars } from "./charts/HBars";
 import { Waterfall } from "./charts/Waterfall";
 import { AREA_ACCENT, SAVINGS_COLOR, fmtCompact } from "./tokens";
 
@@ -29,6 +30,24 @@ function ChartCard({ title, subtitle, children }: { title: string; subtitle?: st
   );
 }
 
+function SummaryRow({ label, value, muted }: { label: string; value: number; muted?: boolean }) {
+  return (
+    <Box display="flex" alignItems="center" justifyContent="space-between" gap={2}>
+      <Typography variant="body2" color={muted ? colors.textMuted : colors.textSecondary}>
+        {label}
+      </Typography>
+      <Typography
+        variant="body2"
+        fontWeight={800}
+        color={muted ? colors.textMuted : colors.textPrimary}
+        sx={{ fontVariantNumeric: "tabular-nums" }}
+      >
+        {value}
+      </Typography>
+    </Box>
+  );
+}
+
 export default function RecommendationInsights({
   findings,
   assessment,
@@ -36,19 +55,23 @@ export default function RecommendationInsights({
   findings: Finding[];
   assessment: Assessment;
 }) {
-  const totalAnnual = findings.reduce((s, f) => s + f.estimated_savings_annual, 0);
+  // Every savings aggregate is built on REALISABLE findings only — conditional AHB is shown separately
+  // (as a caption below), never folded into the donut / totals / waterfall.
+  const realisable = React.useMemo(() => realisableFindings(findings), [findings]);
+  const totalAnnual = realisable.reduce((s, f) => s + countedAnnual(f), 0);
+  const ahbPotential = conditionalSavingsAnnual(findings);
 
   // ── Savings by Category (donut) ──────────────────────────────────────────
-  const rollups = React.useMemo(() => rollupByArea(findings), [findings]);
+  const rollups = React.useMemo(() => rollupByArea(realisable), [realisable]);
   const donutData = rollups
     .filter((r) => r.savings > 0)
     .map((r) => ({ name: r.area, value: r.savings, color: AREA_ACCENT[r.area] }));
   const [active, setActive] = React.useState<number | null>(null);
 
-  // ── Top Opportunities ────────────────────────────────────────────────────
+  // ── Top Opportunities (largest realisable wins) ──────────────────────────
   const top = React.useMemo(
-    () => [...findings].sort((a, b) => b.estimated_savings_annual - a.estimated_savings_annual).slice(0, 5),
-    [findings]
+    () => [...realisable].sort((a, b) => b.estimated_savings_annual - a.estimated_savings_annual).slice(0, 5),
+    [realisable]
   );
   const topMax = top[0]?.estimated_savings_annual || 1;
 
@@ -57,9 +80,9 @@ export default function RecommendationInsights({
   const currentAnnual = assessment.current_annual_spend ?? 0;
   const reconciles = hasSpend && totalAnnual <= currentAnnual;
 
-  const impactData = (["critical", "high", "medium", "low"] as Severity[])
-    .map((s) => ({ label: SEVERITY[s] ? s[0].toUpperCase() + s.slice(1) : s, value: findings.filter((f) => f.severity === s).length, color: SEVERITY[s].solid }))
-    .filter((d) => d.value > 0);
+  // Cost-focused summary (shown when a projected-spend waterfall can't be drawn) — never a severity split.
+  const reviewCount = findings.filter(isReviewFinding).length;
+  const quantifiedCount = realisable.length;
 
   return (
     <Grid container spacing={2.5}>
@@ -67,7 +90,14 @@ export default function RecommendationInsights({
       <Grid item xs={12} md={4}>
         <ChartCard title="Savings by Category" subtitle="Share of total identified savings">
           {donutData.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">No savings to break down.</Typography>
+            <Box textAlign="center">
+              <Typography variant="body2" color="text.secondary">No realisable savings to break down.</Typography>
+              {ahbPotential > 0 && (
+                <Typography variant="caption" color={colors.textMuted} sx={{ display: "block", mt: 1 }}>
+                  {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit (needs licences)
+                </Typography>
+              )}
+            </Box>
           ) : (
             <Box>
               <Box display="flex" justifyContent="center">
@@ -97,6 +127,15 @@ export default function RecommendationInsights({
                   </Box>
                 ))}
               </Box>
+              {ahbPotential > 0 && (
+                <Typography
+                  variant="caption"
+                  color={colors.textMuted}
+                  sx={{ display: "block", textAlign: "center", mt: 1.5 }}
+                >
+                  + {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit — shown separately (needs licences)
+                </Typography>
+              )}
             </Box>
           )}
         </ChartCard>
@@ -137,12 +176,32 @@ export default function RecommendationInsights({
             />
           </ChartCard>
         ) : (
-          <ChartCard title="Recommendations by Impact" subtitle={`${findings.length} opportunities`}>
-            {impactData.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">No findings.</Typography>
-            ) : (
-              <HBars data={impactData} />
-            )}
+          <ChartCard title="Optimization Summary" subtitle="Identified opportunities at a glance">
+            <Box>
+              <Typography
+                sx={{
+                  fontSize: "2rem", fontWeight: 800, lineHeight: 1, color: SAVINGS_COLOR,
+                  letterSpacing: "-0.02em", fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                {fmtCompact(totalAnnual)}
+              </Typography>
+              <Typography variant="caption" color={colors.textMuted}>
+                total potential savings / year
+              </Typography>
+              <Box mt={2.5} display="flex" flexDirection="column" gap={1.25}>
+                <SummaryRow label="Opportunities identified" value={findings.length} />
+                <SummaryRow label="Quantified savings" value={quantifiedCount} />
+                {reviewCount > 0 && (
+                  <SummaryRow label="Need review · not quantified" value={reviewCount} muted />
+                )}
+              </Box>
+              {ahbPotential > 0 && (
+                <Typography variant="caption" color={colors.textMuted} sx={{ display: "block", mt: 2, lineHeight: 1.5 }}>
+                  + {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit — shown separately (needs licences)
+                </Typography>
+              )}
+            </Box>
           </ChartCard>
         )}
       </Grid>

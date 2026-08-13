@@ -19,6 +19,26 @@ export interface Subscription {
   tenant_id: string;
 }
 
+// Self-service readiness (Phase B). Each check is an honest probe of one data source in the
+// signed-in user's context — "ok" | "warning" (degrades gracefully) | "unavailable" (blocking).
+export type PreflightStatus = "ok" | "warning" | "unavailable";
+
+export interface PreflightCheck {
+  key: string;
+  label: string;
+  status: PreflightStatus;
+  detail: string;
+  blocking: boolean;
+}
+
+export interface PreflightResponse {
+  subscription_id: string;
+  subscription_name: string | null;
+  tenant_id: string | null;
+  ready: boolean;
+  checks: PreflightCheck[];
+}
+
 export interface Finding {
   id: number;
   category: string;
@@ -30,6 +50,10 @@ export interface Finding {
   resource_type: string | null;
   estimated_savings_monthly: number;
   estimated_savings_annual: number;
+  // Non-overlapping contribution to the total (RI vs right-sizing de-overlapped). Null → use estimated.
+  // Aggregates (headline, donut, categories) sum these; individual cards show estimated_savings_*.
+  counted_savings_monthly: number | null;
+  counted_savings_annual: number | null;
   severity: Severity;
   confidence: number;
   description: string;
@@ -38,6 +62,12 @@ export interface Finding {
   validation_status: "validated" | "needs_review" | "unvalidated" | null;
   validation_variance_pct: number | null;
   actual_monthly_cost: number | null;
+  // Financial evidence state: "quantified" (a defensible, countable saving) or "review" (a real signal
+  // we can't price for this customer — shown as "Not quantified", never counted in any savings total).
+  evidence_state: "quantified" | "review";
+  // Canonical, client-safe "how this number was calculated" sentence (backend single source of truth,
+  // shared with the PDF). Qualitative — the value source + method; money is formatted by the UI.
+  basis: string | null;
   dismissed: boolean;
   // DEV-ONLY: populated only when backend DEBUG_FINDINGS_REASONING is enabled.
   debug_reason: string | null;
@@ -64,6 +94,13 @@ export interface AssessmentSummary {
   current_annual_spend: number | null;
   spend_by_area: Record<string, number> | null;
   cost_data_available: boolean;
+  // Per-resource billed cost was unavailable this run (Cost Management throttled) — grounded findings
+  // were withheld and the UI shows a "re-run for accurate figures" banner.
+  billing_detail_unavailable: boolean;
+  // Azure data-collection quality: some Azure data could not be collected (throttle/error) when not
+  // "complete". `data_quality_message` is the concise client line; missing data is never treated as zero.
+  data_quality: "complete" | "partial" | "failed";
+  data_quality_message: string | null;
   // Spend is an estimated run rate (new/migrated subscription, no complete billing month) over N days.
   spend_estimated: boolean;
   spend_period_days: number | null;

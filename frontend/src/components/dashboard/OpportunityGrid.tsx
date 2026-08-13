@@ -1,28 +1,17 @@
 import React from "react";
 import {
-  Alert, Box, Button, Chip, Collapse, Grid, InputAdornment, Snackbar, Stack,
-  TextField, Typography,
+  Alert, Box, Button, Collapse, Grid, Snackbar, Typography,
 } from "@mui/material";
-import { alpha } from "@mui/material/styles";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import SearchIcon from "@mui/icons-material/Search";
 import RemoveCircleOutlineIcon from "@mui/icons-material/RemoveCircleOutline";
 import RestoreIcon from "@mui/icons-material/Restore";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import { colors } from "../../theme";
-import type { Finding, Severity } from "../../types";
+import type { Finding } from "../../types";
 import { useApi } from "../../services/api";
 import OpportunityCard from "./OpportunityCard";
 import RecommendationDetails from "./RecommendationDetails";
-import { SAVINGS_COLOR, fmtUSD } from "./tokens";
-
-const IMPACTS: { label: string; value: "all" | Severity }[] = [
-  { label: "All impact", value: "all" },
-  { label: "Critical", value: "critical" },
-  { label: "High", value: "high" },
-  { label: "Medium", value: "medium" },
-  { label: "Low", value: "low" },
-];
+import { fmtUSD } from "./tokens";
 
 function GroupLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -44,8 +33,6 @@ export default function OpportunityGrid({
   excludedFindings: Finding[];
   assessmentId: number;
 }) {
-  const [impact, setImpact] = React.useState<"all" | Severity>("all");
-  const [search, setSearch] = React.useState("");
   const [selected, setSelected] = React.useState<Finding | null>(null);
   const [showExcluded, setShowExcluded] = React.useState(false);
   const [undo, setUndo] = React.useState<{ id: number; name: string } | null>(null);
@@ -63,19 +50,12 @@ export default function OpportunityGrid({
     onSuccess: () => invalidate(),
   });
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase();
-    return findings
-      .filter((f) => (impact === "all" ? true : f.severity === impact))
-      .filter((f) =>
-        q
-          ? f.display_name.toLowerCase().includes(q) ||
-            (f.resource_name || "").toLowerCase().includes(q) ||
-            (f.resource_group || "").toLowerCase().includes(q)
-          : true
-      )
-      .sort((a, b) => b.estimated_savings_annual - a.estimated_savings_annual);
-  }, [findings, impact, search]);
+  // Cost optimisation is ranked by the size of the saving, not by an "impact" severity — the largest
+  // opportunities lead. (Severity stays in the data model; it's just not a dimension we surface here.)
+  const filtered = React.useMemo(
+    () => [...findings].sort((a, b) => b.estimated_savings_annual - a.estimated_savings_annual),
+    [findings]
+  );
 
   const featuredCount = filtered.length >= 4 ? 2 : 0;
   const featured = filtered.slice(0, featuredCount);
@@ -85,40 +65,9 @@ export default function OpportunityGrid({
 
   return (
     <Box>
-      {/* Filter bar — Category (Level 1) is the primary filter; Impact + search refine within it. */}
-      <Box display="flex" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap={1.5} mb={2.5}>
-        <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-          {IMPACTS.map((c) => (
-            <Chip
-              key={c.value}
-              label={c.label}
-              size="small"
-              onClick={() => setImpact(c.value)}
-              variant={impact === c.value ? "filled" : "outlined"}
-              color={impact === c.value ? "primary" : "default"}
-              sx={{ borderColor: colors.border, fontWeight: 600 }}
-            />
-          ))}
-        </Stack>
-        <TextField
-          size="small"
-          placeholder="Search opportunities…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          sx={{ minWidth: 260 }}
-          InputProps={{
-            startAdornment: (
-              <InputAdornment position="start">
-                <SearchIcon fontSize="small" sx={{ color: colors.textMuted }} />
-              </InputAdornment>
-            ),
-          }}
-        />
-      </Box>
-
       {filtered.length === 0 ? (
         <Typography variant="body2" color="text.secondary" sx={{ py: 5, textAlign: "center" }}>
-          No opportunities match the current filters.
+          No optimization opportunities to show.
         </Typography>
       ) : (
         <>

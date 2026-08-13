@@ -4,7 +4,7 @@ import { alpha } from "@mui/material/styles";
 import DoneAllIcon from "@mui/icons-material/DoneAll";
 import { colors } from "../../theme";
 import type { Finding } from "../../types";
-import { Area, areaForCategory } from "./area";
+import { Area, areaForCategory, realisableFindings, countedAnnual, countedMonthly } from "./area";
 import { AREA_ICON } from "./areaIcons";
 import { affectedResources } from "./categoryMeta";
 import { AREA_ACCENT, SAVINGS_COLOR, fmtCompact, fmtUSD, fmtPct } from "./tokens";
@@ -28,13 +28,16 @@ export default function OptimizationCategories({
   selected: Area | null;
   onSelect: (a: Area | null) => void;
 }) {
+  // Single source of truth: the category set is built from REALISABLE findings only (conditional AHB
+  // and unquantified REVIEW findings are excluded), exactly like the donut and the headline total — so
+  // the card count, the "N categories" label, the donut legend and the savings all agree by construction.
   const rollups: Rollup[] = React.useMemo(() => {
     const map = new Map<Area, Rollup>();
-    for (const f of findings) {
+    for (const f of realisableFindings(findings)) {
       const area = areaForCategory(f.category);
       const cur = map.get(area) ?? { area, annual: 0, monthly: 0, recs: 0, resources: 0 };
-      cur.annual += f.estimated_savings_annual;
-      cur.monthly += f.estimated_savings_monthly;
+      cur.annual += countedAnnual(f);
+      cur.monthly += countedMonthly(f);
       cur.recs += 1;
       cur.resources += affectedResources(f).count;
       map.set(area, cur);
@@ -50,7 +53,7 @@ export default function OptimizationCategories({
       <Box display="flex" alignItems="center" gap={1} mb={2} flexWrap="wrap">
         <Chip
           icon={<DoneAllIcon sx={{ fontSize: 16 }} />}
-          label={`All categories · ${findings.length}`}
+          label={`All categories · ${rollups.length}`}
           onClick={() => onSelect(null)}
           variant={selected === null ? "filled" : "outlined"}
           sx={{
@@ -166,16 +169,11 @@ export default function OptimizationCategories({
         })}
       </Box>
 
-      {/* Total strip */}
-      <Box
-        display="flex" justifyContent="space-between" alignItems="center" mt={2} px={0.5}
-      >
+      {/* Quiet meta line — category + resource counts only. The headline savings total lives in the
+          Estimated Savings KPI above and is deliberately not repeated here as a floating figure. */}
+      <Box mt={2} px={0.5}>
         <Typography variant="caption" color={colors.textMuted}>
           {rollups.length} categor{rollups.length === 1 ? "y" : "ies"} · {totalResources} affected resources
-        </Typography>
-        <Typography variant="body2" fontWeight={700} color={colors.textSecondary}>
-          Total identified savings{" "}
-          <Box component="span" sx={{ color: SAVINGS_COLOR, fontWeight: 800 }}>{fmtUSD(totalAnnual)} / yr</Box>
         </Typography>
       </Box>
     </Box>

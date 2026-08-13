@@ -22,13 +22,22 @@ import asyncio
 from typing import Dict, List, Optional
 
 from .azure_client import AzureClient
+from .collection import CollectionReport
 
 CPU_METRIC = "Percentage CPU"
 MEMORY_METRIC = "Available Memory Percentage"
 DEFAULT_WINDOW_DAYS = 30
-# Cap concurrent Azure Monitor calls so a large fleet (hundreds of VMs × 3 metric calls each) doesn't
-# self-throttle by firing everything at once. Metrics degrade per-VM, so a bounded pool is plenty.
-_METRIC_CONCURRENCY = 15
+# NOTE: metrics no longer keep their own concurrency semaphore. Concurrency is controlled at EXACTLY ONE
+# layer — the AzureClient (per-run + process-wide caps, see azure_client.py) — through which every
+# get_metric call passes. Removing the per-type bound eliminates a hidden second limit that could
+# contradict the documented one; the fan-out of pending coroutines is cheap and bounded in execution.
+
+
+def _metric_failures(results: List) -> int:
+    """How many results in a `gather(..., return_exceptions=True)` were exceptions — i.e. the metric
+    call FAILED (throttled/errored after retries), as opposed to genuinely returning no datapoints. A
+    failure must never be read as "0% utilisation"; the caller records it so the run is flagged PARTIAL."""
+    return sum(1 for r in results if isinstance(r, BaseException))
 
 
 class VmUtilisation:
@@ -118,18 +127,16 @@ async def get_asp_utilisation(
 
 
 async def enrich_asps_with_metrics(
-    client: AzureClient, plans: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+    client: AzureClient, plans: List[Dict], days: int = DEFAULT_WINDOW_DAYS,
+    report: Optional[CollectionReport] = None,
 ) -> List[Dict]:
     """Attach peak CPU + memory % to each App Service Plan row, fetched in parallel (bounded)."""
     if not plans:
         return []
-    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
-
-    async def _bounded(plan_id: str):
-        async with sem:
-            return await get_asp_utilisation(client, plan_id, days)
-
-    results = await asyncio.gather(*[_bounded(p.get("id", "")) for p in plans], return_exceptions=True)
+    results = await asyncio.gather(
+        *[get_asp_utilisation(client, p.get("id", ""), days) for p in plans], return_exceptions=True)
+    if report is not None:
+        report.note_metrics(len(plans), _metric_failures(results))
     enriched: List[Dict] = []
     for plan, res in zip(plans, results):
         peak_cpu, peak_mem, dp = res if isinstance(res, tuple) else (None, None, 0)
@@ -169,18 +176,16 @@ async def get_sql_db_utilisation(
 
 
 async def enrich_sql_dbs_with_metrics(
-    client: AzureClient, dbs: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+    client: AzureClient, dbs: List[Dict], days: int = DEFAULT_WINDOW_DAYS,
+    report: Optional[CollectionReport] = None,
 ) -> List[Dict]:
     """Attach peak CPU / data-IO / log-IO % to each SQL Database row, fetched in parallel (bounded)."""
     if not dbs:
         return []
-    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
-
-    async def _bounded(db_id: str):
-        async with sem:
-            return await get_sql_db_utilisation(client, db_id, days)
-
-    results = await asyncio.gather(*[_bounded(d.get("id", "")) for d in dbs], return_exceptions=True)
+    results = await asyncio.gather(
+        *[get_sql_db_utilisation(client, d.get("id", ""), days) for d in dbs], return_exceptions=True)
+    if report is not None:
+        report.note_metrics(len(dbs), _metric_failures(results))
     enriched: List[Dict] = []
     for db, res in zip(dbs, results):
         cpu, data_io, log_io, dp = res if isinstance(res, tuple) else (None, None, None, 0)
@@ -219,18 +224,16 @@ async def get_disk_io(client: AzureClient, resource_id: str, days: int = DEFAULT
 
 
 async def enrich_disks_with_iops(
-    client: AzureClient, disks: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+    client: AzureClient, disks: List[Dict], days: int = DEFAULT_WINDOW_DAYS,
+    report: Optional[CollectionReport] = None,
 ) -> List[Dict]:
     """Attach peak IOPS + throughput (MB/s) to each managed-disk row, fetched in parallel (bounded)."""
     if not disks:
         return []
-    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
-
-    async def _bounded(disk_id: str):
-        async with sem:
-            return await get_disk_io(client, disk_id, days)
-
-    results = await asyncio.gather(*[_bounded(d.get("id", "")) for d in disks], return_exceptions=True)
+    results = await asyncio.gather(
+        *[get_disk_io(client, d.get("id", ""), days) for d in disks], return_exceptions=True)
+    if report is not None:
+        report.note_metrics(len(disks), _metric_failures(results))
     enriched: List[Dict] = []
     for disk, res in zip(disks, results):
         peak_iops, peak_mbps, dp = res if isinstance(res, tuple) else (None, None, 0)
@@ -246,19 +249,21 @@ SQL_MI_CPU_METRIC = "avg_cpu_percent"
 
 
 async def enrich_sql_mis_with_metrics(
-    client: AzureClient, instances: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+    client: AzureClient, instances: List[Dict], days: int = DEFAULT_WINDOW_DAYS,
+    report: Optional[CollectionReport] = None,
 ) -> List[Dict]:
     """Attach peak CPU % to each SQL Managed Instance row (Maximum of avg_cpu_percent over the window)."""
     if not instances:
         return []
-    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
 
-    async def _bounded(mi_id: str):
-        async with sem:
-            cpu = await client.get_metric(mi_id, SQL_MI_CPU_METRIC, days=days, aggregation="Maximum")
-            return (round(max(cpu), 2) if cpu else None, len(cpu))
+    async def _mi_cpu(mi_id: str):
+        cpu = await client.get_metric(mi_id, SQL_MI_CPU_METRIC, days=days, aggregation="Maximum")
+        return (round(max(cpu), 2) if cpu else None, len(cpu))
 
-    results = await asyncio.gather(*[_bounded(m.get("id", "")) for m in instances], return_exceptions=True)
+    results = await asyncio.gather(
+        *[_mi_cpu(m.get("id", "")) for m in instances], return_exceptions=True)
+    if report is not None:
+        report.note_metrics(len(instances), _metric_failures(results))
     enriched: List[Dict] = []
     for mi, res in zip(instances, results):
         cpu, dp = res if isinstance(res, tuple) else (None, 0)
@@ -267,32 +272,33 @@ async def enrich_sql_mis_with_metrics(
 
 
 async def enrich_vms_with_metrics(
-    client: AzureClient, vms: List[Dict], days: int = DEFAULT_WINDOW_DAYS
+    client: AzureClient, vms: List[Dict], days: int = DEFAULT_WINDOW_DAYS,
+    report: Optional[CollectionReport] = None,
 ) -> List[Dict]:
     """Attach CPU + memory utilisation fields to each VM row, fetched in parallel across VMs.
 
-    A metrics failure for one VM leaves it un-classifiable (max_cpu=None) rather than failing the
-    whole run. Missing memory data is distinct from missing CPU data — a VM can have one without
-    the other, and the findings engine treats "memory unknown" as its own case, not "memory low".
+    A metrics failure for one VM leaves it un-classifiable (max_cpu=None, `metrics_failed=True`) rather
+    than failing the whole run — and it is recorded on `report` so the assessment is flagged PARTIAL. A
+    failed metric is NEVER read as "0% utilisation" / idle. Missing memory data is distinct from missing
+    CPU data — the findings engine treats "memory unknown" as its own case, not "memory low".
     """
     if not vms:
         return []
-    sem = asyncio.Semaphore(_METRIC_CONCURRENCY)
-
-    async def _bounded(vm_id: str) -> VmUtilisation:
-        async with sem:
-            return await get_vm_utilisation(client, vm_id, days)
-
-    tasks = [_bounded(vm.get("id", "")) for vm in vms]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results = await asyncio.gather(
+        *[get_vm_utilisation(client, vm.get("id", ""), days) for vm in vms], return_exceptions=True)
+    if report is not None:
+        report.note_metrics(len(vms), _metric_failures(results))
 
     enriched: List[Dict] = []
     for vm, result in zip(vms, results):
         if isinstance(result, VmUtilisation):
             u = result
+            failed = False
         else:
             u = VmUtilisation(None, None, 0, None, 0, days)
+            failed = True                 # metric call errored → NOT genuinely-zero utilisation
         enriched.append({
+            "metrics_failed": failed,
             **vm,
             "avg_cpu": u.avg_cpu,
             "max_cpu": u.max_cpu,

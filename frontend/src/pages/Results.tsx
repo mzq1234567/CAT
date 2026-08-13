@@ -10,6 +10,7 @@ import Layout from "../components/Layout";
 import AssessmentDashboard from "../components/dashboard/AssessmentDashboard";
 import AssessmentProgress from "../components/assessment/AssessmentProgress";
 import { useApi } from "../services/api";
+import { errorMessage } from "../services/errors";
 import { colors } from "../theme";
 import React from "react";
 import { AssessmentStatus } from "../types";
@@ -28,14 +29,20 @@ const STATUS_CHIP: Record<AssessmentStatus, { label: string; color: string }> = 
 
 export default function Results() {
   const { id } = useParams<{ id: string }>();
-  const assessmentId = parseInt(id!, 10);
   const api = useApi();
   const navigate = useNavigate();
   const [downloading, setDownloading] = React.useState(false);
+  const [downloadError, setDownloadError] = React.useState<string | null>(null);
+
+  // The id comes from the URL (not from transient in-memory state), so a refresh or a directly-opened
+  // link works. Reject a non-numeric id defensively rather than firing a request for NaN.
+  const parsedId = Number(id);
+  const assessmentId = Number.isInteger(parsedId) && parsedId > 0 ? parsedId : null;
 
   const { data: assessment, error } = useQuery({
     queryKey: ["assessment", assessmentId],
-    queryFn: () => api.getAssessment(assessmentId),
+    queryFn: () => api.getAssessment(assessmentId as number),
+    enabled: assessmentId != null,
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       // Poll faster while running so phase transitions and discovered counts land promptly — the
@@ -44,10 +51,27 @@ export default function Results() {
     },
   });
 
+  if (assessmentId == null) {
+    return (
+      <Layout title="Assessment">
+        <Alert severity="error" icon={<ErrorOutlineIcon />}>
+          That assessment link isn't valid.{" "}
+          <Link sx={{ cursor: "pointer" }} onClick={() => navigate("/assessments")}>
+            View your assessments
+          </Link>
+          .
+        </Alert>
+      </Layout>
+    );
+  }
+
   const handleDownload = async () => {
     setDownloading(true);
+    setDownloadError(null);
     try {
       await api.downloadReport(assessmentId);
+    } catch (err) {
+      setDownloadError(errorMessage(err));
     } finally {
       setDownloading(false);
     }
@@ -57,7 +81,7 @@ export default function Results() {
     return (
       <Layout title={`Assessment #${assessmentId}`}>
         <Alert severity="error" icon={<ErrorOutlineIcon />}>
-          Could not load assessment. {String((error as Error).message)}
+          {errorMessage(error)}
         </Alert>
       </Layout>
     );
@@ -154,9 +178,16 @@ export default function Results() {
         {actions && <Box display="flex" gap={1.5}>{actions}</Box>}
       </Box>
 
+      {downloadError && (
+        <Alert severity="error" icon={<ErrorOutlineIcon />} sx={{ mb: 2 }} onClose={() => setDownloadError(null)}>
+          {downloadError}
+        </Alert>
+      )}
+
       {assessment.status === "failed" && (
         <Alert severity="error" icon={<ErrorOutlineIcon />}>
-          Assessment failed: {assessment.error_message}
+          This assessment couldn't be completed. Please try running it again — if the problem persists,
+          contact your TechPlus Talent consultant.
         </Alert>
       )}
 

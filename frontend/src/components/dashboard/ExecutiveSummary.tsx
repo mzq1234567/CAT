@@ -7,18 +7,21 @@ import TrendingDownIcon from "@mui/icons-material/TrendingDown";
 import ArrowDownwardIcon from "@mui/icons-material/ArrowDownward";
 import InfoOutlinedIcon from "@mui/icons-material/InfoOutlined";
 import ChecklistIcon from "@mui/icons-material/Checklist";
-import PriorityHighIcon from "@mui/icons-material/PriorityHigh";
-import { colors, SEVERITY } from "../../theme";
+import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
+import { colors } from "../../theme";
 import type { Assessment } from "../../types";
 import { AnimatedValue } from "./charts/AnimatedValue";
 import { SAVINGS_COLOR, SPEND_COLOR, fmtCompact, fmtUSD, fmtPct } from "./tokens";
-import { conditionalSavingsAnnual } from "./area";
+import {
+  conditionalSavingsAnnual, realisableFindings, countedAnnual, countedMonthly, isReviewFinding,
+} from "./area";
 
 const ahbInfo = (conditionalAnnual: number, fmt: (n: number) => string) =>
-  `Includes ~${fmt(conditionalAnnual)}/yr of POTENTIAL Azure Hybrid Benefit savings — conditional on ` +
-  `already owning eligible Windows Server licences (with active Software Assurance or a qualifying ` +
-  `subscription). That portion is not automatic; you realise it only on VMs your licences cover. All ` +
-  `AHB figures are the licence share of each VM's actual billed cost.`;
+  `A further ~${fmt(conditionalAnnual)}/yr is POTENTIALLY available through Azure Hybrid Benefit — ` +
+  `conditional on already owning eligible Windows Server licences (with active Software Assurance or a ` +
+  `qualifying subscription). It is deliberately NOT included in the savings above, because it isn't ` +
+  `automatic: you realise it only on VMs your licences cover. All AHB figures are the licence share of ` +
+  `each VM's actual billed cost.`;
 
 /**
  * The 5-second story. Three KPI cards answer, in one glance:
@@ -202,13 +205,19 @@ function SecondaryStat({
 
 export default function ExecutiveSummary({ assessment }: { assessment: Assessment }) {
   const findings = assessment.findings.filter((f) => !f.dismissed);
-  const highImpact = findings.filter((f) => f.severity === "critical" || f.severity === "high").length;
+  // Quantified-vs-review split: REVIEW findings are real signals we couldn't price for this customer —
+  // shown as "not quantified" and never in any total. Surfacing the count keeps the split honest.
+  const reviewCount = findings.filter(isReviewFinding).length;
 
   const hasSpend = !!assessment.cost_data_available && assessment.current_annual_spend != null;
   const currentMonthly = assessment.current_monthly_spend ?? null;
   const currentAnnual = assessment.current_annual_spend ?? null;
-  const savingsMonthly = assessment.total_savings_monthly;
-  const savingsAnnual = assessment.total_savings_annual;
+  // Headline savings = REALISABLE only (conditional AHB is surfaced separately, below). Computed from the
+  // live findings so it stays consistent with the donut/category views and reflects exclusions
+  // immediately, without depending on a re-persisted backend total.
+  const realisable = realisableFindings(findings);
+  const savingsMonthly = realisable.reduce((s, f) => s + countedMonthly(f), 0);
+  const savingsAnnual = realisable.reduce((s, f) => s + countedAnnual(f), 0);
 
   // Projected spend = current − savings, but only when the numbers reconcile (savings can't
   // legitimately exceed measured spend; when they do, the billing window is partial).
@@ -221,16 +230,31 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
   const ahbInSavings = conditionalAnnual > 0;
 
   // Spend baseline is an estimated run rate when the subscription has no complete billing month yet.
+  // In that case the headline figure is a PROJECTION (average daily × ~30.44), so we also surface the
+  // amount ACTUALLY billed so far and over how many days — otherwise "₹64K/mo" reads as money spent when
+  // really only ₹31,677 has been billed (over 15 days), which projects to ₹64K/mo.
   const spendEstimated = hasSpend && !!assessment.spend_estimated;
   const spendDays = assessment.spend_period_days;
+  const actualBilledSoFar =
+    spendEstimated && spendDays && currentMonthly != null
+      ? (currentMonthly * spendDays) / 30.4375
+      : null;
   const spendInfo = spendEstimated
-    ? `Estimated run rate — this subscription has no complete billing month yet, so spend is its average daily cost${spendDays ? ` over ${spendDays} days of billing` : ""} normalised to a month.`
+    ? `This is a PROJECTION, not money already spent.${
+        actualBilledSoFar != null && spendDays
+          ? ` You've actually been billed ${fmtUSD(actualBilledSoFar)} over ${spendDays} days so far; at that daily rate the month projects to ${fmtUSD(currentMonthly ?? 0)}.`
+          : ` The subscription has no complete billing month yet, so spend is its average daily cost normalised to a month.`
+      } Re-run after a full billing month for the actual figure.`
     : undefined;
   const spendFooter = spendEstimated ? (
     <Chip
       size="small"
       icon={<InfoOutlinedIcon sx={{ fontSize: 14 }} />}
-      label={`Estimated run rate${spendDays ? ` · ${spendDays}d billed` : ""}`}
+      label={
+        actualBilledSoFar != null && spendDays
+          ? `Projected · ${fmtUSD(actualBilledSoFar)} billed in ${spendDays}d`
+          : `Estimated run rate${spendDays ? ` · ${spendDays}d billed` : ""}`
+      }
       sx={{
         bgcolor: alpha(colors.warning, 0.12), color: colors.warning, fontWeight: 600,
         border: `1px solid ${alpha(colors.warning, 0.3)}`, "& .MuiChip-icon": { color: colors.warning },
@@ -287,7 +311,23 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
             emphasize
             monthly={savingsMonthly}
             annual={savingsAnnual}
-            info={ahbInSavings ? ahbInfo(conditionalAnnual, fmtUSD) : undefined}
+            footer={
+              ahbInSavings ? (
+                <Tooltip title={ahbInfo(conditionalAnnual, fmtUSD)} arrow placement="top">
+                  <Chip
+                    size="small"
+                    icon={<InfoOutlinedIcon sx={{ fontSize: 14 }} />}
+                    label={`+ ${fmtCompact(conditionalAnnual)} / yr potential · Hybrid Benefit`}
+                    sx={{
+                      cursor: "help",
+                      bgcolor: alpha(colors.warning, 0.12), color: colors.warning, fontWeight: 600,
+                      border: `1px solid ${alpha(colors.warning, 0.3)}`,
+                      "& .MuiChip-icon": { color: colors.warning },
+                    }}
+                  />
+                </Tooltip>
+              ) : undefined
+            }
           />
         </Box>
         <Connector symbol="equals" />
@@ -324,10 +364,25 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
         </Box>
       )}
 
-      {/* Secondary — findings counts. Deliberately small; the money is the headline. */}
+      {/* Secondary — opportunity counts. Cost optimisation is framed as opportunities, not severity. */}
       <Box display="flex" gap={{ xs: 3, md: 5 }} mt={2.75} flexWrap="wrap" alignItems="center">
-        <SecondaryStat icon={<ChecklistIcon fontSize="small" />} label="Total findings" value={findings.length} color={colors.accentBlue} />
-        <SecondaryStat icon={<PriorityHighIcon fontSize="small" />} label="High-impact findings" value={highImpact} color={SEVERITY.high.solid} />
+        <SecondaryStat icon={<ChecklistIcon fontSize="small" />} label="Optimization opportunities" value={findings.length} color={colors.accentBlue} />
+        {reviewCount > 0 && (
+          <Tooltip
+            title="Real optimisation signals we could not price for your subscription (e.g. no billed cost available). They're shown as 'not quantified' and are never included in any savings total."
+            arrow
+            placement="top"
+          >
+            <Box sx={{ cursor: "help" }}>
+              <SecondaryStat
+                icon={<HelpOutlineIcon fontSize="small" />}
+                label="Need review · not quantified"
+                value={reviewCount}
+                color={colors.warning}
+              />
+            </Box>
+          </Tooltip>
+        )}
       </Box>
     </Box>
   );

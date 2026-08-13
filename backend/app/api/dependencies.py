@@ -16,9 +16,19 @@ def get_verifier():
     from ..security.token import TokenVerifier
     global _verifier
     if _verifier is None:
+        expected_appids = [settings.azure_client_id] if settings.azure_client_id else []
+        if settings.token_require_issuer and not expected_appids:
+            logger.warning(
+                "SECURITY: azure_client_id is not set — the token 'issued for this application' (appid) "
+                "check is DISABLED. Set AZURE_CLIENT_ID in production so only tokens minted for this app "
+                "are accepted. (Signature, issuer, audience and expiry are still enforced.)"
+            )
         _verifier = TokenVerifier(
             allowed_audiences=settings.token_allowed_audiences,
             enforce_audience=settings.token_enforce_audience,
+            require_issuer=settings.token_require_issuer,
+            expected_appids=expected_appids,
+            require_delegated=settings.token_require_delegated,
         )
     return _verifier
 

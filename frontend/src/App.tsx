@@ -6,8 +6,10 @@ import { ThemeProvider, CssBaseline } from "@mui/material";
 
 import { theme } from "./theme";
 import { msalConfig } from "./auth/msalConfig";
+import ErrorBoundary from "./components/ErrorBoundary";
 import Login from "./pages/Login";
 import SelectSubscriptions from "./pages/SelectSubscriptions";
+import Assessments from "./pages/Assessments";
 import Results from "./pages/Results";
 
 const msalInstance = new PublicClientApplication(msalConfig);
@@ -37,13 +39,18 @@ export default function App() {
         <ThemeProvider theme={theme}>
           <CssBaseline />
           <BrowserRouter>
-            <AuthGate>
-              <Routes>
-                <Route path="/" element={<Navigate to="/subscriptions" replace />} />
-                <Route path="/subscriptions" element={<SelectSubscriptions />} />
-                <Route path="/assessments/:id" element={<Results />} />
-              </Routes>
-            </AuthGate>
+            <ErrorBoundary>
+              <AuthGate>
+                <Routes>
+                  <Route path="/" element={<Navigate to="/subscriptions" replace />} />
+                  <Route path="/subscriptions" element={<SelectSubscriptions />} />
+                  <Route path="/assessments" element={<Assessments />} />
+                  <Route path="/assessments/:id" element={<Results />} />
+                  {/* Any unknown route lands on a real page instead of a blank screen. */}
+                  <Route path="*" element={<Navigate to="/subscriptions" replace />} />
+                </Routes>
+              </AuthGate>
+            </ErrorBoundary>
           </BrowserRouter>
         </ThemeProvider>
       </QueryClientProvider>

@@ -1,5 +1,5 @@
 import re
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, computed_field, field_validator
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -19,6 +19,10 @@ class FindingResponse(BaseModel):
     resource_type: Optional[str] = None
     estimated_savings_monthly: float
     estimated_savings_annual: float
+    # Non-overlapping contribution to the total (RI vs right-sizing de-overlapped). Null → callers use
+    # estimated_savings_*. The dashboard total sums these; each card still shows its own estimated_savings_*.
+    counted_savings_monthly: Optional[float] = None
+    counted_savings_annual: Optional[float] = None
     severity: str
     confidence: float = 0.0
     description: str
@@ -27,10 +31,21 @@ class FindingResponse(BaseModel):
     validation_status: Optional[str] = None
     validation_variance_pct: Optional[float] = None
     actual_monthly_cost: Optional[float] = None
+    # Financial evidence state: "quantified" (a defensible, countable saving) or "review" (a real
+    # signal we can't price for this customer — shown as "Not quantified", never counted in any total).
+    evidence_state: str = "quantified"
     dismissed: bool = False
     # DEV-ONLY; null unless DEBUG_FINDINGS_REASONING is enabled.
     debug_reason: Optional[str] = None
     details: Optional[Dict[str, Any]] = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def basis(self) -> Optional[str]:
+        """Client-safe "how this number was calculated" sentence — the single source of truth shared
+        with the PDF (see services.finding_basis). Computed from the evidence fields, never stored."""
+        from ..services.finding_basis import describe_finding_basis
+        return describe_finding_basis(self)
 
     class Config:
         from_attributes = True
@@ -79,6 +94,13 @@ class AssessmentSummary(BaseModel):
     current_annual_spend: Optional[float] = None
     spend_by_area: Optional[Dict[str, float]] = None
     cost_data_available: bool = False
+    # Per-resource billed cost was unavailable this run (Cost Management throttled) though the
+    # subscription total came through — grounded findings were withheld; the UI shows a "re-run" banner.
+    billing_detail_unavailable: bool = False
+    # Azure data-collection quality: "complete" | "partial" | "failed". `data_quality_message` is the
+    # concise client-facing line (detailed diagnostics stay internal, not exposed here).
+    data_quality: str = "complete"
+    data_quality_message: Optional[str] = None
     # Spend is an estimated run rate (new/migrated sub, no complete billing month) over N days.
     spend_estimated: bool = False
     spend_period_days: Optional[int] = None
@@ -108,6 +130,22 @@ class AssessmentEventResponse(BaseModel):
 class AssessmentResponse(AssessmentSummary):
     findings: List[FindingResponse] = []
     events: List[AssessmentEventResponse] = []
+
+
+class PreflightCheck(BaseModel):
+    key: str
+    label: str
+    status: str            # "ok" | "warning" | "unavailable"
+    detail: str = ""
+    blocking: bool = False
+
+
+class PreflightResponse(BaseModel):
+    subscription_id: str
+    subscription_name: Optional[str] = None
+    tenant_id: Optional[str] = None
+    ready: bool
+    checks: List[PreflightCheck]
 
 
 class SubscriptionResponse(BaseModel):

@@ -27,6 +27,15 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .cost_management import UNVALIDATED, VALIDATED, ValidationResult, validate_savings
 from .currency import symbol, to_usd
+from .financial_evidence import (
+    ACTUAL_BILLED_COST,
+    AUTHORITATIVE_RETAIL_PRICE,
+    POTENTIAL_SAVINGS,
+    QUANTIFIED,
+    QUANTIFIED_SAVINGS,
+    REVIEW,
+    UNQUANTIFIED,
+)
 from .pricing import PricingEngine, PricingUnavailableError
 from .vm_specs import VmSpec, get_spec, smaller_same_series
 
@@ -40,6 +49,39 @@ IDLE_MAX_CPU = 5.0            # peak CPU below this...
 IDLE_MAX_MEMORY_PCT = 10.0    # ...AND peak memory used below this → does effectively nothing.
 DOWNSIZE_HEADROOM_CEILING = 70.0  # a candidate (smaller) SKU must keep BOTH projected peaks ≤ this.
 METRIC_WINDOW_DAYS = 30
+
+# The ratio actual_monthly_cost / licence-free (Linux) monthly list price is a VM's EFFECTIVE UPTIME —
+# the share of the month it actually ran at its normal rate. A mostly-deallocated lab/dev VM legitimately
+# bills only a small fraction of a full month; that's LOW UTILISATION, not bad data, and a saving grounded
+# in actual cost scales down with it correctly (so it must NOT be flagged as suspect). Only when that ratio
+# is NEGLIGIBLE — compute is effectively free — does it signal a sponsored/credited/trial subscription or a
+# billing-scale/currency mismatch: a genuine anomaly worth flagging loudly.
+ANOMALOUS_UPTIME_FRACTION = 0.01   # < ~1% effective uptime (≈7h/mo) → compute ≈ free → data is suspect
+LOW_UTILISATION_FRACTION = 0.5     # < 50% effective uptime → VM runs part-time (informational, not alarming)
+
+# Sponsored/credited-subscription guard for FLAT-RATE resources (disk / IP / LB / NAT / Bastion): when a
+# resource that always bills at a fixed rate is billed at less than this fraction of its list price, the
+# cost is effectively free — an Azure Sponsorship/credit (or a currency-scale mismatch), not the customer's
+# real economics. The resource still has economic VALUE (≈ its list price), but the customer's realisable
+# saving CANNOT be quantified from a near-zero bill, and we must not imply the resource is worthless. Such
+# a finding becomes REVIEW (reference price shown) rather than a tiny, misleading quantified saving.
+SPONSORED_COST_FRACTION = 0.01
+
+# Minimum observed billing span before a run-rate (partial-billing) figure may be annualised into a
+# confident saving. Below this, a few days of spend is NOT enough evidence to project a reliable annual
+# number, so such findings become REVIEW ("insufficient billing history") instead of a quantified saving.
+#
+# IMPORTANT: this is THIS TOOL'S OWN conservative financial-integrity validation rule — it is NOT an
+# Azure or Azure Advisor requirement, and Microsoft does not define a 14-day minimum anywhere. It is a
+# threshold we chose to guarantee we never present a confident annual saving from too little billing
+# history; tune it to appetite. (Azure's own 7/30/60-day windows are a SEPARATE concept — they're the
+# reservation-recommendation look-back, set in azure_client.py, not this annualisation guard.)
+MIN_BILLING_DAYS_FOR_ANNUAL = 14
+
+# Conditional savings (Azure Hybrid Benefit) are realised ONLY if the customer already owns eligible
+# licences, so they're kept OUT of the headline/realisable savings roll-up and surfaced separately as
+# "potential". Single source of truth for that classification, shared by the persistence + API layers.
+CONDITIONAL_CATEGORIES = frozenset({"windows_ahb", "sql_ahb"})
 
 
 def _vcpus(sku: str) -> Optional[int]:
@@ -162,6 +204,7 @@ CATEGORY_DISPLAY = {
     "stopped_sql_managed_instances": "Stopped SQL Managed Instances",
     "idle_vms": "Idle Virtual Machines",
     "oversized_vms": "Oversized Virtual Machines",
+    "vm_metrics_unavailable": "VMs — Utilisation Metrics Unavailable",
     "ri_vm": "Reserved Instance (VM)",
     "vm_rightsizing": "VM Rightsizing",
     "windows_ahb": "Windows Azure Hybrid Benefit",
@@ -368,11 +411,16 @@ class FindingsEngine:
         cost_consistency: Optional[Dict[str, Dict]] = None,
         currency: str = "USD",
         measured_monthly_spend: Optional[float] = None,
+        cost_basis: Optional[Dict[str, Dict]] = None,
+        billing_span_days: Optional[int] = None,
     ):
         self._pricing = pricing
         self._cost_map = cost_map or {}
         self._advisor_index = advisor_index or {}
         self._consistency = cost_consistency or {}
+        # Per-resource cost-basis metadata (label / is_estimate / variability) so a finding can disclose
+        # whether its saving is grounded in a real last month, a representative figure, or a run-rate.
+        self._cost_basis = cost_basis or {}
         self._currency = (currency or "USD").upper()
         self._snapshot = snapshot_iso or "the inventory snapshot"
         self._debug = debug
@@ -385,6 +433,11 @@ class FindingsEngine:
         self._measured_monthly_spend = (
             measured_monthly_spend if (measured_monthly_spend and measured_monthly_spend > 0) else None
         )
+        # Observed billing span (days). When the subscription has no complete billing month, a saving
+        # grounded on a run-rate of fewer than MIN_BILLING_DAYS_FOR_ANNUAL days can't be defensibly
+        # annualised → such findings are downgraded to REVIEW ("insufficient billing history"). None
+        # means a complete billing month exists (annualisation is fine).
+        self._billing_span_days = billing_span_days
 
     # -- shared builder --------------------------------------------------------
 
@@ -414,9 +467,71 @@ class FindingsEngine:
         *, has_price: bool = True, advisor_impact: str = "",
         debug_reason: Optional[str] = None, extra_details: Optional[Dict] = None,
         grounded: bool = False, actual_cost_override: Optional[float] = None,
+        evidence_state: str = QUANTIFIED, reference_monthly_price: Optional[float] = None,
+        savings_source: str = QUANTIFIED_SAVINGS,
     ) -> Dict:
+        """Build one finding, stamping its FINANCIAL EVIDENCE STATE.
+
+        `evidence_state` = QUANTIFIED (a defensible, countable saving) or REVIEW (a real signal we can't
+        price for this customer — no savings amount, optional clearly-labelled reference list price). The
+        caller passes REVIEW (with an optional `reference_monthly_price`) when it has no actual billed cost
+        to ground a saving. A QUANTIFIED finding is additionally downgraded to REVIEW here when its saving
+        rests on a run-rate over too short a billing span to annualise (insufficient billing history).
+        """
         monthly = round(monthly or 0.0, 2)
         resource_id = resource.get("id")
+        details = dict(extra_details or {})
+        conditional = bool(details.get("conditional"))
+        cb = self._cost_basis.get((resource_id or "").lower()) if resource_id else None
+
+        # ── Insufficient billing history: a run-rate saving over fewer than MIN_BILLING_DAYS_FOR_ANNUAL
+        # days is too little evidence to annualise into a confident figure → downgrade to REVIEW and keep
+        # the observed monthly only as a reference. (Conditional/AHB carries its own partial-billing note.)
+        if (evidence_state == QUANTIFIED and monthly > 0 and not conditional
+                and self._billing_span_days is not None
+                and self._billing_span_days < MIN_BILLING_DAYS_FOR_ANNUAL
+                and cb and cb.get("cost_basis") == "run_rate"):
+            evidence_state = REVIEW
+            reference_monthly_price = reference_monthly_price or monthly
+            details["insufficient_billing_history"] = True
+            details["billing_span_days"] = self._billing_span_days
+
+        # ── REVIEW: a legitimate optimisation signal we cannot price for THIS customer. It NEVER carries a
+        # savings amount and NEVER counts toward any total; it may show a clearly-labelled reference price.
+        if evidence_state == REVIEW:
+            details["evidence_state"] = REVIEW
+            details["financial_impact"] = "Not quantified"
+            details["savings_source"] = UNQUANTIFIED
+            if reference_monthly_price and reference_monthly_price > 0:
+                details["reference_monthly_price"] = round(reference_monthly_price, 2)
+                details.setdefault("reference_price_source", AUTHORITATIVE_RETAIL_PRICE)
+            return {
+                "category": category,
+                "display_name": CATEGORY_DISPLAY.get(category, category),
+                "resource_id": resource_id,
+                "resource_name": resource.get("name"),
+                "subscription_id": resource.get("subscriptionId"),
+                "resource_group": resource.get("resourceGroup"),
+                "resource_type": resource_type,
+                "estimated_savings_monthly": 0.0,   # REVIEW: no savings figure, ever
+                "estimated_savings_annual": 0.0,
+                # Contribution to the non-overlapping Total Identified Savings — always 0 for REVIEW.
+                "counted_savings_monthly": 0.0,
+                "counted_savings_annual": 0.0,
+                "severity": "low",
+                "confidence": round(clamp01(base_confidence * 0.6), 2),
+                "description": description,
+                "recommendation": recommendation,
+                "advisor_recommendation_id": self._advisor_id_for(resource_id),
+                "validation_status": UNVALIDATED,
+                "validation_variance_pct": None,
+                "actual_monthly_cost": None,
+                "evidence_state": REVIEW,
+                "debug_reason": debug_reason if self._debug else None,
+                "details": details,
+            }
+
+        # ── QUANTIFIED path ───────────────────────────────────────────────────────────────
         # Validation compares the *original* estimate to actual cost (records the overage).
         validation = validate_savings(monthly, resource_id, self._cost_map) if monthly > 0 else None
         # When a finding's saving is grounded in a DIFFERENT resource's cost than the one it's attributed
@@ -463,13 +578,28 @@ class FindingsEngine:
         if advisor_id and category not in ("advisor_cost", "ri_vm"):
             confidence = round(min(1.0, confidence + 0.05), 2)
 
-        details = dict(extra_details or {})
         if validation is not None:
             details["validation_note"] = validation.note
         if capped:
             details["savings_capped_at_actual_cost"] = True
         if spend_capped:
             details["savings_capped_at_measured_spend"] = True
+        # Disclose the cost basis (actual last month / representative / run-rate) for a resource-bearing
+        # finding, so the UI can flag an estimate or a high-variability resource and show both the
+        # historical average and the current run-rate when they materially diverge. Aggregate findings
+        # (id=None, e.g. AHB) set their own basis flags from their constituent resources.
+        if cb and monthly > 0:
+            details.setdefault("cost_basis", cb.get("cost_basis"))
+            details.setdefault("cost_is_estimate", cb.get("cost_is_estimate"))
+            details.setdefault("cost_variability", cb.get("cost_variability"))
+            if cb.get("cost_material_divergence"):
+                details.setdefault("historical_monthly", cb.get("historical_monthly"))
+                details.setdefault("current_run_rate", cb.get("current_run_rate"))
+        # Stamp the evidence state + value source so a quantified saving is never confused with a
+        # potential/conditional one. Conditional (AHB) savings are POTENTIAL — realised only if the
+        # customer owns the licences — and are excluded from every total downstream.
+        details["evidence_state"] = QUANTIFIED
+        details["savings_source"] = POTENTIAL_SAVINGS if conditional else savings_source
 
         return {
             "category": category,
@@ -481,6 +611,11 @@ class FindingsEngine:
             "resource_type": resource_type,
             "estimated_savings_monthly": monthly,
             "estimated_savings_annual": round(monthly * 12, 2),
+            # Contribution to the non-overlapping Total Identified Savings. Defaults to the finding's own
+            # value; the overlap resolver (resolve_overlaps) reduces it when an RI and a right-sizing/idle
+            # recommendation address the same VM's compute so the same spend is never counted twice.
+            "counted_savings_monthly": monthly,
+            "counted_savings_annual": round(monthly * 12, 2),
             "severity": severity_from_savings(monthly, advisor_impact, self._currency),
             "confidence": confidence,
             "description": description,
@@ -489,10 +624,53 @@ class FindingsEngine:
             "validation_status": validation.status if validation else None,
             "validation_variance_pct": validation.variance_pct if validation else None,
             "actual_monthly_cost": validation.actual_monthly_cost if validation else None,
+            "evidence_state": QUANTIFIED,
             # TODO: remove or gate behind admin-only role before prod (debug scaffolding).
             "debug_reason": debug_reason if self._debug else None,
             "details": details,
         }
+
+    def _grounded_or_review(
+        self, category: str, resource: Dict, resource_type: str, *,
+        actual: Optional[float], reference_price: Optional[float],
+        base_confidence: float, description: str, recommendation: str,
+        debug_reason: Optional[str] = None, extra_details: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """One finding for a flat-rate / orphan / always-on resource, honouring the no-fabrication rule:
+
+          * actual billed cost known → QUANTIFIED, saving = the resource's ACTUAL billed cost;
+          * no billed cost but a live retail price → REVIEW, the retail rate shown ONLY as a clearly-
+            labelled reference (never a saving, never in any total) — this is the Bastion/orphan case;
+          * neither → None (SUPPRESSED: nothing defensible to say).
+
+        This is the single place the old "list price AS the saving" behaviour was removed: a retail/list
+        price is reference pricing, not customer spend, so it can never become a quantified saving.
+
+        Sponsored/credited subscriptions: when the billed cost is present but a negligible fraction of the
+        list price (compute effectively free — Azure Sponsorship/credit or a currency-scale mismatch), the
+        resource still has economic value but the customer's saving can't be quantified from a near-zero
+        bill, so it too becomes REVIEW rather than a tiny, misleading number.
+        """
+        sponsored = (
+            actual is not None and actual > 0 and reference_price is not None and reference_price > 0
+            and actual < reference_price * SPONSORED_COST_FRACTION
+        )
+        if actual is not None and actual > 0 and not sponsored:
+            return self._finding(
+                category, resource, resource_type, actual,
+                base_confidence=base_confidence, description=description, recommendation=recommendation,
+                has_price=True, grounded=True, savings_source=ACTUAL_BILLED_COST,
+                debug_reason=debug_reason, extra_details=extra_details)
+        if reference_price is not None and reference_price > 0:
+            details = dict(extra_details or {})
+            if sponsored:
+                details["sponsored_or_credited"] = True
+            return self._finding(
+                category, resource, resource_type, 0.0,
+                base_confidence=base_confidence, description=description, recommendation=recommendation,
+                evidence_state=REVIEW, reference_monthly_price=reference_price,
+                debug_reason=debug_reason, extra_details=details)
+        return None
 
     # -- unattached / orphaned (ARG-authoritative) -----------------------------
 
@@ -502,24 +680,27 @@ class FindingsEngine:
             sku = disk.get("skuName") or "Standard_LRS"
             size = int(disk.get("diskSizeGB") or 0)
             region = disk.get("location") or "eastus"
+            rid = (disk.get("id") or "").lower()
+            actual = self._cost_map.get(rid)
             try:
                 price = await self._pricing.get_managed_disk_monthly_price(region, sku, size)
             except PricingUnavailableError:
                 price = None
-            monthly = price or 0.0
             reason = (
                 f"disk unattached: diskState=='Unattached' in Resource Graph as of {self._snapshot}; "
-                f"{size} GB {sku} in {region} priced at ${monthly:.2f}/mo "
-                f"({'live retail' if price is not None else 'no price available'})."
+                f"{size} GB {sku} in {region}; actual billed cost "
+                f"{'unknown' if actual is None else f'{actual:.2f}'}, retail reference "
+                f"{'n/a' if price is None else f'{price:.2f}'}/mo."
             )
-            out.append(self._finding(
-                "unattached_managed_disks", disk, "microsoft.compute/disks", monthly,
-                base_confidence=0.9,
+            f = self._grounded_or_review(
+                "unattached_managed_disks", disk, "microsoft.compute/disks",
+                actual=actual, reference_price=price, base_confidence=0.9,
                 description=(f"Managed disk '{disk.get('name')}' ({size} GB, {sku}) is unattached "
                             "and accruing storage cost with no VM using it."),
                 recommendation="Delete the disk if unneeded, or re-attach it to a VM.",
-                has_price=price is not None, debug_reason=reason, extra_details=disk,
-            ))
+                debug_reason=reason, extra_details=disk)
+            if f:
+                out.append(f)
         return out
 
     async def detect_orphaned_public_ips(self, ips: List[Dict]) -> List[Dict]:
@@ -527,23 +708,27 @@ class FindingsEngine:
         for pip in ips:
             sku = pip.get("skuName") or "Basic"
             region = pip.get("location") or "eastus"
+            rid = (pip.get("id") or "").lower()
+            actual = self._cost_map.get(rid)
             try:
                 price = await self._pricing.get_public_ip_monthly_price(region, sku)
             except PricingUnavailableError:
                 price = None
-            monthly = price or 0.0
             reason = (
                 f"public IP orphaned: no ipConfiguration/natGateway in Resource Graph as of "
-                f"{self._snapshot}; {sku} IP in {region} priced ${monthly:.2f}/mo."
+                f"{self._snapshot}; {sku} IP in {region}; actual billed cost "
+                f"{'unknown' if actual is None else f'{actual:.2f}'}, retail reference "
+                f"{'n/a' if price is None else f'{price:.2f}'}/mo."
             )
-            out.append(self._finding(
-                "orphaned_public_ips", pip, "microsoft.network/publicipaddresses", monthly,
-                base_confidence=0.9,
+            f = self._grounded_or_review(
+                "orphaned_public_ips", pip, "microsoft.network/publicipaddresses",
+                actual=actual, reference_price=price, base_confidence=0.9,
                 description=(f"Public IP '{pip.get('name')}' ({sku}) is not associated with any "
                             "resource and is billing idle."),
                 recommendation="Delete the Public IP if it is no longer needed.",
-                has_price=price is not None, debug_reason=reason, extra_details=pip,
-            ))
+                debug_reason=reason, extra_details=pip)
+            if f:
+                out.append(f)
         return out
 
     async def detect_idle_app_service_plans(self, plans: List[Dict]) -> List[Dict]:
@@ -552,25 +737,23 @@ class FindingsEngine:
             sku = plan.get("skuName") or ""
             region = plan.get("location") or "eastus"
             price = await self._pricing.get_app_service_plan_monthly_price(region, sku)
-            # Prefer the plan's actual billed cost; else the live retail price. No price at all → skip
-            # (don't emit an unpriced finding; the get_* call can now return None).
             actual = self._cost_map.get((plan.get("id") or "").lower())
-            monthly = actual if (actual is not None and actual > 0) else price
-            if not monthly or monthly <= 0:
-                continue
             reason = (
                 f"App Service Plan idle: numberOfSites==0 in Resource Graph as of {self._snapshot}; "
-                f"SKU {sku or 'unknown'} priced {monthly:.2f}/mo ({self._currency})."
+                f"SKU {sku or 'unknown'}; actual billed cost "
+                f"{'unknown' if actual is None else f'{actual:.2f}'}, retail reference "
+                f"{'n/a' if price is None else f'{price:.2f}'}/mo ({self._currency})."
             )
-            out.append(self._finding(
-                "idle_app_service_plans", plan, "microsoft.web/serverfarms", monthly,
-                base_confidence=0.75,  # detection authoritative; live ASP price (capped at actual cost)
+            # QUANTIFIED from the plan's ACTUAL billed cost; else REVIEW with the retail rate as reference.
+            f = self._grounded_or_review(
+                "idle_app_service_plans", plan, "microsoft.web/serverfarms",
+                actual=actual, reference_price=price, base_confidence=0.75,
                 description=(f"App Service Plan '{plan.get('name')}' ({plan.get('skuName')}) hosts "
                             "no apps and is incurring idle compute charges."),
                 recommendation="Delete the plan or deploy apps to it.",
-                has_price=True, debug_reason=reason,
-                grounded=actual is not None and actual > 0, extra_details=plan,
-            ))
+                debug_reason=reason, extra_details=plan)
+            if f:
+                out.append(f)
         return out
 
     async def detect_app_service_rightsizing(self, plans: List[Dict]) -> List[Dict]:
@@ -930,39 +1113,33 @@ class FindingsEngine:
             region = row.get("location") or "eastus"
             rid = (row.get("id") or "").lower()
             actual = self._cost_map.get(rid)
-            grounded = False
+            # Reference retail rate (flat-rate resources only). Snapshots bill on incremental USED
+            # storage, which retail can't express, so they have NO reference price — grounded-cost-only.
             if bucket == "orphaned_snapshots":
-                # Snapshots bill on incremental USED storage (not provisioned size) — only the actual
-                # billed cost is authoritative. No cost data → no fabricated per-GB estimate → skip.
-                monthly = actual
-                grounded = actual is not None and actual > 0
-                source = "Cost Management actual cost"
+                reference_price = None
+            elif bucket == "empty_load_balancers":
+                reference_price = await self._pricing.get_load_balancer_monthly_price(region)
+            elif bucket == "idle_nat_gateways":
+                reference_price = await self._pricing.get_nat_gateway_monthly_price(region)
+            elif bucket == "bastion_hosts":
+                reference_price = await self._pricing.get_bastion_monthly_price(region, row.get("skuName") or "Basic")
             else:
-                if bucket == "empty_load_balancers":
-                    price = await self._pricing.get_load_balancer_monthly_price(region)
-                elif bucket == "idle_nat_gateways":
-                    price = await self._pricing.get_nat_gateway_monthly_price(region)
-                elif bucket == "bastion_hosts":
-                    price = await self._pricing.get_bastion_monthly_price(region, row.get("skuName") or "Basic")
-                else:
-                    price = None
-                # Prefer actual billed cost; else the live retail rate. Both are authoritative.
-                monthly = actual if (actual is not None and actual > 0) else price
-                grounded = actual is not None and actual > 0
-                source = "Cost Management actual cost" if grounded else "live Retail Prices API"
-            if not monthly or monthly <= 0:
-                continue  # no authoritative price → do not quantify (finding dropped)
+                reference_price = None
             reason = (
                 f"{CATEGORY_DISPLAY.get(rule.category, rule.category)}: matched by Resource Graph "
-                f"state as of {self._snapshot}; {monthly:.2f}/mo ({self._currency}) from {source}."
+                f"state as of {self._snapshot}; actual billed cost "
+                f"{'unknown' if actual is None else f'{actual:.2f}'}, retail reference "
+                f"{'n/a' if reference_price is None else f'{reference_price:.2f}'}/mo ({self._currency})."
             )
-            out.append(self._finding(
-                rule.category, row, rule.resource_type, monthly,
-                base_confidence=rule.base_confidence,
-                description=rule.describe(row),
-                recommendation=rule.recommendation,
-                has_price=True, debug_reason=reason, grounded=grounded, extra_details=row,
-            ))
+            # QUANTIFIED only from the resource's ACTUAL billed cost. With no billed cost, the retail rate
+            # is shown as a REVIEW reference (never a saving) — this is the Bastion/NAT/LB fix.
+            f = self._grounded_or_review(
+                rule.category, row, rule.resource_type,
+                actual=actual, reference_price=reference_price, base_confidence=rule.base_confidence,
+                description=rule.describe(row), recommendation=rule.recommendation,
+                debug_reason=reason, extra_details=row)
+            if f:
+                out.append(f)
         return out
 
     # -- metrics-based (idle / downsize), keyed off PEAK CPU + PEAK MEMORY over 30d --
@@ -983,6 +1160,7 @@ class FindingsEngine:
         and the finding is marked `memory_verified=False` — never silently treated as "0% memory".
         """
         out: List[Dict] = []
+        metrics_unavailable: List[Dict] = []   # VMs discovered but whose metrics FAILED (≠ genuinely empty)
         for vm in vms:
             max_cpu = vm.get("max_cpu")
             avg_cpu = vm.get("avg_cpu")
@@ -991,7 +1169,13 @@ class FindingsEngine:
             memory_available = bool(vm.get("memory_available"))
             window = int(vm.get("metric_window_days") or METRIC_WINDOW_DAYS)
             if max_cpu is None or cpu_datapoints == 0:
-                continue  # no CPU metrics at all → cannot classify utilisation
+                # No CPU metrics → cannot classify utilisation. Distinguish the two reasons:
+                #  * metrics FAILED to retrieve (throttle/error) → the VM is un-assessable; surface it as
+                #    REVIEW so the evidence model records "discovered but metrics unavailable" — NEVER idle.
+                #  * Azure genuinely returned no datapoints → leave it out (legitimate "no data").
+                if vm.get("metrics_failed"):
+                    metrics_unavailable.append(vm)
+                continue
             # GROUNDED-ONLY. An idle/resize saving MUST be grounded in the VM's ACTUAL billed cost so it
             # can never exceed what the customer really pays. Without per-resource billing a raw list-
             # price delta can dwarf actual spend (a D16s_v3's list price is ~₹47K/mo even if the VM has
@@ -1037,6 +1221,8 @@ class FindingsEngine:
                     extra_details={
                         "avg_cpu": avg_cpu, "max_cpu": max_cpu, "peak_memory_used_pct": peak_mem,
                         "memory_verified": memory_available, "cpu_datapoints": cpu_datapoints,
+                        # SKU/region so the overlap resolver can match this VM to an RI recommendation.
+                        "vm_sku": sku, "vm_region": region,
                     },
                 ))
                 continue
@@ -1073,6 +1259,8 @@ class FindingsEngine:
                     "avg_cpu": avg_cpu, "max_cpu": max_cpu, "peak_memory_used_pct": peak_mem,
                     "memory_verified": memory_available, "cpu_datapoints": cpu_datapoints,
                     "current_sku": sku, "recommended_sku": target.sku,
+                    # SKU/region so the overlap resolver can match this VM to an RI recommendation.
+                    "vm_sku": sku, "vm_region": region,
                     "current_monthly_price": payg, "recommended_monthly_price": target_price,
                     # Absolute specs power the before/after visual on the frontend.
                     "current_vcpu": current_spec.vcpu if current_spec else None,
@@ -1082,7 +1270,42 @@ class FindingsEngine:
                     "downsize_ceiling_pct": DOWNSIZE_HEADROOM_CEILING,
                 },
             ))
+        # VMs discovered but un-assessable because their metrics FAILED to retrieve → ONE aggregated
+        # REVIEW finding, so the evidence model explicitly records "discovered, metrics unavailable"
+        # (never idle/right-sized from missing metrics) without a noisy per-VM card each.
+        if metrics_unavailable:
+            out.append(self._metrics_unavailable_review(metrics_unavailable))
         return out
+
+    def _metrics_unavailable_review(self, vms: List[Dict]) -> Dict:
+        """One REVIEW finding for VMs whose utilisation metrics could not be collected this run.
+
+        Utilisation-dependent savings (idle / right-sizing) can't be quantified without metrics, so this
+        is REVIEW / "Not quantified" — it carries the reason and the affected VMs, integrates with the
+        Batch-1 evidence model (0 saving, excluded from every total), and is never a fabricated finding.
+        """
+        n = len(vms)
+        affected = [{"name": vm.get("name"), "sku": vm.get("vmSize"), "region": vm.get("location")}
+                    for vm in vms[:50]]
+        sub_id = next((vm.get("subscriptionId") for vm in vms if vm.get("subscriptionId")), None)
+        synthetic = {
+            "id": None, "name": f"{n} VM{'s' if n != 1 else ''} — utilisation metrics unavailable",
+            "subscriptionId": sub_id, "resourceGroup": None,
+        }
+        return self._finding(
+            "vm_metrics_unavailable", synthetic, "microsoft.compute/virtualmachines", 0.0,
+            base_confidence=0.5,
+            description=(
+                f"{n} running VM{'s were' if n != 1 else ' was'} discovered, but Azure Monitor "
+                "utilisation metrics could not be collected for them this run (throttled or errored after "
+                "retries). Idle / right-sizing savings can't be assessed without metrics, so they are not "
+                "quantified — a failed metric is never treated as 0% utilisation."),
+            recommendation=("Re-run the assessment once Azure Monitor metrics are available to evaluate "
+                            "these VMs for idle / right-sizing savings."),
+            evidence_state=REVIEW,
+            extra_details={"metrics_unavailable": True, "affected_count": n, "affected_vms": affected,
+                           "reason": "metrics_unavailable"},
+        )
 
     # -- commitments: Reserved Instances + Savings Plan (VMs) ------------------
 
@@ -1271,6 +1494,10 @@ class FindingsEngine:
         total = 0.0
         sub_id: Optional[str] = None
         partial_billing = False   # ≥1 eligible VM grounded on a partial (sub-month) billing window
+        any_estimate = False      # ≥1 eligible VM grounded on a run-rate/representative (estimate) basis
+        any_high_var = False      # ≥1 eligible VM sits on a high-variability (bursty) resource
+        anomalous_low = 0         # eligible VMs whose billed cost is NEGLIGIBLE vs list (compute ≈ free)
+        low_util = 0              # eligible VMs that simply run part-time (low, but plausible, uptime)
         for vm in vms:
             rid_l = (vm.get("id") or "").lower()
             if rid_l in exclude_ids:
@@ -1297,6 +1524,16 @@ class FindingsEngine:
             if actual is None or actual <= 0:
                 excluded_no_billing += 1
                 continue
+            # Effective uptime = the fraction of the month this VM billed at its licence-free (Linux) rate.
+            # LOW uptime is a part-time/lab VM (legitimate — the grounded saving scales with it, no alarm).
+            # A NEGLIGIBLE ratio means compute is effectively free → sponsored/credited sub or a
+            # billing-scale/currency mismatch, which we DO flag. This distinction is what stops every
+            # mostly-deallocated VM from tripping a false "verify billing" warning.
+            uptime = actual / compute_only if compute_only > 0 else 0.0
+            if uptime < ANOMALOUS_UPTIME_FRACTION:
+                anomalous_low += 1
+            elif uptime < LOW_UTILISATION_FRACTION:
+                low_util += 1
             # Saving = the licence share of what they ACTUALLY pay, capped at the list licence premium so
             # it can never exceed the licence itself (nor, since fraction ≤ 1, the VM's own bill).
             monthly = round(min(actual * licence_fraction, licence_premium), 2)
@@ -1304,11 +1541,14 @@ class FindingsEngine:
                 excluded_no_billing += 1
                 continue
             partial_billing = partial_billing or self._cost_basis_partial(vm.get("id"))
+            cb = self._cost_basis.get(rid_l, {})
+            any_estimate = any_estimate or bool(cb.get("cost_is_estimate"))
+            any_high_var = any_high_var or (cb.get("cost_variability") == "high")
             sub_id = sub_id or vm.get("subscriptionId")
             eligible.append({
                 "name": vm.get("name"), "sku": sku, "region": region,
                 "monthly_savings": monthly, "resource_id": vm.get("id"),
-                "actual_cost_based": True,
+                "actual_cost_based": True, "cost_basis": cb.get("cost_basis"),
                 # Audit trail — verifiable inputs. licence_charge = this VM's own (Windows − Linux) retail
                 # delta; saving = min(actual × fraction, licence_charge).
                 "windows_price": round(windows, 2), "compute_only_price": round(compute_only, 2),
@@ -1344,6 +1584,22 @@ class FindingsEngine:
                 parts.append(f"{excluded_no_pricing} with no live licence price")
             excl_note = (f" A further {excluded} Windows VM{'s' if excluded != 1 else ''} "
                          f"({', '.join(parts)}) could not be quantified and are excluded from the total.")
+        # Anomaly: most eligible VMs bill NEGLIGIBLY vs their size's list price (compute effectively free)
+        # → the data is suspect. Flag loudly. This is now distinct from ordinary low utilisation.
+        cost_anomaly = anomalous_low > 0 and anomalous_low >= (n + 1) // 2
+        anomaly_note = (
+            f" ⚠ Billed cost for {anomalous_low} of {n} VMs is far below their size's list price — compute "
+            "is effectively free, which usually means a sponsored/credited/trial subscription OR a "
+            "billing-data/currency issue. Verify your subscription type and billing currency before relying "
+            "on these figures." if cost_anomaly else ""
+        )
+        # Not an anomaly, but most VMs run part-time → the licence saving is small simply because the VMs
+        # are billed for only part of the month. Explain that plainly instead of raising a false alarm.
+        low_utilisation = not cost_anomaly and (anomalous_low + low_util) >= (n + 1) // 2
+        low_util_note = (
+            " Most of these VMs run intermittently (billed for only part of the month), so the licence "
+            "saving reflects their limited runtime — it scales up as they run more." if low_utilisation else ""
+        )
         reason = (
             f"{n} Windows VMs grounded in actual billed cost × per-VM (Windows − Linux) licence fraction "
             f"(capped at the SKU's list licence premium); total ${total:.2f}/mo across: {shown}. "
@@ -1359,7 +1615,7 @@ class FindingsEngine:
                 "Assurance (or qualifying subscription licences), Azure Hybrid Benefit removes that licence "
                 "charge. The amount shown is the Windows licence share of these VMs' ACTUAL billed cost — "
                 "not a theoretical list price, and not automatic: you only realise it on VMs your licences "
-                f"cover.{partial_note}{excl_note}"
+                f"cover.{partial_note}{excl_note}{anomaly_note}{low_util_note}"
             ),
             recommendation=(
                 "Apply Azure Hybrid Benefit (licenseType=Windows_Server) ONLY to the VMs covered by "
@@ -1377,6 +1633,14 @@ class FindingsEngine:
                 "excluded_count": excluded, "excluded_no_billing": excluded_no_billing,
                 "excluded_no_pricing": excluded_no_pricing, "partial_billing": partial_billing,
                 "savings_label": "Potential annual savings",
+                # Cost-basis disclosure: True when any VM's saving rests on a run-rate/representative
+                # (estimated) figure rather than a completed month's actual bill.
+                "cost_is_estimate": any_estimate or partial_billing,
+                "cost_variability": "high" if any_high_var else "low",
+                # Anomaly: most VMs bill NEGLIGIBLY vs list (compute ≈ free) → figures untrustworthy.
+                "cost_anomaly": cost_anomaly, "anomalous_low_count": anomalous_low,
+                # Low utilisation: most VMs simply run part-time — a soft, non-alarming explanation.
+                "low_utilization": low_utilisation,
             },
         )]
 
