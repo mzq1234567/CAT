@@ -128,3 +128,74 @@ def test_preflight_route_returns_report(monkeypatch):
     client = TestClient(app)
     r = client.get(f"/api/assessments/preflight?subscription_id={SUB}")
     assert r.status_code == 200 and r.json()["ready"] is True
+
+
+# ── Cost Management PROBE budget ───────────────────────────────────────────────────────────────────
+# Preflight is an INTERACTIVE, foreground request. It must not inherit the assessment's Cost Management
+# collection retry budget: doing so made one /preflight call cost 13 CM requests and up to 36 minutes of
+# backoff on a throttled subscription (see PROJECT_HANDOFF.md §9). The cost check is non-blocking, so a
+# throttled probe should answer quickly and honestly rather than retry like a collector.
+
+def _throttled_cost_client(counter, *, retry_after=None):
+    """Client whose Cost Management endpoint always returns 429, counting the attempts."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/subscriptions"):
+            return httpx.Response(200, json={"value": [
+                {"subscriptionId": SUB, "state": "Enabled",
+                 "displayName": "Contoso Prod", "tenantId": "tenant-1"}]})
+        if "/providers/Microsoft.ResourceGraph/resources" in path:
+            return httpx.Response(200, json={"data": [{"id": "/r/1"}]})
+        if "/providers/Microsoft.CostManagement/query" in path:
+            counter[0] += 1
+            headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+            return httpx.Response(429, headers=headers, json={"error": {"code": "TooManyRequests"}})
+        return httpx.Response(200, json={})
+
+    return AzureClient("t", transport=httpx.MockTransport(handler), base_delay=0.001)
+
+
+async def test_preflight_cost_probe_uses_its_own_small_retry_budget(monkeypatch):
+    """G. A throttled preflight must spend exactly COST_MANAGEMENT_PROBE_MAX_RETRIES + 1 attempts —
+    NOT the assessment's collection budget — and must still answer (cost = WARNING, never blocking)."""
+    from app.services import resilience
+    from app.services.azure_client import (
+        COST_MANAGEMENT_MAX_RETRIES,
+        COST_MANAGEMENT_PROBE_MAX_RETRIES,
+    )
+
+    async def _no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(resilience, "_sleep", _no_wait)
+    counter = [0]
+
+    report = await pf.run_preflight(_throttled_cost_client(counter), SUB, user_email="u@x.com")
+
+    assert counter[0] == COST_MANAGEMENT_PROBE_MAX_RETRIES + 1 == 2, (
+        f"preflight made {counter[0]} Cost Management requests; the probe budget is 2")
+    # The important guarantee: the probe did NOT inherit the collection budget.
+    assert counter[0] < COST_MANAGEMENT_MAX_RETRIES + 1
+    # A throttled cost probe is a non-blocking WARNING; readiness is decided by the blocking checks.
+    assert _status(report, "cost") == "warning"
+    assert report["ready"] is True
+
+
+async def test_preflight_cost_probe_budget_unaffected_by_retry_after(monkeypatch):
+    """A large `Retry-After` must not expand the probe budget either — the attempt count is fixed."""
+    from app.services import resilience
+    from app.services.azure_client import COST_MANAGEMENT_PROBE_MAX_RETRIES
+
+    waits: list[float] = []
+
+    async def _record(seconds):
+        waits.append(float(seconds))
+
+    monkeypatch.setattr(resilience, "_sleep", _record)
+    counter = [0]
+
+    await pf.run_preflight(_throttled_cost_client(counter, retry_after=3600), SUB)
+
+    assert counter[0] == COST_MANAGEMENT_PROBE_MAX_RETRIES + 1
+    from app.services.azure_client import COST_MANAGEMENT_MAX_RETRY_AFTER
+    assert max(waits) <= COST_MANAGEMENT_MAX_RETRY_AFTER   # still clamped by the cap

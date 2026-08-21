@@ -301,14 +301,21 @@ async def get_runrate_baseline(
 
 async def get_service_costs_and_currency(
     client: AzureClient, subscription_id: str, days: int = DEFAULT_WINDOW_DAYS,
-    now: Optional[datetime] = None,
+    now: Optional[datetime] = None, max_retries: Optional[int] = None,
 ) -> tuple[Dict[str, float], Optional[str]]:
-    """Per-service last-month cost + billing currency; falls back to month-to-date for new subs."""
-    payload = await client.query_cost_management(subscription_id, build_service_cost_query(now=now))
+    """Per-service last-month cost + billing currency; falls back to month-to-date for new subs.
+
+    `max_retries` lets a PROBE caller (preflight readiness) use a small budget instead of the full
+    Cost Management collection budget — see `azure_client.COST_MANAGEMENT_PROBE_MAX_RETRIES`. None
+    keeps the collection default. Collection callers must not pass this.
+    """
+    payload = await client.query_cost_management(
+        subscription_id, build_service_cost_query(now=now), max_retries=max_retries)
     costs = parse_service_cost_rows(payload)
     if not costs:  # brand-new subscription with no complete previous month → current month so far
         payload = await client.query_cost_management(
-            subscription_id, build_service_cost_query(now=now, month_to_date=True))
+            subscription_id, build_service_cost_query(now=now, month_to_date=True),
+            max_retries=max_retries)
         costs = parse_service_cost_rows(payload)
     return costs, extract_currency(payload)
 

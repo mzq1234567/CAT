@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional
 
-from .azure_client import AzureClient
+from .azure_client import COST_MANAGEMENT_PROBE_MAX_RETRIES, AzureClient
 from .cost_management import get_service_costs_and_currency
 from .pricing import PricingUnavailableError, get_pricing_engine
 
@@ -94,8 +94,12 @@ async def run_preflight(
 
     # 4. Cost data (Cost Management) — non-blocking. Missing billed cost degrades findings to
     #    "not quantified" (never fabricated), so a failure here is a WARNING, not a blocker.
+    #    This is a LIVENESS PROBE on an interactive request, so it uses its own small retry budget
+    #    (COST_MANAGEMENT_PROBE_MAX_RETRIES) instead of the assessment's collection budget — inheriting
+    #    the latter made one /preflight call cost 13 CM requests and up to 36 minutes of backoff.
     try:
-        costs, _ = await get_service_costs_and_currency(client, subscription_id)
+        costs, _ = await get_service_costs_and_currency(
+            client, subscription_id, max_retries=COST_MANAGEMENT_PROBE_MAX_RETRIES)
         if costs:
             checks.append(_check("cost", "Cost data", OK, "Billed cost is readable."))
         else:

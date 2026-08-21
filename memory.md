@@ -2105,6 +2105,94 @@ quirk — you FILTER by `priceType` but the response JSON field is `type`.
 - Also (prior turn, same session): modal → progressive disclosure (essentials visible; Implementation/
   Prerequisites/Supporting-Metrics collapsed); donut legend de-duped (labels only). Backend **243**; FE clean.
 
+### 2026-08-21 — Cost Management request-amplification investigation (measurement only, NO code changed)
+
+Instrumented the real `run_assessment` + `run_preflight` against a mock transport (429 on the billing
+plane) and counted actual outbound HTTP requests. All figures below are **measured, not derived**.
+
+- **Healthy-path CM baseline per subscription** (no throttling): **2** requests (established sub, stable
+  months) · **3** (erratic → forces the month-to-date run-rate query) · **5** (brand-new sub, all
+  queries 200-empty) · **6** (subscription total OK but per-resource detail empty → cost-map-only retry;
+  this path also ends `data_quality=partial`). So the healthy cost is 2, not 6 — the retry multiplier,
+  not the query count, is the dominant term.
+- **Under continuous 429: 78 CM requests/subscription** = 6 logical queries × 13 attempts
+  (1 + `COST_MANAGEMENT_MAX_RETRIES=12`). Verified by request-body fingerprinting: each of the 3 query
+  shapes is hit exactly 26× = 2 passes × 13. Consumption adds 18/sub (2 logical × 9). Scales linearly
+  with subscription count; 50 subs → 3,900 CM.
+- **`/preflight` carries the same CM envelope**: 13 requests and up to 36 min of backoff on a
+  *foreground* request. Its `AzureClient` is built with default `max_retries=4`, but
+  `query_cost_management` overrides to 12 regardless.
+- **Critical-path backoff** (queries are sequential within a subscription): ~19.6 min with no
+  `Retry-After`; ~72 min at `Retry-After: 60`; **~232 min (3.9 h)** once Azure asks ≥180s (clamped by
+  `COST_MANAGEMENT_MAX_RETRY_AFTER=180`).
+- **Instantaneous burst IS bounded** — measured peak in-flight CM requests = **8 per assessment**
+  (`azure_max_concurrency`) and **24 process-wide** (`azure_global_max_concurrency`), confirmed with 6
+  concurrent assessments. What is unbounded is total request VOLUME and total DURATION, not the burst.
+- **`retry_request` has NO total-elapsed-time cap** — only per-wait (`MAX_BACKOFF_SECONDS` /
+  `retry_after_cap`) and per-count (`max_retries`) bounds.
+- **No circuit breaker on the billing plane** — CM and Consumption both pass `use_breaker=False`, so
+  there is no fail-fast; each logical query burns its full budget independently.
+- **No test asserts the whole-billing retry ever RECOVERS a run.** Both tests referencing
+  `BILLING_RETRY_DELAY_SECONDS` set it to 0 and assert the *failure* path. The #127 regression test
+  (`test_cost_management_exhausts_then_recovers_clears_stale_partial`) exercises the **cost-map-only**
+  retry (`COST_MAP_RETRY_DELAY_SECONDS`), not the whole-billing retry.
+- **Lowering the CM constants is test-safe** — no test hardcodes 12/13/180; the only dependent test
+  imports `COST_MANAGEMENT_MAX_RETRIES` symbolically.
+- `_retry_after_seconds` parses **numeric seconds only**; an HTTP-date `Retry-After` returns None and
+  falls back to exponential backoff (capped 60s) — safer, not a bug, but it means the 180s cap only
+  ever applies to numeric headers.
+- `Retry-After` waits carry **no jitter**; only the exponential-backoff fallback jitters.
+- Rate limiting allows **10 assessments / 60s per user** with no cap on *concurrent* assessments per
+  user, so one user can have several runs multiplying billing-plane volume (in-flight still capped 24).
+- Two fixes were **proposed and documented in `PROJECT_HANDOFF.md` §9.6 but NOT implemented** pending a
+  decision. Redis, queueing, distributed locking and per-customer serialisation were explicitly ruled
+  OUT of scope by the user and are **not** the agreed solution.
+
+### 2026-08-21 — Cost Management bounded request budget (Option A) — IMPLEMENTED
+
+Acting on the measurement entry above. **Option A only**; Option B (per-assessment budget object +
+per-subscription latch) was explicitly NOT implemented. Redis, queueing and customer concurrency
+locking remain out of scope and are NOT part of this or any agreed solution. No frontend change.
+
+- **`azure_client.py`** — `COST_MANAGEMENT_MAX_RETRIES` **12 → 4** (13 → 5 attempts per query);
+  `COST_MANAGEMENT_MAX_RETRY_AFTER` **180.0 → 90.0**; new `COST_MANAGEMENT_PROBE_MAX_RETRIES = 1`
+  (2 attempts) for liveness probing. `query_cost_management` gained a keyword-only
+  `max_retries: Optional[int] = None` that falls back to the collection budget.
+- **`cost_management.py`** — `get_service_costs_and_currency` gained `max_retries: Optional[int] = None`,
+  threaded to both its queries (last-month + the month-to-date fallback). Collection callers pass
+  nothing and are unaffected.
+- **`preflight.py`** — the cost probe now passes `COST_MANAGEMENT_PROBE_MAX_RETRIES`. It is the ONLY
+  probe-budget caller.
+- **NO control-flow change.** Whole-billing retry, cost-map retry, `Retry-After` parsing/clamping,
+  exponential backoff + full jitter, breaker isolation (`use_breaker=False`), pagination, subscription
+  isolation/reconciliation, inventory collection and every detector are untouched.
+
+**Measured after (same instrumentation as the investigation entry), per subscription:**
+
+| | before | after |
+|---|---|---|
+| CM requests under continuous 429 | 78 | **30** (6 queries x 5 attempts; each shape hit 10x = 2 passes x 5) |
+| Preflight CM requests under 429 | 13 | **2** |
+| Worst case incl. preflight | 91 | **32** |
+| Whole-billing recovery scenario | — | **17** (15 exhausted first pass + 2 recovered) |
+| Max honoured `Retry-After` wait | 180s | **90s** |
+| CM critical-path backoff | ~232 min | **~36 min** |
+| At the 50-sub cap | 4,550 | **1,600** |
+
+- **Healthy paths re-measured and UNCHANGED: 2 / 3 / 5 / 6** CM requests (stable / erratic / new sub /
+  detail-degraded). The budget only ever engages on a failure path.
+- Consumption `reservationRecommendations` deliberately left at 18/sub — out of Option A's scope.
+- **Tests: 415 → 426.** New `tests/test_cost_management_budget.py` (9 tests) pins the measured request
+  COUNT rather than the constants, so adding a CM query or another whole-billing pass fails with the
+  real number: healthy run does zero retries (exactly 2 requests); continuous 429 stops at exactly 30
+  and scales linearly (60 for two subs); a 3600s `Retry-After` changes neither the count nor the clamp;
+  a throttle inside budget still recovers to COMPLETE; exhaustion is PARTIAL with spend/savings null and
+  resource-based findings still surfacing as REVIEW; the whole-billing retry still rescues a run
+  (COMPLETE, `billing_failed_subs=0`, exhaustion forgiven); isolation + resource-based findings
+  unchanged. Two tests added to `tests/test_preflight.py` prove the probe uses 2 attempts, does not
+  inherit the collection budget, stays non-blocking (`cost=warning`, `ready=True`), and is not expanded
+  by `Retry-After`. Frontend `tsc --noEmit` + `vite build` clean.
+
 ## Assumptions (as of final state)
 
 - Azure Retail Prices API (`https://prices.azure.com/api/retail/prices`) is public, no-auth, USD

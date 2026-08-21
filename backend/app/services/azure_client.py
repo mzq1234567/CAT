@@ -60,10 +60,27 @@ COST_MANAGEMENT_API = "2023-11-01"
 CONSUMPTION_API = "2023-05-01"
 
 # Cost Management throttles harder than any other ARM surface and asks for long Retry-After waits, so it
-# gets its OWN, more patient retry envelope (still strictly bounded — never an infinite loop). These do
-# NOT affect any other Azure API's retry behaviour.
-COST_MANAGEMENT_MAX_RETRIES = 12          # was 8; a few more bounded retries to ride out a 429 burst
-COST_MANAGEMENT_MAX_RETRY_AFTER = 180.0   # honour Azure's Retry-After up to 3 min (global cap is 60s)
+# gets its OWN retry envelope (still strictly bounded — never an infinite loop). These do NOT affect any
+# other Azure API's retry behaviour.
+#
+# BUDGET RATIONALE (measured 2026-08-21, see PROJECT_HANDOFF.md §9). These were 12 retries / 180s, which
+# multiplied out badly: the pipeline issues up to 6 sequential CM queries per subscription under total
+# throttling (3 in the first pass, 3 more in the whole-billing retry), so 13 attempts each meant 78 CM
+# requests per subscription and up to ~3.9h of backoff on the critical path — against a HEALTHY baseline
+# of just 2 requests. Retries here exist to ride out a TRANSIENT throttle, not to collect data
+# indefinitely: 5 attempts honouring a 60s Retry-After is already ~4 minutes of patience per query, and
+# the single whole-billing retry (assessment.BILLING_RETRY_DELAY_SECONDS) still provides the second
+# chance. A throttle that outlives that budget is a real failure and must be reported as PARTIAL, not
+# ground against for hours.
+COST_MANAGEMENT_MAX_RETRIES = 4           # 5 attempts per query (was 12 → 13); see budget rationale
+COST_MANAGEMENT_MAX_RETRY_AFTER = 90.0    # honour Retry-After up to 90s (was 180s; global cap is 60s)
+
+# Cost Management used as a LIVENESS PROBE (preflight readiness) rather than for data collection. A probe
+# only needs to answer "is billing readable right now?", so it must NOT inherit the collection budget
+# above — that made a single foreground /preflight request cost 13 CM calls and up to 36 minutes of
+# backoff. Two attempts absorb a single transient 429 and then answer honestly; the cost check is
+# non-blocking (WARNING only), so a throttled probe never gates the assessment.
+COST_MANAGEMENT_PROBE_MAX_RETRIES = 1     # 2 attempts total
 
 
 class AzureClient:
@@ -302,14 +319,22 @@ class AzureClient:
                         values.append(float(v))
         return values
 
-    async def query_cost_management(self, subscription_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    async def query_cost_management(
+        self, subscription_id: str, body: Dict[str, Any],
+        *, max_retries: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """POST a Cost Management query and return a merged {properties:{columns,rows}} payload.
 
         Follows `properties.nextLink` for paging. 403/404 (no cost access / not enabled) are treated
         as "no data" rather than fatal. Cost Management throttles hard, so this uses patient retries
         and is isolated from the shared circuit breaker (see `_send`); a final 429 (throttled even
         after backoff) raises so the caller can distinguish "throttled, retry" from "no access".
+
+        `max_retries` overrides the collection budget (`COST_MANAGEMENT_MAX_RETRIES`) for callers that
+        are PROBING rather than collecting — see `COST_MANAGEMENT_PROBE_MAX_RETRIES`. It only lowers the
+        per-attempt budget; the Retry-After cap, breaker isolation and pagination are unchanged.
         """
+        retries = COST_MANAGEMENT_MAX_RETRIES if max_retries is None else max_retries
         url: Optional[str] = (
             f"{ARM_BASE}/subscriptions/{subscription_id}/providers/Microsoft.CostManagement"
             f"/query?api-version={COST_MANAGEMENT_API}"
@@ -320,7 +345,7 @@ class AzureClient:
         async with self._client(90) as client:
             while url:
                 r = await self._send(client, "POST", url, json=body,
-                                     max_retries=COST_MANAGEMENT_MAX_RETRIES, use_breaker=False,
+                                     max_retries=retries, use_breaker=False,
                                      retry_after_cap=COST_MANAGEMENT_MAX_RETRY_AFTER)
                 if r.status_code in (403, 404):
                     break
