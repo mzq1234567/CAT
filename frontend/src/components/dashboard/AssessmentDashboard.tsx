@@ -3,6 +3,8 @@ import { Alert, Box, Chip, Tooltip, Typography } from "@mui/material";
 import { alpha } from "@mui/material/styles";
 import ReportProblemOutlinedIcon from "@mui/icons-material/ReportProblemOutlined";
 import CheckCircleOutlineIcon from "@mui/icons-material/CheckCircleOutline";
+import HourglassEmptyIcon from "@mui/icons-material/HourglassEmpty";
+import CloudOffIcon from "@mui/icons-material/CloudOff";
 import { colors } from "../../theme";
 import type { Assessment } from "../../types";
 import { Area, areaForCategory, realisableFindings, countedAnnual } from "./area";
@@ -57,12 +59,12 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
       <ReportProblemOutlinedIcon sx={{ fontSize: 20, color: colors.warning, mt: "1px", flexShrink: 0 }} />
       <Box>
         <Typography variant="body2" fontWeight={700} color={colors.textPrimary}>
-          Billing detail was unavailable for this run — results are incomplete.
+          Billing detail was unavailable for this run, results are incomplete.
         </Typography>
         <Typography variant="caption" color={colors.textSecondary} sx={{ lineHeight: 1.6 }}>
           Azure Cost Management returned the subscription total but not per‑resource billed cost
-          (usually a temporary throttle). Grounded findings — right‑sizing, Azure Hybrid Benefit and
-          idle‑resource savings — were <b>withheld</b> rather than estimated from list price, so what you
+          (usually a temporary throttle). Grounded findings, right‑sizing, Azure Hybrid Benefit and
+          idle‑resource savings were <b>withheld</b> rather than estimated from list price, so what you
           see below is a subset. Re‑run in a few minutes for accurate, grounded figures.
         </Typography>
       </Box>
@@ -72,6 +74,10 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
   // Data-collection banner — some Azure data could not be collected (throttle/error), so the run is
   // PARTIAL/FAILED. Shown for non-billing causes (the billing-specific case has its own banner above).
   const collectionIncomplete = assessment.data_quality !== "complete";
+  // A PARTIAL run whose only missing piece is billing (Cost Management was throttled this run) — distinct
+  // from a genuinely-new subscription (which collects billing fine but has no history: data_quality stays
+  // "complete"). Resource-based findings still work, so we DON'T call the whole assessment incomplete here.
+  const billingUnavailable = !assessment.cost_data_available && assessment.data_quality === "partial";
   const dataQualityBanner =
     collectionIncomplete && !assessment.billing_detail_unavailable && assessment.data_quality_message ? (
       <Box
@@ -91,10 +97,14 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
           <Typography variant="body2" fontWeight={700} color={colors.textPrimary}>
             {assessment.data_quality === "failed"
               ? "Azure data could not be collected for this assessment."
-              : "Some Azure data could not be collected — results are incomplete."}
+              : billingUnavailable
+              ? "Billing data temporarily unavailable."
+              : "Some Azure data could not be collected. Results are incomplete."}
           </Typography>
           <Typography variant="caption" color={colors.textSecondary} sx={{ lineHeight: 1.6 }}>
-            {assessment.data_quality_message}
+            {billingUnavailable
+              ? "Azure billing data could not be retrieved for this run because the Cost Management API was throttled. Resource-based findings are still available, but cost-based savings could not be quantified. Re-run shortly."
+              : assessment.data_quality_message}
           </Typography>
         </Box>
       </Box>
@@ -105,6 +115,10 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
   // say so plainly (the banners above carry the detail).
   const partialRun = collectionIncomplete || assessment.billing_detail_unavailable;
   const failedRun = assessment.data_quality === "failed";
+  // A new or recently-migrated subscription: resources were collected fine, but Azure Cost Management
+  // has no billing history yet, so cost-dependent savings can't be quantified. This is NOT a failure and
+  // NOT "fully optimized", so it gets its own honest, neutral state rather than "Complete".
+  const awaitingBilling = !assessment.cost_data_available && !failedRun && !partialRun;
   const statusMeta = failedRun
     ? {
         color: colors.error,
@@ -112,17 +126,31 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
         label: "Incomplete assessment",
         tip: "Azure data could not be collected for this run, so this is not a complete assessment. Re-run once access/throttling clears.",
       }
+    : billingUnavailable
+    ? {
+        color: colors.warning,
+        Icon: CloudOffIcon,
+        label: "Billing data temporarily unavailable",
+        tip: "Resource inventory and the other data sources were collected successfully, but the Azure Cost Management (billing) API was throttled this run, so cost-based savings couldn't be quantified. Resource-based findings are still shown; this is temporary, re-run shortly for cost figures.",
+      }
     : partialRun
     ? {
         color: colors.warning,
         Icon: ReportProblemOutlinedIcon,
         label: "Partial data collected",
-        tip: "Some Azure data couldn't be collected this run, so results are a subset. Missing data is never treated as zero — affected findings were withheld or shown as 'not quantified'. Re-run for complete figures.",
+        tip: "Some Azure data couldn't be collected this run, so results are a subset. Missing data is never treated as zero, so affected findings were withheld or shown as 'not quantified'. Re-run for complete figures.",
+      }
+    : awaitingBilling
+    ? {
+        color: colors.accentBlue,
+        Icon: HourglassEmptyIcon,
+        label: "Awaiting billing data",
+        tip: "Current resources were collected successfully, but Azure Cost Management has no billing history for this subscription yet (common for a new or recently migrated subscription). Savings that depend on billed cost can't be quantified until that history accrues, so ₹0 here means 'not yet quantifiable', not 'no potential'. Re-run once billing data is available.",
       }
     : {
         color: colors.success,
         Icon: CheckCircleOutlineIcon,
-        label: "Complete — all data sources collected",
+        label: "Complete: all data sources collected",
         tip: "Every data source the assessment relies on (inventory, metrics, billing, pricing) was collected successfully for this run.",
       };
   const statusChip = (
@@ -151,14 +179,19 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
         {dataQualityBanner}
         {statusChip}
         <ExecutiveSummary assessment={assessment} />
-        {/* Only claim "well-optimized" when we actually had the data to judge — not when a throttle or a
-            failed collection withheld everything (covered by the banners above). */}
+        {/* Speak only to what we actually evaluated: the resources currently in this subscription,
+            checked against the available recommendations. We stop short of declaring the whole
+            environment "optimized". Still gated on having had complete data to judge — a throttle or a
+            failed collection withholds everything (covered by the banners above). */}
         {!assessment.billing_detail_unavailable && !collectionIncomplete && (
           <Alert
             severity="success"
             sx={{ mt: 3, bgcolor: alpha(colors.success, 0.1), border: `1px solid ${alpha(colors.success, 0.3)}` }}
           >
-            No cost optimization findings detected — this environment looks well-optimized.
+            No applicable cost optimization findings detected for the resources currently in this subscription.
+            <Typography variant="caption" display="block" sx={{ mt: 0.5, opacity: 0.85 }}>
+              Current resource inventory was evaluated against the available optimization recommendations.
+            </Typography>
           </Alert>
         )}
       </>
@@ -193,7 +226,7 @@ export default function AssessmentDashboard({ assessment }: { assessment: Assess
       <Box>
         <SectionHeader
           title="Optimization Opportunities"
-          subtitle="Where the savings are, the biggest wins, and every recommendation — open any one for the full breakdown."
+          subtitle="Where the savings are, the biggest wins, and every recommendation. Open any one for the full breakdown."
         />
 
         {/* Executive visualizations — break up the page with charts, not just cards */}

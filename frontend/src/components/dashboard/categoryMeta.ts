@@ -51,16 +51,16 @@ const plural = (noun: string, n: number) => `${noun}${n === 1 ? "" : noun.endsWi
 // A reusable "reserve capacity" profile for the reserved-capacity families.
 const reserved = (noun: string): CategoryMeta => ({
   summary: (n) => `Reserve ${n} steady ${plural(noun, n)} to lock in a lower committed rate.`,
-  businessValue: "Convert predictable, always-on usage to a committed rate — the biggest lever for steady workloads.",
+  businessValue: "Convert predictable, always-on usage to a committed rate, the biggest lever for steady workloads.",
   effort: "Low",
-  effortNote: "A reservation purchase in the portal — no change to the running resources.",
+  effortNote: "A reservation purchase in the portal, no change to the running resources.",
   prerequisites: "A 1- or 3-year commitment; best for capacity you will keep running for the full term.",
   noun,
 });
 
 // A reusable "delete orphan" profile.
 const orphan = (noun: string): CategoryMeta => ({
-  summary: (n) => `${n} ${plural(noun, n)} ${n === 1 ? "is" : "are"} provisioned but serve nothing — pure waste.`,
+  summary: (n) => `${n} ${plural(noun, n)} ${n === 1 ? "is" : "are"} provisioned but serve nothing, pure waste.`,
   businessValue: "Remove resources that keep billing while delivering no value.",
   effort: "Low",
   effortNote: "Delete the orphaned resource after a quick dependency check.",
@@ -81,7 +81,7 @@ const rightsize = (noun: string): CategoryMeta => ({
 const META: Record<string, CategoryMeta> = {
   windows_ahb: {
     summary: (n) => `Apply Windows Server licences you already own to drop the licence charge on ${n} ${plural("VM", n)}.`,
-    businessValue: "Cut Azure's Windows Server licence premium using licences you already hold — pure licence optimisation, no infrastructure change.",
+    businessValue: "Cut Azure's Windows Server licence premium using licences you already hold, pure licence optimisation, no infrastructure change.",
     effort: "Low",
     effortNote: "Set licenseType=Windows_Server on each VM. No downtime, no resize.",
     prerequisites: "You must own eligible Windows Server licences with active Software Assurance (or subscription licences).",
@@ -97,22 +97,22 @@ const META: Record<string, CategoryMeta> = {
   },
   ri_vm: {
     summary: (n) => `Reserve ${n} steady production ${plural("VM", n)} to lock in a lower rate than pay-as-you-go.`,
-    businessValue: "Convert predictable, always-on compute to a committed rate — the single biggest lever for steady workloads.",
+    businessValue: "Convert predictable, always-on compute to a committed rate, the single biggest lever for steady workloads.",
     effort: "Low",
-    effortNote: "A reservation purchase in the portal — the running VMs are untouched.",
-    prerequisites: "A 1- or 3-year commitment; best for VMs you'll keep running. Untagged VMs are assumed production — verify first.",
+    effortNote: "A reservation purchase in the portal, the running VMs are untouched.",
+    prerequisites: "A 1- or 3-year commitment; best for VMs you'll keep running. Untagged VMs are assumed production, verify first.",
     noun: "Virtual Machine",
   },
   vm_metrics_unavailable: {
-    summary: (n) => `${n} ${plural("VM", n)} could not be assessed — Azure Monitor utilisation metrics were unavailable this run.`,
-    businessValue: "Idle / right-sizing savings can't be evaluated without utilisation metrics, so these VMs are flagged for review rather than quantified — a missing metric is never read as idle.",
+    summary: (n) => `${n} ${plural("VM", n)} could not be assessed because Azure Monitor utilisation metrics were unavailable this run.`,
+    businessValue: "Idle / right-sizing savings can't be evaluated without utilisation metrics, so these VMs are flagged for review rather than quantified. A missing metric is never read as idle.",
     effort: "Low",
     effortNote: "Re-run the assessment once Azure Monitor metrics are available.",
     noun: "Virtual Machine",
   },
   idle_vms: {
-    summary: (n) => `${n} ${plural("VM", n)} ${n === 1 ? "is" : "are"} running but effectively idle — paying for compute that does no work.`,
-    businessValue: "Stop paying for compute that isn't doing anything — the cleanest saving there is.",
+    summary: (n) => `${n} ${plural("VM", n)} ${n === 1 ? "is" : "are"} running but effectively idle, paying for compute that does no work.`,
+    businessValue: "Stop paying for compute that isn't doing anything, the cleanest saving there is.",
     effort: "Low",
     effortNote: "Deallocate (or delete) after confirming the VM is genuinely unused.",
     prerequisites: "Check it isn't a warm standby or a scheduled/burst workload before deallocating.",
@@ -129,7 +129,7 @@ const META: Record<string, CategoryMeta> = {
   oversized_vms: rightsize("Virtual Machine"),
   vm_rightsizing: rightsize("Virtual Machine"),
   disk_rightsizing: {
-    summary: (n) => `${n} Premium ${plural("disk", n)} run well below their tier — Standard SSD would serve the same load for less.`,
+    summary: (n) => `${n} Premium ${plural("disk", n)} run well below their tier, Standard SSD would serve the same load for less.`,
     businessValue: "Match disk tier to real IOPS/throughput instead of paying for Premium headroom you don't use.",
     effort: "Medium",
     effortNote: "Change the disk SKU during a maintenance window; a brief detach/restart applies.",

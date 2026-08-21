@@ -61,7 +61,7 @@ export function SavingsProjection({
           </Typography>
           <Typography variant="caption" color={colors.textMuted}>
             {growth > 0
-              ? `Spend trending ${fmtPct(growth * 100)}/yr (measured) — grown linearly`
+              ? `Spend trending ${fmtPct(growth * 100)}/yr (measured), grown linearly`
               : "Flat run-rate (no growth trend measured)"}
           </Typography>
         </Box>

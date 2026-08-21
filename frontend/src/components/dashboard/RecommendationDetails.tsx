@@ -307,7 +307,7 @@ export default function RecommendationDetails({
         <Section title="Why this was identified">
           {review ? (
             <Typography variant="body2" color={colors.textSecondary} sx={{ lineHeight: 1.55 }}>
-              A real optimisation signal, but we couldn't establish this resource's actual billed cost —
+              A real optimisation signal, but we couldn't establish this resource's actual billed cost,
               so it's shown for review rather than a quantified saving.
             </Typography>
           ) : (
@@ -323,18 +323,18 @@ export default function RecommendationDetails({
           )}
           {costAnomaly && !review && (
             <Note tone="warning" title="Verify billing.">
-              Billed cost is far below list price — likely a sponsored/credited subscription or a currency
+              Billed cost is far below list price, likely a sponsored/credited subscription or a currency
               mismatch. Confirm before relying on this figure.
             </Note>
           )}
           {supersededByRi && !review && (
             <Note tone="estimate">
-              A Reserved Instance already covers this resource's compute — counted there, not added on top.
+              A Reserved Instance already covers this resource's compute, counted there, not added on top.
             </Note>
           )}
           {mutexReservation && !review && (
             <Note tone="estimate">
-              Also appears in the {mutexReservation} recommendation — these are alternatives; treat the two
+              Also appears in the {mutexReservation} recommendation, these are alternatives; treat the two
               as an upper bound, not a sum.
             </Note>
           )}

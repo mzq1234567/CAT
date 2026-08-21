@@ -17,7 +17,7 @@ import {
 } from "./area";
 
 const ahbInfo = (conditionalAnnual: number, fmt: (n: number) => string) =>
-  `A further ~${fmt(conditionalAnnual)}/yr is POTENTIALLY available through Azure Hybrid Benefit — ` +
+  `A further ~${fmt(conditionalAnnual)}/yr is POTENTIALLY available through Azure Hybrid Benefit, ` +
   `conditional on already owning eligible Windows Server licences (with active Software Assurance or a ` +
   `qualifying subscription). It is deliberately NOT included in the savings above, because it isn't ` +
   `automatic: you realise it only on VMs your licences cover. All AHB figures are the licence share of ` +
@@ -212,6 +212,10 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
   const hasSpend = !!assessment.cost_data_available && assessment.current_annual_spend != null;
   const currentMonthly = assessment.current_monthly_spend ?? null;
   const currentAnnual = assessment.current_annual_spend ?? null;
+  // Two very different "no spend shown" causes. FAILURE (Cost Management was throttled this run) → the
+  // run is PARTIAL; NEW-SUB (billing collected fine but the subscription has no history yet) → the run
+  // is COMPLETE. Distinguishing them keeps the card honest: ₹0/blank never reads as "no potential".
+  const billingUnavailable = !assessment.cost_data_available && assessment.data_quality === "partial";
   // Headline savings = REALISABLE only (conditional AHB is surfaced separately, below). Computed from the
   // live findings so it stays consistent with the donut/category views and reflects exclusions
   // immediately, without depending on a re-persisted backend total.
@@ -244,7 +248,7 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
         actualBilledSoFar != null && spendDays
           ? ` You've actually been billed ${fmtUSD(actualBilledSoFar)} over ${spendDays} days so far; at that daily rate the month projects to ${fmtUSD(currentMonthly ?? 0)}.`
           : ` The subscription has no complete billing month yet, so spend is its average daily cost normalised to a month.`
-      } Re-run after a full billing month for the actual figure.`
+      } Re-run after a full billing month for the actual figure. Recent resource moves or removals may cause this to differ from the current inventory.`
     : undefined;
   const spendFooter = spendEstimated ? (
     <Chip
@@ -282,8 +286,10 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
 
   const caveat = !reconciles
     ? hasSpend
-      ? "Estimated savings exceed the measured spend for this scope — the billing data is partial (e.g. a new or recently-migrated subscription), so projected spend isn't shown yet. Treat savings as an upper bound until a full billing month is available."
-      : "Azure billing (Cost Management) data wasn't returned for this run, so current and projected spend aren't shown. That's usually a temporary throttle on the billing API; re-running normally resolves it."
+      ? "Estimated savings exceed the measured spend for this scope, the billing data is partial (e.g. a new or recently-migrated subscription), so projected spend isn't shown yet. Treat savings as an upper bound until a full billing month is available."
+      : billingUnavailable
+      ? "Azure billing data could not be retrieved for this run because the Cost Management API was throttled. Resource-based findings are still available, but cost-based savings could not be quantified. Re-run shortly."
+      : "This subscription has no Azure Cost Management billing history yet (common right after resources are created or migrated), so spend and cost-based savings can't be quantified yet. Resource-based findings are still shown. Re-run once billing data is available."
     : null;
 
   return (
@@ -297,7 +303,7 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
             accent={SPEND_COLOR}
             monthly={hasSpend ? currentMonthly : null}
             annual={hasSpend ? currentAnnual : null}
-            placeholder="Awaiting billing data"
+            placeholder={billingUnavailable ? "Billing data unavailable" : "Awaiting billing data"}
             info={spendInfo}
             footer={spendFooter}
           />
@@ -318,6 +324,26 @@ export default function ExecutiveSummary({ assessment }: { assessment: Assessmen
                     size="small"
                     icon={<InfoOutlinedIcon sx={{ fontSize: 14 }} />}
                     label={`+ ${fmtCompact(conditionalAnnual)} / yr potential · Hybrid Benefit`}
+                    sx={{
+                      cursor: "help",
+                      bgcolor: alpha(colors.warning, 0.12), color: colors.warning, fontWeight: 600,
+                      border: `1px solid ${alpha(colors.warning, 0.3)}`,
+                      "& .MuiChip-icon": { color: colors.warning },
+                    }}
+                  />
+                </Tooltip>
+              ) : reviewCount > 0 ? (
+                // ₹0 quantified but opportunities exist: make it explicit that ₹0 means "not yet
+                // quantifiable" (no billed cost available), never "no potential".
+                <Tooltip
+                  title="These opportunities can't be quantified yet because Azure billing data isn't available for this subscription. Zero here means not yet quantifiable, not zero potential. Re-run once Cost Management has history."
+                  arrow
+                  placement="top"
+                >
+                  <Chip
+                    size="small"
+                    icon={<HelpOutlineIcon sx={{ fontSize: 14 }} />}
+                    label={`${reviewCount} identified · not yet quantified`}
                     sx={{
                       cursor: "help",
                       bgcolor: alpha(colors.warning, 0.12), color: colors.warning, fontWeight: 600,

@@ -1,7 +1,7 @@
 import React from "react";
 import { Box } from "@mui/material";
 import { keyframes } from "@mui/material/styles";
-import { colors } from "../../theme";
+import { useThemeMode } from "../themeMode";
 import { useReducedMotion, useSequencedSwap } from "./useAssessmentMotion";
 
 /**
@@ -25,13 +25,21 @@ const enter = keyframes`
   100% { opacity: 1; transform: translateY(0); filter: blur(0px); }
 `;
 
-/** Memoised: depends only on `text`, but its parent re-renders on every poll and progress publish. */
+/** Memoised: depends only on `text`, so it doesn't re-render on the parent's ~11Hz progress publishes.
+ *  The visible text colour is bound to the MUI theme via an `sx` CALLBACK (`t.palette.text.primary`),
+ *  not the mutable `colors` object: MUI's `<ThemeProvider>` swaps a NEW theme on every mode toggle, and
+ *  every `sx`-callback consumer subscribes to it directly — so the CURRENT caption re-colours the instant
+ *  the theme changes, with no dependency on this component re-rendering or on caption rotation. (It still
+ *  subscribes to `useThemeMode` for the `data-theme-mode` hook; `t.palette.text.primary` equals the old
+ *  `colors.textPrimary` in both modes, so the look is unchanged.) */
 function StageCaption({ text }: { text: string }) {
   const reduced = useReducedMotion();
+  const { mode } = useThemeMode();
   const { shown, leaving } = useSequencedSwap(text, EXIT_MS);
 
   return (
     <Box
+      data-theme-mode={mode}
       sx={{
         height: 34,
         display: "flex",
@@ -42,11 +50,11 @@ function StageCaption({ text }: { text: string }) {
     >
       <Box
         key={shown}
-        sx={{
+        sx={(t) => ({
           fontSize: { xs: "1.0625rem", md: "1.1875rem" },
           fontWeight: 500,
           letterSpacing: "-0.015em",
-          color: colors.textPrimary,
+          color: t.palette.text.primary,
           textAlign: "center",
           whiteSpace: "nowrap",
           animation: reduced
@@ -54,7 +62,7 @@ function StageCaption({ text }: { text: string }) {
             : leaving
             ? `${out} ${EXIT_MS}ms cubic-bezier(.4,0,1,1) forwards`
             : `${enter} .72s cubic-bezier(.16,1,.3,1)`,
-        }}
+        })}
       >
         {shown}
         <Box component="span" sx={{ opacity: 0.35 }}>

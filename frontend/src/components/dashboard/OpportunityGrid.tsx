@@ -182,7 +182,7 @@ export default function OpportunityGrid({
           }
           sx={{ alignItems: "center" }}
         >
-          Excluded “{undo?.name}” — savings total updated.
+          Excluded “{undo?.name}”. Savings total updated.
         </Alert>
       </Snackbar>
     </Box>

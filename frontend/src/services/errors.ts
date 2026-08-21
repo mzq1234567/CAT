@@ -38,7 +38,7 @@ export function errorMessage(err: unknown): string {
       case 404:
         return "We couldn't find what you were looking for. It may have been removed.";
       case 429:
-        return "You're going a bit fast — please wait a moment and try again.";
+        return "You're going a bit fast. Please wait a moment and try again.";
       case 400:
         return looksClientSafe(data?.detail) ? (data!.detail as string) : "That request wasn't valid.";
       default:

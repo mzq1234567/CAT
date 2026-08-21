@@ -37,7 +37,7 @@ export default class ErrorBoundary extends React.Component<
           Something went wrong
         </Typography>
         <Typography variant="body2" color="text.secondary" maxWidth={440}>
-          The page ran into an unexpected problem. Reloading usually fixes it — your data is safe.
+          The page ran into an unexpected problem. Reloading usually fixes it, and your data is safe.
         </Typography>
         <Button variant="contained" onClick={() => window.location.reload()} sx={{ mt: 1 }}>
           Reload

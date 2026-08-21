@@ -79,6 +79,33 @@ async def test_respects_retry_after_header(monkeypatch):
     assert delays[0] == 7.0  # honoured the header
 
 
+async def test_retry_after_cap_is_per_call_cost_management_higher_than_global(monkeypatch):
+    # (C) A big Azure Retry-After is capped by the PER-CALL retry_after_cap. Default (global 60s) truncates
+    # a 120s Retry-After to 60; the Cost Management path passes a higher cap (180s) and honours it in full.
+    # Other APIs (default cap) are unaffected — the parameter only changes the caller that opts in.
+    delays = []
+
+    async def _capture(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr(resilience, "_sleep", _capture)
+
+    def _send_429_then_ok():
+        async def send():
+            return httpx.Response(429, headers={"Retry-After": "120"}) if not delays else httpx.Response(200)
+        return send
+
+    # Default cap (unchanged global behaviour for every other Azure API): 120 → capped at 60.
+    delays.clear()
+    await retry_request(_send_429_then_ok(), max_retries=3, base_delay=0.01)
+    assert delays[0] == 60.0
+
+    # Cost Management's higher, still-bounded cap: the full 120s Retry-After is honoured.
+    delays.clear()
+    await retry_request(_send_429_then_ok(), max_retries=3, base_delay=0.01, retry_after_cap=180.0)
+    assert delays[0] == 120.0
+
+
 async def test_transport_error_retried_then_raised():
     calls = {"n": 0}
 

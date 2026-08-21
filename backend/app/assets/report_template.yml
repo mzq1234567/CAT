@@ -98,7 +98,7 @@ projections:
       growth_source: measured
       caption: >-
         Projects the environment's own spend trend, measured from recent monthly billing, forward
-        linearly over three years — highlighting cumulative projected spend, savings, and
+        linearly over three years, highlighting cumulative projected spend, savings, and
         post-optimization costs.
     - title: "Conservative Growth ACR - 3 Years"
       growth_source: half_measured
@@ -167,11 +167,11 @@ content:
     require: has_findings
     style: note
     text: >-
-      <b>How these figures are calculated.</b> Every saving is grounded in your own Azure data — a
+      <b>How these figures are calculated.</b> Every saving is grounded in your own Azure data, a
       resource&#8217;s actual billed cost from Azure Cost Management, or live Azure retail pricing
       cross-checked against and capped at your billed cost, or Azure&#8217;s own reservation engine
       computed on your real usage. A saving is never allowed to exceed what you actually pay. Reference
-      list prices, where shown, are Azure&#8217;s published rates for context only — not billed cost and
+      list prices, where shown, are Azure&#8217;s published rates for context only, not billed cost and
       not a realised saving. Azure Hybrid Benefit is shown as <b>potential</b> (conditional on already
       owning eligible licences) and is deliberately excluded from the savings totals above.
 

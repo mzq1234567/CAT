@@ -2,18 +2,18 @@
 Findings engine (Step 6).
 
 Detects cost-optimisation findings across four families:
-  * unattached / orphaned  — ARG state is authoritative (unattached disk, idle App Service Plan…)
-  * idle                   — running VM with avg CPU below the idle threshold
-  * oversized              — running VM with low-but-not-idle CPU (downsize candidate)
-  * reserved-instance      — steadily-running VM cheaper on a 1yr reservation than pay-as-you-go
+  * unattached / orphaned , ARG state is authoritative (unattached disk, idle App Service Plan…)
+  * idle                  , running VM with avg CPU below the idle threshold
+  * oversized             , running VM with low-but-not-idle CPU (downsize candidate)
+  * reserved-instance     , steadily-running VM cheaper on a 1yr reservation than pay-as-you-go
 Plus Azure Advisor's own cost recommendations, re-scored consistently.
 
 Every finding carries:
-  * severity   — critical / high / medium / low (savings magnitude, Advisor impact can raise it)
-  * confidence — 0..1 from data freshness/volume, pricing source, and validation outcome
-  * advisor_recommendation_id — correlated Advisor rec id when one matches the resource
-  * validation — cross-check vs actual Cost Management spend (Step 4)
-  * debug_reason — DEV-ONLY plain-language trigger explanation, gated by DEBUG_FINDINGS_REASONING
+  * severity  , critical / high / medium / low (savings magnitude, Advisor impact can raise it)
+  * confidence, 0..1 from data freshness/volume, pricing source, and validation outcome
+  * advisor_recommendation_id, correlated Advisor rec id when one matches the resource
+  * validation, cross-check vs actual Cost Management spend (Step 4)
+  * debug_reason, DEV-ONLY plain-language trigger explanation, gated by DEBUG_FINDINGS_REASONING
 
 Live pricing (Step 2) and actual-cost validation (Step 4) are injected, so the engine is fully
 unit-testable without any network.
@@ -85,7 +85,7 @@ CONDITIONAL_CATEGORIES = frozenset({"windows_ahb", "sql_ahb"})
 
 
 def _vcpus(sku: str) -> Optional[int]:
-    """vCPU count for a VM SKU — from the curated spec table, else parsed from the SKU name.
+    """vCPU count for a VM SKU, from the curated spec table, else parsed from the SKU name.
 
     Azure encodes the vCPU count as the first number in the size (Standard_D4s_v3 → 4,
     Standard_B2ms → 2, Standard_DC1ds_v3 → 1), so a simple first-digit parse is a reliable fallback
@@ -177,7 +177,7 @@ def find_sql_vcore_target(
 ) -> Optional[int]:
     """Smallest vCore count below `current_vcores` (from `ladder`) where EVERY measured utilisation
     peak, scaled up by the capacity ratio (halving vCores ~doubles %), still clears `ceiling`. `peaks`
-    may hold None entries (metric unavailable) — those are ignored; at least one real peak is required.
+    may hold None entries (metric unavailable), those are ignored; at least one real peak is required.
     None → no safe smaller size."""
     ladder = ladder or _SQL_VCORE_LADDER
     usable = [p for p in peaks if p is not None]
@@ -204,7 +204,7 @@ CATEGORY_DISPLAY = {
     "stopped_sql_managed_instances": "Stopped SQL Managed Instances",
     "idle_vms": "Idle Virtual Machines",
     "oversized_vms": "Oversized Virtual Machines",
-    "vm_metrics_unavailable": "VMs — Utilisation Metrics Unavailable",
+    "vm_metrics_unavailable": "VMs, Utilisation Metrics Unavailable",
     "ri_vm": "Reserved Instance (VM)",
     "vm_rightsizing": "VM Rightsizing",
     "windows_ahb": "Windows Azure Hybrid Benefit",
@@ -222,7 +222,7 @@ CATEGORY_DISPLAY = {
     "orphaned_snapshots": "Orphaned Disk Snapshots",
     "empty_load_balancers": "Empty Load Balancers",
     "idle_nat_gateways": "Idle NAT Gateways",
-    "bastion_hosts": "Azure Bastion — Review",
+    "bastion_hosts": "Azure Bastion, Review",
     "backup_redundancy": "Backup Redundancy (GRS→LRS)",
 }
 
@@ -263,7 +263,7 @@ ORPHAN_RULES: Dict[str, OrphanRule] = {
     "empty_load_balancers": OrphanRule(
         "empty_load_balancers", "microsoft.network/loadbalancers",
         "Delete the load balancer if it is not routing traffic.",
-        lambda r: (f"Standard Load Balancer '{r.get('name')}' has no backend pool — it bills "
+        lambda r: (f"Standard Load Balancer '{r.get('name')}' has no backend pool, it bills "
                    "without balancing anything."),
         0.85,
     ),
@@ -278,7 +278,7 @@ ORPHAN_RULES: Dict[str, OrphanRule] = {
         "bastion_hosts", "microsoft.network/bastionhosts",
         "Confirm Bastion is still needed, or deallocate it when not in use.",
         lambda r: (f"Azure Bastion '{r.get('name')}' ({r.get('skuName') or 'Standard'}) is a "
-                   "fixed-cost resource that bills whether or not it's used — verify it is still required."),
+                   "fixed-cost resource that bills whether or not it's used, verify it is still required."),
         0.6,
     ),
 }
@@ -336,7 +336,7 @@ def find_downsize_target(
     CPU and (if known) peak memory both ≤ `ceiling` on that candidate. None if no candidate fits,
     the current SKU is unknown, or it's already the smallest in its family.
 
-    When `peak_memory_pct` is None (memory could not be measured), only CPU is checked — the
+    When `peak_memory_pct` is None (memory could not be measured), only CPU is checked, the
     caller is responsible for reflecting that reduced certainty in confidence/description; this
     function only answers "does a smaller SKU fit," not "how sure are we."
     """
@@ -389,6 +389,26 @@ def _parse_ids(resource_id: str) -> Tuple[str, str]:
     sub = parts[2] if len(parts) > 2 and parts[1].lower() == "subscriptions" else ""
     rg = parts[4] if len(parts) > 4 and parts[3].lower() == "resourcegroups" else ""
     return sub, rg
+
+
+def advisor_rec_is_subscription_scoped(resource_id: str, impacted_field: str = "") -> bool:
+    """True when an Advisor cost rec's 'resource' is the SUBSCRIPTION itself (or missing), not a deployed
+    resource — which is exactly the shape of a reservation / savings-plan PURCHASE recommendation
+    ("Consider virtual machine reserved instance to save over the on-demand costs").
+
+    Such recs must NOT become resource-backed findings: reservation recommendations come solely from the
+    Consumption reservationRecommendations path, which is the ONLY path reconciled against current
+    inventory (reconcile_vm_recommendations / reconcile_sql_recommendations). Turning an Advisor
+    reservation rec into a finding leaks an UNRECONCILED RI into "Other" and uses the subscription id as
+    the affected resource — the live bug. A real deployed resource id always contains '/providers/';
+    anything shallower (a bare subscription GUID, or '/subscriptions/{id}') is a subscription scope.
+    """
+    if (impacted_field or "").strip().lower() == "microsoft.subscriptions/subscriptions":
+        return True
+    rid = (resource_id or "").strip().strip("/").lower()
+    if not rid:
+        return True                      # no resource at all → cannot back a finding
+    return "/providers/" not in rid       # no provider path → subscription/scope, not a real resource
 
 
 # ── The engine ────────────────────────────────────────────────────────────────────
@@ -445,8 +465,8 @@ class FindingsEngine:
         """True when a resource hasn't billed a full representative month yet.
 
         `billed_months` (from the 6-month history) counts months with any cost. A value of 1 means the
-        resource only started billing in the most recent month — a brand-new, recently-migrated, or
-        just-provisioned resource — so its "last month" cost is a partial fragment that badly
+        resource only started billing in the most recent month, a brand-new, recently-migrated, or
+        just-provisioned resource, so its "last month" cost is a partial fragment that badly
         under-represents its real run-rate. In that case a saving grounded in that cost would be far
         too low (e.g. AHB on a 24×7 VM whose subscription was migrated mid-month), so the caller should
         price at the full-month run-rate instead and flag it as an estimate.
@@ -473,7 +493,7 @@ class FindingsEngine:
         """Build one finding, stamping its FINANCIAL EVIDENCE STATE.
 
         `evidence_state` = QUANTIFIED (a defensible, countable saving) or REVIEW (a real signal we can't
-        price for this customer — no savings amount, optional clearly-labelled reference list price). The
+        price for this customer, no savings amount, optional clearly-labelled reference list price). The
         caller passes REVIEW (with an optional `reference_monthly_price`) when it has no actual billed cost
         to ground a saving. A QUANTIFIED finding is additionally downgraded to REVIEW here when its saving
         rests on a run-rate over too short a billing span to annualise (insufficient billing history).
@@ -640,14 +660,14 @@ class FindingsEngine:
 
           * actual billed cost known → QUANTIFIED, saving = the resource's ACTUAL billed cost;
           * no billed cost but a live retail price → REVIEW, the retail rate shown ONLY as a clearly-
-            labelled reference (never a saving, never in any total) — this is the Bastion/orphan case;
+            labelled reference (never a saving, never in any total), this is the Bastion/orphan case;
           * neither → None (SUPPRESSED: nothing defensible to say).
 
         This is the single place the old "list price AS the saving" behaviour was removed: a retail/list
         price is reference pricing, not customer spend, so it can never become a quantified saving.
 
         Sponsored/credited subscriptions: when the billed cost is present but a negligible fraction of the
-        list price (compute effectively free — Azure Sponsorship/credit or a currency-scale mismatch), the
+        list price (compute effectively free, Azure Sponsorship/credit or a currency-scale mismatch), the
         resource still has economic value but the customer's saving can't be quantified from a near-zero
         bill, so it too becomes REVIEW rather than a tiny, misleading number.
         """
@@ -801,7 +821,7 @@ class FindingsEngine:
                 "app_service_plan_rightsizing", plan, "microsoft.web/serverfarms", monthly,
                 base_confidence=round(base_conf * 0.9, 2),
                 description=(f"App Service Plan '{plan.get('name')}' ({sku}) peaked at {max_cpu}% CPU and "
-                            f"{mem_str} memory over {window} days{mem_caveat} — it fits a smaller plan."),
+                            f"{mem_str} memory over {window} days{mem_caveat}, it fits a smaller plan."),
                 recommendation=f"Scale the plan down from {sku} to {target_sku}." + _RIGHTSIZE_METHODOLOGY,
                 has_price=True, debug_reason=reason,
                 extra_details={
@@ -824,7 +844,7 @@ class FindingsEngine:
         SQL is stateful and performance-sensitive, so this is deliberately cautious: it runs ONLY where
         per-resource Cost Management data exists (never a list-price guess), requires EVERY measured
         load dimension to clear the headroom ceiling on the projected smaller size, and grounds the
-        saving as `actual cost × (removed vCores / current vCores)`, capped at actual cost — so it
+        saving as `actual cost × (removed vCores / current vCores)`, capped at actual cost, so it
         tracks the real bill and can't exceed it. A recommendation to review, not an auto-action.
         """
         out: List[Dict] = []
@@ -864,7 +884,7 @@ class FindingsEngine:
                 "sql_db_rightsizing", db, "microsoft.sql/servers/databases", monthly,
                 base_confidence=round(base_conf * 0.85, 2),  # stateful resource → a touch more cautious
                 description=(f"SQL Database '{db.get('name')}' ({current_label}) peaked at {cpu}% CPU "
-                            f"({io_str}) over {window} days — it fits fewer vCores."),
+                            f"({io_str}) over {window} days, it fits fewer vCores."),
                 recommendation=(f"Scale down from {current_vcores} to {target} vCores after confirming "
                                 f"peak workloads.") + _RIGHTSIZE_METHODOLOGY,
                 has_price=True, debug_reason=reason,
@@ -920,7 +940,7 @@ class FindingsEngine:
                 "sql_mi_rightsizing", mi, "microsoft.sql/managedinstances", monthly,
                 base_confidence=round(base_conf * 0.85, 2),
                 description=(f"SQL Managed Instance '{mi.get('name')}' ({current_label}) peaked at "
-                            f"{cpu}% CPU over {window} days — it fits fewer vCores."),
+                            f"{cpu}% CPU over {window} days, it fits fewer vCores."),
                 recommendation=(f"Scale down from {current_vcores} to {target} vCores after confirming "
                                 f"peak workloads.") + _RIGHTSIZE_METHODOLOGY,
                 has_price=True, debug_reason=reason, grounded=True,
@@ -938,7 +958,7 @@ class FindingsEngine:
     ) -> List[Dict]:
         """Downgrade an attached Premium SSD disk to Standard SSD when its peak IOPS AND throughput
         both stay well within Standard SSD's baseline (the 70% headroom ceiling). Requires BOTH signals
-        — a wrong downgrade throttles the disk's I/O — so a disk with no metrics is left alone.
+       , a wrong downgrade throttles the disk's I/O, so a disk with no metrics is left alone.
 
         Low IOPS/throughput does NOT by itself make a downgrade safe: databases and other latency-
         sensitive workloads need Premium's low, consistent latency even at trivial IOPS (a SQL log disk
@@ -991,7 +1011,7 @@ class FindingsEngine:
                 "disk_rightsizing", disk, "microsoft.compute/disks", monthly,
                 base_confidence=round(base_conf * 0.9, 2),
                 description=(f"Managed disk '{disk.get('name')}' ({size} GB Premium SSD) peaked at only "
-                            f"{peak_iops:.0f} IOPS / {peak_mbps:.0f} MB/s over {window} days — a throughput "
+                            f"{peak_iops:.0f} IOPS / {peak_mbps:.0f} MB/s over {window} days, a throughput "
                             "level Standard SSD handles at lower cost."),
                 recommendation=(f"If this disk does NOT back a latency-sensitive workload (databases, "
                                 f"transaction logs, etc. need Premium's low latency even at low IOPS), change "
@@ -1012,13 +1032,19 @@ class FindingsEngine:
     def detect_deallocated_vms(self, vms: List[Dict]) -> List[Dict]:
         """Deallocated/stopped VMs: compute stops billing, but the OS + data disks keep billing.
 
-        The saving from removing the VM (and its disks) is the cost of those still-billing disks, read
+        The saving from removing a VM (and its disks) is the cost of those still-billing disks, read
         straight from Cost Management (the disks are attached to the VM, so they don't show up in the
-        unattached-disk detector). Without per-resource cost data the disk cost can't be quantified, so
-        the saving is 0 and the finding drops out (a zero-value line is noise in a savings report).
+        unattached-disk detector). Without per-resource cost data the disk cost can't be quantified.
+
+        Emitted as ONE aggregated finding (like Reserved Instances / Azure Hybrid Benefit): the headline
+        opportunity is the TOTAL still-billing disk cost across every deallocated VM, and the individual
+        VMs are listed in the details (drawer). The finding is resource-less (`id=None`) so it presents as
+        a single card and escapes the per-resource dedupe. VMs whose disk cost can't be quantified are
+        excluded (no fabricated $0 line).
         """
-        out = []
         sym = symbol(self._currency)
+        items: List[Dict] = []
+        total = 0.0
         for vm in vms:
             disk_ids: List[str] = []
             if vm.get("osDiskId"):
@@ -1028,28 +1054,57 @@ class FindingsEngine:
                 if did:
                     disk_ids.append(did.lower())
             disk_cost = round(sum(self._cost_map.get(d, 0.0) for d in disk_ids), 2)
-            n_disks = len(disk_ids)
-            state = vm.get("powerState") or "deallocated"
-            reason = (
-                f"VM powerState=='{state}' in Resource Graph as of {self._snapshot}; compute stopped "
-                f"but {n_disks} attached disk(s) still bill {sym}{disk_cost:.2f}/mo (Cost Management)."
-            )
-            out.append(self._finding(
-                "deallocated_vms", vm, "microsoft.compute/virtualmachines", disk_cost,
-                base_confidence=0.9,
-                description=(f"VM '{vm.get('name')}' ({vm.get('vmSize')}) is {state}. Its {n_disks} "
-                            f"disk{'s' if n_disks != 1 else ''} keep accruing storage cost while it's stopped."),
-                recommendation="Delete the VM and its disks if it's no longer needed.",
-                has_price=disk_cost > 0, debug_reason=reason,
-                # Grounded in the disks' real cost, not the VM's ~0 compute — override the cap basis.
-                grounded=disk_cost > 0, actual_cost_override=disk_cost if disk_cost > 0 else None,
-                extra_details={**vm, "attached_disk_count": n_disks, "disk_monthly_cost": disk_cost},
-            ))
-        return out
+            if disk_cost <= 0:
+                continue  # can't quantify this VM's residual disk cost → don't invent a $0 opportunity
+            total += disk_cost
+            items.append({
+                "name": vm.get("name"), "sku": vm.get("vmSize"),
+                "region": vm.get("location"),
+                "monthly_savings": disk_cost,
+                "attached_disk_count": len(disk_ids),
+                "power_state": vm.get("powerState") or "deallocated",
+            })
+
+        if not items:
+            return []
+        total = round(total, 2)
+        items.sort(key=lambda x: -(x.get("monthly_savings") or 0))
+        n = len(items)
+        plural = "s" if n != 1 else ""
+        shown = ", ".join(str(x["name"]) for x in items[:6] if x.get("name"))
+        if n > 6:
+            shown += f", +{n - 6} more"
+        synthetic = {
+            "id": None,
+            "name": f"Deallocated VMs, {n} VM{plural}",
+            "subscriptionId": vms[0].get("subscriptionId") if vms else None,
+            "resourceGroup": None,
+        }
+        reason = (
+            f"Aggregated {n} deallocated VM{plural}; attached OS/data disks still bill {sym}{total:.2f}/mo "
+            f"total (Cost Management). VMs: {shown}."
+        )
+        return [self._finding(
+            "deallocated_vms", synthetic, "microsoft.compute/virtualmachines", total,
+            base_confidence=0.9,
+            description=(
+                f"{n} virtual machine{plural} {'is' if n == 1 else 'are'} deallocated/stopped, yet their "
+                f"attached OS and data disks keep accruing storage cost while the compute is off."
+            ),
+            recommendation="Delete each VM and its disks where the machine is no longer needed.",
+            has_price=True, debug_reason=reason,
+            # Grounded in the disks' real billed cost (not the VMs' ~0 compute) — override the cap basis.
+            grounded=True, actual_cost_override=total,
+            extra_details={
+                "aggregate": True, "affected_vms": items, "affected_count": n,
+                "attached_disk_count": sum(x["attached_disk_count"] for x in items),
+                "disk_monthly_cost": total,
+            },
+        )]
 
     def detect_paused_sql_databases(self, dbs: List[Dict]) -> List[Dict]:
         """Paused/inactive SQL DBs still bill for storage. The saving from removing one is its ACTUAL
-        Cost Management billed cost — never a guess. Without per-resource cost data the saving can't be
+        Cost Management billed cost, never a guess. Without per-resource cost data the saving can't be
         quantified, so it stays 0 and the pipeline drops it (no fabricated $0 opportunity)."""
         out = []
         for db in dbs:
@@ -1099,7 +1154,7 @@ class FindingsEngine:
     async def detect_orphans(self, bucket: str, rows: List[Dict]) -> List[Dict]:
         """Evaluate a rule-driven orphan bucket (snapshots, empty LBs, NAT gw, Bastion).
 
-        Pricing hierarchy — never a hardcoded estimate:
+        Pricing hierarchy, never a hardcoded estimate:
           * snapshots            → the snapshot's ACTUAL Cost Management billed cost (grounded);
           * Load Balancer / NAT / Bastion → the LIVE Retail Prices API rate, or the resource's
             actual billed cost when retail has no price.
@@ -1157,7 +1212,7 @@ class FindingsEngine:
         CPU and memory (not CPU alone) avoids flagging a memory-bound VM (e.g. an in-memory cache)
         as idle just because it happens to be CPU-light. When memory couldn't be measured for a VM
         (no data from Azure Monitor), the CPU-only signal is still used but confidence is reduced
-        and the finding is marked `memory_verified=False` — never silently treated as "0% memory".
+        and the finding is marked `memory_verified=False`, never silently treated as "0% memory".
         """
         out: List[Dict] = []
         metrics_unavailable: List[Dict] = []   # VMs discovered but whose metrics FAILED (≠ genuinely empty)
@@ -1208,14 +1263,14 @@ class FindingsEngine:
                 reason = (
                     f"peak CPU {max_cpu}% and peak memory used {mem_str} over the last {window} days "
                     f"(avg CPU {avg_str}, {cpu_datapoints} data points) both stayed below the idle "
-                    f"bars ({IDLE_MAX_CPU}% CPU / {IDLE_MAX_MEMORY_PCT}% memory) — the VM does "
+                    f"bars ({IDLE_MAX_CPU}% CPU / {IDLE_MAX_MEMORY_PCT}% memory), the VM does "
                     f"effectively no work; {sku} priced ${monthly:.2f}/mo."
                 )
                 out.append(self._finding(
                     "idle_vms", vm, "microsoft.compute/virtualmachines", monthly,
                     base_confidence=base_conf,
                     description=(f"VM '{vm.get('name')}' ({sku}) peaked at just {max_cpu}% CPU and "
-                                f"{mem_str} memory over {window} days — effectively idle."),
+                                f"{mem_str} memory over {window} days, effectively idle."),
                     recommendation="Deallocate or delete this VM if it is no longer needed." + _IDLE_METHODOLOGY,
                     has_price=payg is not None, debug_reason=reason,
                     extra_details={
@@ -1237,7 +1292,7 @@ class FindingsEngine:
             except PricingUnavailableError:
                 target_price = None
             if payg is None or target_price is None:
-                continue  # can't state a real saving without both real prices — skip rather than guess
+                continue  # can't state a real saving without both real prices, skip rather than guess
             monthly = round(max(0.0, payg - target_price), 2)
             if monthly <= 0:
                 continue  # target isn't actually cheaper (edge-case pricing) → nothing to recommend
@@ -1251,7 +1306,7 @@ class FindingsEngine:
                 "oversized_vms", vm, "microsoft.compute/virtualmachines", monthly,
                 base_confidence=round(base_conf * 0.9, 2),
                 description=(f"VM '{vm.get('name')}' ({sku}) peaked at {max_cpu}% CPU and {mem_str} "
-                            f"memory over {window} days{mem_caveat} — comfortably fits on a smaller "
+                            f"memory over {window} days{mem_caveat}, comfortably fits on a smaller "
                             f"SKU."),
                 recommendation=f"Resize from {sku} to {target.sku}." + _RIGHTSIZE_METHODOLOGY,
                 has_price=True, debug_reason=reason,
@@ -1281,7 +1336,7 @@ class FindingsEngine:
         """One REVIEW finding for VMs whose utilisation metrics could not be collected this run.
 
         Utilisation-dependent savings (idle / right-sizing) can't be quantified without metrics, so this
-        is REVIEW / "Not quantified" — it carries the reason and the affected VMs, integrates with the
+        is REVIEW / "Not quantified", it carries the reason and the affected VMs, integrates with the
         Batch-1 evidence model (0 saving, excluded from every total), and is never a fabricated finding.
         """
         n = len(vms)
@@ -1289,7 +1344,7 @@ class FindingsEngine:
                     for vm in vms[:50]]
         sub_id = next((vm.get("subscriptionId") for vm in vms if vm.get("subscriptionId")), None)
         synthetic = {
-            "id": None, "name": f"{n} VM{'s' if n != 1 else ''} — utilisation metrics unavailable",
+            "id": None, "name": f"{n} VM{'s' if n != 1 else ''}, utilisation metrics unavailable",
             "subscriptionId": sub_id, "resourceGroup": None,
         }
         return self._finding(
@@ -1299,7 +1354,7 @@ class FindingsEngine:
                 f"{n} running VM{'s were' if n != 1 else ' was'} discovered, but Azure Monitor "
                 "utilisation metrics could not be collected for them this run (throttled or errored after "
                 "retries). Idle / right-sizing savings can't be assessed without metrics, so they are not "
-                "quantified — a failed metric is never treated as 0% utilisation."),
+                "quantified, a failed metric is never treated as 0% utilisation."),
             recommendation=("Re-run the assessment once Azure Monitor metrics are available to evaluate "
                             "these VMs for idle / right-sizing savings."),
             evidence_state=REVIEW,
@@ -1312,7 +1367,7 @@ class FindingsEngine:
     def _aggregate_commitment_finding(
         self, category: str, kind: str, items: List[Dict], *,
         source: str, base_confidence: float, unit: str = "SKU", grounded: bool = False,
-        context_note: str = "",
+        context_note: str = "", affected_resources: Optional[List[Dict]] = None,
     ) -> Optional[Dict]:
         """Roll many per-SKU/VM commitment items into ONE finding.
 
@@ -1321,82 +1376,141 @@ class FindingsEngine:
         1-year option is shown alongside so the client can pick the shorter commitment. Resource-less
         (`id=None`) so it isn't collapsed by the per-resource dedupe. `context_note` is appended to the
         description (e.g. the production-targeting rationale for VMs).
+
+        `affected_resources`, when provided, is the list of CURRENT resources (resolved from live
+        inventory by the reconciliation layer) that this recommendation applies to; it becomes the
+        finding's affected-resource list/count so the client only ever sees resources that currently
+        exist in the assessed subscription — never resources inferred from historical usage.
         """
-        one_total = 0.0
-        three_total = 0.0
+        # PURE per-term aggregation. Each term is summed over ONLY the items Azure actually priced for
+        # that term. A missing term is NEVER back-filled from the other term — so `total_1yr_monthly`
+        # can only reflect real P1Y recommendations and `total_3yr_monthly` only real P3Y ones.
+        one_save = 0.0        # Σ P1Y net savings (items with a real 1-year rec)
+        three_save = 0.0      # Σ P3Y net savings (items with a real 3-year rec)
+        one_ond = 0.0         # Σ P1Y on-demand baseline (costWithNoReservedInstances) for those items
+        three_ond = 0.0       # Σ P3Y on-demand baseline for those items
+        has_1yr = False
         has_3yr = False
+        n1 = 0
+        n3 = 0
         ui_items: List[Dict] = []
         for it in items:
             s1 = it.get("s1")
             s3 = it.get("s3")
-            best = s3 if s3 is not None else s1  # deepest available discount for this item
-            if best is None or best <= 0:
+            s1 = s1 if (s1 is not None and s1 > 0) else None
+            s3 = s3 if (s3 is not None and s3 > 0) else None
+            if s1 is None and s3 is None:
                 continue
-            one_total += (s1 if s1 is not None else s3)
-            three_total += best
+            if s1 is not None:
+                has_1yr = True
+                n1 += 1
+                one_save += s1
+                if it.get("ond1"):
+                    one_ond += it["ond1"]
             if s3 is not None:
                 has_3yr = True
+                n3 += 1
+                three_save += s3
+                if it.get("ond3"):
+                    three_ond += it["ond3"]
             ui_items.append({
                 "name": it.get("name"), "sku": it.get("sku"), "region": it.get("region"),
-                "quantity": it.get("quantity") or 0,
-                "monthly_savings": round(s1, 2) if s1 is not None else round(best, 2),
-                "monthly_savings_3yr": round(s3, 2) if s3 is not None else None,
-                "monthly_ondemand": it.get("ondemand"), "monthly_reserved": it.get("reserved"),
+                "quantity": it.get("q3") or it.get("q1") or it.get("quantity") or 0,
+                # Each term shows its OWN Azure saving, or None if Azure returned no rec for that term
+                # (never copied from the other term).
+                "monthly_savings": round(s1, 2) if s1 is not None else None,        # 1-year
+                "monthly_savings_3yr": round(s3, 2) if s3 is not None else None,    # 3-year
+                "monthly_ondemand": it.get("ond3") if it.get("ond3") is not None else it.get("ond1"),
+                "monthly_reserved": it.get("res3") if it.get("res3") is not None else it.get("res1"),
                 "environment": it.get("environment"),
             })
         if not ui_items:
             return None
 
-        one_total = round(one_total, 2)
-        three_total = round(three_total, 2)
-        headline = three_total if has_3yr else one_total  # best case = 3-year when available
-        ui_items.sort(key=lambda x: -(x["monthly_savings_3yr"] or x["monthly_savings"]))
+        one_save = round(one_save, 2)
+        three_save = round(three_save, 2)
+        one_ond = round(one_ond, 2)
+        three_ond = round(three_ond, 2)
+        both = has_1yr and has_3yr
+        rec_term = "3-year" if has_3yr else "1-year"   # deepest term actually available
+        # Counted headline = the best realisable saving, each item using its OWN deepest available term
+        # (no cross-term copying). With both terms priced for the same SKUs this equals the 3-year total.
+        headline = round(
+            sum(max(x["monthly_savings_3yr"] or 0.0, x["monthly_savings"] or 0.0) for x in ui_items), 2
+        )
+        ui_items.sort(key=lambda x: -max(x["monthly_savings_3yr"] or 0.0, x["monthly_savings"] or 0.0))
         n = len(ui_items)
         plural = "s" if n != 1 else ""
         shown = ", ".join(str(x["sku"]) for x in ui_items[:6] if x["sku"])
         if n > 6:
             shown += f", +{n - 6} more"
 
-        # Best case first (3-year), then the 1-year alternative.
+        # Only the terms Azure genuinely returned appear as options (a single-term rec shows one option,
+        # not a fabricated second term). Deepest term first.
         options = []
         if has_3yr:
-            options.append({"label": f"3-year {kind}", "monthly_savings": three_total})
-        options.append({"label": f"1-year {kind}", "monthly_savings": one_total})
+            options.append({"label": f"3-year {kind}", "monthly_savings": three_save})
+        if has_1yr:
+            options.append({"label": f"1-year {kind}", "monthly_savings": one_save})
 
         synthetic = {
             "id": None,
-            "name": f"{kind}s — {n} {unit}{plural}",
+            "name": f"{kind}s, {n} {unit}{plural}",
             "subscriptionId": items[0].get("subscription_id") if items else None,
             "resourceGroup": None,
         }
         sym = symbol(self._currency)
-        rate_note = (
-            f"best rate about {sym}{three_total:,.0f}/mo on a 3-year term, {sym}{one_total:,.0f}/mo on 1-year"
-            if has_3yr else f"about {sym}{one_total:,.0f}/mo on a 1-year term"
-        )
+        if both:
+            rate_note = (f"best rate about {sym}{three_save:,.0f}/mo on a 3-year term, "
+                         f"{sym}{one_save:,.0f}/mo on 1-year")
+            term_phrase = "1- or 3-year"
+        elif has_3yr:
+            rate_note = f"about {sym}{three_save:,.0f}/mo on a 3-year term"
+            term_phrase = "3-year"
+        else:
+            rate_note = f"about {sym}{one_save:,.0f}/mo on a 1-year term"
+            term_phrase = "1-year"
         reason = (
-            f"Aggregated {n} {kind} candidate{plural} ({source}); best case 3-year "
-            f"{sym}{three_total:.2f}/mo, 1-year {sym}{one_total:.2f}/mo. {unit}s: {shown}."
+            f"Aggregated {n} {kind} candidate{plural} ({source}); Azure priced 1-year for {n1}, "
+            f"3-year for {n3}; term totals 1yr={sym}{one_save:.2f}/mo, 3yr={sym}{three_save:.2f}/mo. "
+            f"{unit}s: {shown}."
         )
+        extra_details = {
+            "aggregate": True, "source": source, "kind": kind,
+            "reservation_options": options, "reservation_items": ui_items,
+            "item_count": n,
+            # PURE per-term totals — None when Azure returned no rec for that term (never a copy).
+            "total_1yr_monthly": one_save if has_1yr else None,
+            "total_3yr_monthly": three_save if has_3yr else None,
+            # Per-term PAYG (on-demand) baseline so each term's % is vs its own rec's
+            # costWithNoReservedInstances; plus a best-term baseline for the headline comparison.
+            "total_ondemand_1yr": one_ond if (has_1yr and one_ond > 0) else None,
+            "total_ondemand_3yr": three_ond if (has_3yr and three_ond > 0) else None,
+            "total_ondemand_monthly": (
+                three_ond if (has_3yr and three_ond > 0)
+                else one_ond if (has_1yr and one_ond > 0) else None
+            ),
+            "has_1yr": has_1yr, "has_3yr": has_3yr, "n_1yr": n1, "n_3yr": n3,
+        }
+        # Affected resources come from CURRENT inventory (the reconciliation layer), so the drawer's
+        # list/count reflects resources that actually exist now — never historical usage. Takes
+        # precedence over the SKU list in the UI's affectedResources() resolver.
+        if affected_resources:
+            extra_details["affected_vms"] = affected_resources
+            extra_details["affected_count"] = len(affected_resources)
         return self._finding(
             category, synthetic, "microsoft.consumption/reservationrecommendations", headline,
             base_confidence=base_confidence,
             description=(
-                f"{n} {unit}{plural} are candidates to reserve ({shown}). A 1- or 3-year {kind} locks in "
-                f"a lower rate than pay-as-you-go — {rate_note}.{context_note}"
+                f"{n} {unit}{plural} are candidates to reserve ({shown}). A {term_phrase} {kind} locks "
+                f"in a lower rate than pay-as-you-go, {rate_note}.{context_note}"
             ),
             recommendation=(
-                f"Purchase {'3-year' if has_3yr else '1-year'} {kind}s for the {unit.lower()}{plural} "
-                f"listed for the best rate"
-                + (", or a 1-year term for more flexibility." if has_3yr else ".")
+                f"Purchase {rec_term} {kind}s for the {unit.lower()}{plural} listed for the best rate"
+                + (", or a 1-year term for more flexibility." if both else ".")
             ),
             has_price=True, debug_reason=reason, grounded=grounded,
-            extra_details={
-                "aggregate": True, "source": source, "kind": kind,
-                "reservation_options": options, "reservation_items": ui_items,
-                "item_count": n, "total_1yr_monthly": one_total,
-                "total_3yr_monthly": three_total if has_3yr else None,
-            },
+            extra_details=extra_details,
         )
 
     # NOTE: `detect_vm_commitments` (the old retail-estimate VM RI detector) was REMOVED in the
@@ -1412,46 +1526,81 @@ class FindingsEngine:
     def commitments_from_recommendations(self, groups: List[Dict]) -> List[Dict]:
         """Build reservation findings from parsed Consumption `reservationRecommendations`.
 
-        This is the AUTHORITATIVE and ONLY source of Reserved Instance recommendations — for VMs and
+        This is the AUTHORITATIVE and ONLY source of Reserved Instance recommendations, for VMs and
         for every non-VM type (SQL / Cosmos / App Service / Files / Disks) alike. Azure's engine
         simulates the customer's real hourly usage over the look-back window at their real (negotiated)
         prices, excludes reservations already owned, and returns the SKU, quantity, term, on-demand
         cost, reserved cost and net savings that MAXIMISE savings. We never compute a discount, never
-        assume a rate, and never recommend a reservation Azure didn't — so a VM only earns an RI when
+        assume a rate, and never recommend a reservation Azure didn't, so a VM only earns an RI when
         Microsoft's own engine says the customer's usage justifies one.
 
         A group with no positive saving on either term is dropped (nothing to recommend). Savings-plan
-        recommendations are intentionally excluded — this tool recommends Reserved Instances only.
+        recommendations are intentionally excluded, this tool recommends Reserved Instances only.
         Grouped into ONE finding per finding-category. Resource-less (escapes per-resource dedupe).
         """
         by_category: Dict[str, List[Dict]] = {}
+        # Affected resources resolved from CURRENT inventory (attached by reconcile_vm_recommendations),
+        # deduped by resource id per category. These — not the historical SKU groups — drive the
+        # finding's affected-resource list/count for VMs.
+        affected_by_category: Dict[str, List[Dict]] = {}
+        affected_seen: Dict[str, set] = {}
         for g in groups:
             if g.get("category") == "savings_plan_vm":
                 continue  # we recommend Reserved Instances, not Savings Plans
             terms = g.get("terms", {})
             p1 = terms.get("P1Y")
             p3 = terms.get("P3Y")
-            head = p1 or p3
             # Validate we have enough authoritative data: a real recommendation with a positive net
-            # saving. No recommendation / no saving → not surfaced (never a fabricated figure).
-            if not head or head.get("monthly_savings", 0) <= 0:
+            # saving on EITHER term. Keep the group if either term is positive (a 3-year-only rec must
+            # not be dropped for lacking a 1-year rec, and vice-versa); never fabricate the missing term.
+            s1 = p1.get("monthly_savings") if p1 else None
+            s3 = p3.get("monthly_savings") if p3 else None
+            has1 = s1 is not None and s1 > 0
+            has3 = s3 is not None and s3 > 0
+            if not has1 and not has3:
                 continue
-            by_category.setdefault(g["category"], []).append({
+            cat = g["category"]
+            by_category.setdefault(cat, []).append({
                 "name": g.get("sku"), "sku": g.get("sku"), "region": g.get("region"),
-                "quantity": int(head.get("quantity") or 0),
-                "s1": p1["monthly_savings"] if p1 else None,
-                "s3": p3["monthly_savings"] if p3 else None,
-                "ondemand": head.get("monthly_ondemand"), "reserved": head.get("monthly_reserved"),
+                "quantity": int(((p3 or p1) or {}).get("quantity") or 0),
+                # Each term's OWN Azure figures, or None when Azure returned no rec for that term.
+                "s1": s1 if has1 else None,
+                "s3": s3 if has3 else None,
+                "ond1": (p1 or {}).get("monthly_ondemand"), "ond3": (p3 or {}).get("monthly_ondemand"),
+                "res1": (p1 or {}).get("monthly_reserved"), "res3": (p3 or {}).get("monthly_reserved"),
+                "q1": int((p1 or {}).get("quantity") or 0) if p1 else None,
+                "q3": int((p3 or {}).get("quantity") or 0) if p3 else None,
                 "subscription_id": g.get("subscription_id"),
             })
+            for res in g.get("current_resources") or []:
+                rid = (res.get("id") or "").lower()
+                seen = affected_seen.setdefault(cat, set())
+                if rid and rid not in seen:
+                    seen.add(rid)
+                    affected_by_category.setdefault(cat, []).append(res)
 
         out: List[Dict] = []
         for category, items in by_category.items():
             unit = "VM" if category == "ri_vm" else "SKU"
+            # Diagnostic: how many items carried a 1-year vs a 3-year saving, and the term totals — so a
+            # real run makes it obvious whether Azure returned BOTH terms (distinct 1yr/3yr) or only one
+            # (in which case 1yr and 3yr legitimately coincide). Never logs tokens/secrets.
+            n1 = sum(1 for it in items if it.get("s1") is not None)
+            n3 = sum(1 for it in items if it.get("s3") is not None)
+            # PURE per-term totals for the log: sum ONLY the items Azure priced for that term (never a
+            # copy of the other term), so the log tells the true story of what Azure returned.
+            t1 = round(sum(it["s1"] for it in items if it.get("s1") is not None), 2)
+            t3 = round(sum(it["s3"] for it in items if it.get("s3") is not None), 2)
+            logger.info("RI %s: %d SKU/VM group(s) — 1yr priced for %d, 3yr priced for %d; "
+                        "term totals 1yr=%.2f/mo 3yr=%.2f/mo (%s).",
+                        category, len(items), n1, n3, t1, t3,
+                        "both terms present" if n3 and n1 else
+                        "only 3-year returned" if n3 else "only 1-year returned")
             f = self._aggregate_commitment_finding(
                 category, "Reserved Instance", items,
                 source="azure_reservation_recommendations", base_confidence=0.9, unit=unit,
-                grounded=True)  # Azure computes these on real usage at real prices — authoritative
+                grounded=True,  # Azure computes these on real usage at real prices, authoritative
+                affected_resources=affected_by_category.get(category))
             if f:
                 out.append(f)
         return out
@@ -1471,13 +1620,13 @@ class FindingsEngine:
           1. GROUND THE SAVING IN THE ACTUAL BILL. Per VM the saving is
              `actual billed cost × licence_fraction`, where `licence_fraction = (Windows list price −
              Linux list price) / Windows list price` from LIVE retail pricing for that exact SKU/region.
-             This is the licence share of what the customer is REALLY billed — never a theoretical list
+             This is the licence share of what the customer is REALLY billed, never a theoretical list
              price. It is additionally capped at the SKU's full list licence premium so it can never
              exceed the licence itself, and can never exceed the VM's own cost.
 
           2. NEVER FABRICATE. A VM is EXCLUDED (contributes nothing, counted separately) when we can't
              establish the licence premium (no live Windows/Linux price for the SKU) OR can't ground it
-             (no measured billed cost — e.g. a brand-new/partial subscription resource that hasn't billed,
+             (no measured billed cost, e.g. a brand-new/partial subscription resource that hasn't billed,
              or a deallocated box). We do NOT price the licence at list on a VM that isn't billing it, and
              we do NOT extrapolate a full-month/annual figure from insufficient billing to justify a saving.
 
@@ -1571,7 +1720,7 @@ class FindingsEngine:
             "subscriptionId": sub_id, "resourceGroup": None,
         }
         partial_note = (
-            " These figures reflect the licence share of the spend billed SO FAR — this subscription has "
+            " These figures reflect the licence share of the spend billed SO FAR, this subscription has "
             "less than one complete billing month (recently created or migrated), so re-run after a full "
             "billing month for a complete picture." if partial_billing else ""
         )
@@ -1588,7 +1737,7 @@ class FindingsEngine:
         # → the data is suspect. Flag loudly. This is now distinct from ordinary low utilisation.
         cost_anomaly = anomalous_low > 0 and anomalous_low >= (n + 1) // 2
         anomaly_note = (
-            f" ⚠ Billed cost for {anomalous_low} of {n} VMs is far below their size's list price — compute "
+            f" ⚠ Billed cost for {anomalous_low} of {n} VMs is far below their size's list price, compute "
             "is effectively free, which usually means a sponsored/credited/trial subscription OR a "
             "billing-data/currency issue. Verify your subscription type and billing currency before relying "
             "on these figures." if cost_anomaly else ""
@@ -1598,7 +1747,7 @@ class FindingsEngine:
         low_utilisation = not cost_anomaly and (anomalous_low + low_util) >= (n + 1) // 2
         low_util_note = (
             " Most of these VMs run intermittently (billed for only part of the month), so the licence "
-            "saving reflects their limited runtime — it scales up as they run more." if low_utilisation else ""
+            "saving reflects their limited runtime, it scales up as they run more." if low_utilisation else ""
         )
         reason = (
             f"{n} Windows VMs grounded in actual billed cost × per-VM (Windows − Linux) licence fraction "
@@ -1609,11 +1758,11 @@ class FindingsEngine:
             "windows_ahb", synthetic, "microsoft.compute/virtualmachines", total,
             base_confidence=0.7,
             description=(
-                f"POTENTIAL saving — conditional on licence ownership. {n} Windows "
+                f"POTENTIAL saving, conditional on licence ownership. {n} Windows "
                 f"VM{'s' if n != 1 else ''} currently pay Azure's Windows Server licence on top of compute "
                 f"({shown}). IF you already own eligible Windows Server licences with active Software "
                 "Assurance (or qualifying subscription licences), Azure Hybrid Benefit removes that licence "
-                "charge. The amount shown is the Windows licence share of these VMs' ACTUAL billed cost — "
+                "charge. The amount shown is the Windows licence share of these VMs' ACTUAL billed cost, "
                 "not a theoretical list price, and not automatic: you only realise it on VMs your licences "
                 f"cover.{partial_note}{excl_note}{anomaly_note}{low_util_note}"
             ),
@@ -1621,7 +1770,7 @@ class FindingsEngine:
                 "Apply Azure Hybrid Benefit (licenseType=Windows_Server) ONLY to the VMs covered by "
                 "eligible Windows Server licences you already own; VMs without eligible licences must stay "
                 "on their current pay-as-you-go Windows licensing. You do not receive this saving simply "
-                "by enabling AHB — it depends on owning the licences (with active Software Assurance or a "
+                "by enabling AHB, it depends on owning the licences (with active Software Assurance or a "
                 "qualifying subscription)."
             ),
             has_price=True, debug_reason=reason,
@@ -1649,14 +1798,14 @@ class FindingsEngine:
     async def detect_sql_ahb(
         self, sql_resources: List[Dict], exclude_ids: Optional[set] = None,
     ) -> List[Dict]:
-        """RETIRED — SQL Server Azure Hybrid Benefit is no longer quantified, because the SQL licence
+        """RETIRED, SQL Server Azure Hybrid Benefit is no longer quantified, because the SQL licence
         component cannot be reliably derived from any authoritative Microsoft pricing API.
 
         Why: the Azure Retail Prices API exposes only ONE consumption price per SQL vCore (the
-        licence-included rate) — there is no separate "Azure Hybrid Benefit / base compute" meter, so
+        licence-included rate), there is no separate "Azure Hybrid Benefit / base compute" meter, so
         the licence portion isn't published anywhere we can read live. The previous implementation used
         a hardcoded $112/vCore/month constant which, verified against the live API, is ≈ the ENTIRE
-        GP Gen5 per-vCore compute price (~$111/vCore) — i.e. it claimed AHB removes essentially the whole
+        GP Gen5 per-vCore compute price (~$111/vCore), i.e. it claimed AHB removes essentially the whole
         compute cost, grossly over-stating the saving. Under this tool's rule ("if the required pricing
         cannot be reliably derived, do not fabricate the saving"), we surface no SQL AHB dollar figure
         rather than a wrong one. Detection of AHB-eligible SQL still exists in the KQL layer; if Microsoft
@@ -1676,6 +1825,23 @@ class FindingsEngine:
             short = props.get("shortDescription", {})
             meta = props.get("resourceMetadata", {})
             resource_id = meta.get("resourceId", "")
+            # SECOND RI LEAK PATH — the live #118 bug. Azure Advisor also returns reservation / savings-
+            # plan PURCHASE recommendations ("Consider virtual machine reserved instance to save over the
+            # on-demand costs"). These are subscription-scoped (their resource is the subscription itself),
+            # historical/SKU-based, and duplicate our AUTHORITATIVE Consumption RI path — the ONLY path
+            # reconciled against current inventory. Turning them into findings leaked an unreconciled VM RI
+            # into "Other" and used the subscription id as the affected resource, even with zero current
+            # VMs. Skip them here so reservations exist ONLY via the reconciled Consumption path, and a
+            # finding never uses a subscription id as its affected resource.
+            if advisor_rec_is_subscription_scoped(resource_id, props.get("impactedField", "")):
+                logger.info(
+                    "Advisor cost rec EXCLUDED assessment_scope=subscription resourceId=%s "
+                    "impactedField=%s recId=%s problem=%r reason=SUBSCRIPTION_SCOPED_RESERVATION_OR_"
+                    "NO_REAL_RESOURCE (reservations come only from the inventory-reconciled Consumption "
+                    "path; never subscription-id-as-resource)",
+                    resource_id or "(none)", props.get("impactedField"), rec.get("id"),
+                    short.get("problem"))
+                continue
             key = f"advisor:{resource_id}:{short.get('problem','')}"
             if key in seen:
                 continue

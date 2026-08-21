@@ -2,7 +2,7 @@
 Client-facing cost-assessment report (PDF).
 
 `generate_pdf` renders the branded TechPlus Talent template. The document's *copy and layout* live
-in `assets/report_template.yml`; this module only supplies the *data* — every figure, table row and
+in `assets/report_template.yml`; this module only supplies the *data*, every figure, table row and
 chart series is derived from the assessment and its findings, so nothing in the report is
 hardcoded. Sections whose findings are absent are skipped rather than printed empty.
 """
@@ -113,7 +113,7 @@ def _fonts(cfg: Dict) -> str:
         pdfmetrics.registerFontFamily(
             family, normal=family, bold=f"{family}-Bold",
             italic=f"{family}-Italic", boldItalic=f"{family}-BoldItalic")
-    except Exception:  # noqa: BLE001 — missing/unreadable TTFs
+    except Exception:  # noqa: BLE001, missing/unreadable TTFs
         family = "Helvetica"
     _FONTS_READY["family"] = family
     return family
@@ -129,7 +129,7 @@ def _asset(name: str) -> Optional[ImageReader]:
 
     The source art carries wide transparent margins that differ per file, so trimming lets the
     layout position the *artwork* rather than each file's incidental padding. Returns None when
-    the file is missing or unreadable — callers just skip it.
+    the file is missing or unreadable, callers just skip it.
     """
     if name not in _ASSET_CACHE:
         path = os.path.join(_ASSET_DIR, name)
@@ -230,7 +230,7 @@ def _is_review(f) -> bool:
 
 
 def _counts_total(f) -> bool:
-    """Whether this finding contributes to Total Identified Savings — quantified AND not conditional."""
+    """Whether this finding contributes to Total Identified Savings, quantified AND not conditional."""
     conditional = getattr(f, "category", "") in CONDITIONAL_CATEGORIES
     return counts_toward_total(getattr(f, "evidence_state", None) or "quantified", conditional)
 
@@ -344,12 +344,12 @@ def _pillar_rows(findings: List, pillar: str) -> List[Dict]:
         if _is_review(f):
             ref = _reference_price(f)
             if ref:
-                opportunity = f"{opportunity} — reference list price {_usd(ref)}/mo (not billed cost)"
+                opportunity = f"{opportunity}, reference list price {_usd(ref)}/mo (not billed cost)"
             out.append({"name": name, "opportunity": opportunity, "annual_cost": None,
                         "annual_savings": "Not quantified", "_sort": -1.0})
         elif _superseded_by_ri(f):
             out.append({"name": name,
-                        "opportunity": f"{opportunity} — alternative to a Reserved Instance",
+                        "opportunity": f"{opportunity}, alternative to a Reserved Instance",
                         "annual_cost": (monthly_cost * 12) if monthly_cost else None,
                         "annual_savings": "Counted under Reserved Instances", "_sort": -0.5})
         else:
@@ -364,7 +364,7 @@ def _pillar_rows(findings: List, pillar: str) -> List[Dict]:
 
 def _pillar_options(findings: List, pillar: str) -> List[Dict]:
     """Chart series for a pillar: NON-OVERLAPPING counted savings grouped by opportunity type. Only
-    findings that count toward the total (quantified, non-conditional) appear — REVIEW and conditional
+    findings that count toward the total (quantified, non-conditional) appear, REVIEW and conditional
     AHB are excluded so the chart reconciles with the pillar total."""
     totals: "OrderedDict[str, float]" = OrderedDict()
     for f in findings:
@@ -409,8 +409,8 @@ def _completeness_note(assessment) -> Optional[str]:
     if getattr(assessment, "billing_detail_unavailable", 0):
         return (
             "Azure Cost Management returned the subscription total but not per-resource billed cost for "
-            "this run (usually a temporary throttle on the billing API). Grounded savings — right-sizing, "
-            "Azure Hybrid Benefit and idle-resource savings — were withheld rather than estimated from list "
+            "this run (usually a temporary throttle on the billing API). Grounded savings, right-sizing, "
+            "Azure Hybrid Benefit and idle-resource savings, were withheld rather than estimated from list "
             "price, so the figures below are a subset of what a complete run would show. Re-run in a few "
             "minutes for complete, grounded numbers.")
     quality = (getattr(assessment, "data_quality", None) or "complete").lower()
@@ -423,12 +423,12 @@ def _completeness_note(assessment) -> Optional[str]:
             "rather than a complete assessment. Re-run once access and any throttling have cleared.")
     return message or (
         "Some Azure data could not be collected for this run, so the results are incomplete. Missing data "
-        "was never treated as zero — affected findings were withheld or listed as not quantified. Re-run "
+        "was never treated as zero, affected findings were withheld or listed as not quantified. Re-run "
         "for complete figures.")
 
 
 def _context(assessment, findings: List) -> Dict:
-    """Everything the template can reference — all of it derived from the assessment."""
+    """Everything the template can reference, all of it derived from the assessment."""
     annual = assessment.total_savings_annual or 0.0
     monthly = assessment.total_savings_monthly or 0.0
     spend = assessment.current_annual_spend if assessment.cost_data_available else None
@@ -490,7 +490,7 @@ def _context(assessment, findings: List) -> Dict:
     ctx["review_note"] = (
         f"A further {review_count} {plural} could not be priced for your subscription (for example, a "
         "resource with no billed cost available for this run). They are listed as “Not quantified” "
-        "in the tables that follow and are deliberately excluded from every savings figure above — we never "
+        "in the tables that follow and are deliberately excluded from every savings figure above, we never "
         "estimate a number we cannot ground in your data."
     ) if review_count else ""
 
@@ -541,7 +541,7 @@ def _styles(tpl: Dict) -> Dict[str, ParagraphStyle]:
 def _projection(spend: float, savings: float, growth: float):
     """Cumulative 3-year (ACR, ACR-after-savings, savings) at annual growth rate `growth`.
 
-    Growth is LINEAR (simple), not compounded — spend rises by the same amount each year, matching
+    Growth is LINEAR (simple), not compounded, spend rises by the same amount each year, matching
     the "Linear Growth" scenario name: year N spend = spend x (1 + growth*N).
     """
     rate = (savings / spend) if spend else 0.0
@@ -890,7 +890,7 @@ def _scenario_growth(scenario: Dict, measured: Optional[float]) -> Optional[floa
     """Resolve a scenario's annual growth rate. `measured` is the environment's own trend (or None).
 
     A scenario tagged `growth_source: measured` uses that trend directly; `half_measured` uses half
-    of it (the Conservative view). Returns None to SKIP the scenario — used when a trend-based chart
+    of it (the Conservative view). Returns None to SKIP the scenario, used when a trend-based chart
     has no measured growth to draw on (too little billing history), so we hide it rather than guess.
     Untagged scenarios keep their fixed `growth` (e.g. Fixed 0 %, the Civo 25 % hypothetical).
     """
@@ -920,7 +920,7 @@ def _projection_blocks(block: Dict, ctx: Dict, st: Dict, tpl: Dict, avail: float
     if not spend or spend <= 0 or savings > spend:
         return [Paragraph(
             "Three-year spend projections aren't shown for this assessment. The identified savings exceed "
-            "the measured spend for this scope, which means the billing window is partial — typically a "
+            "the measured spend for this scope, which means the billing window is partial, typically a "
             "new or recently-migrated subscription without a complete billing month. Re-run after a full "
             "billing month has elapsed for reliable spend and projection figures.",
             st["caption"])]

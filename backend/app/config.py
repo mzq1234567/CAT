@@ -40,8 +40,12 @@ class Settings(BaseSettings):
     # Max subscriptions accepted per assessment request (bounds fan-out / abuse).
     max_subscriptions_per_assessment: int = 50
 
-    # Azure API resilience (Step 8)
-    azure_max_retries: int = 4
+    # Azure API resilience (Step 8). `azure_max_retries` is the retry budget for the fast ARM/metrics/
+    # Resource-Graph calls (Cost Management + Consumption pass their own higher budget). Bumped to 6 so a
+    # heavily-throttled run has more chances to recover before a call exhausts its retries — which is what
+    # turns a run PARTIAL. Each wait is still bounded (Retry-After / exponential backoff, capped at 60s),
+    # so more retries add patience under throttling without ever stalling indefinitely. Fully configurable.
+    azure_max_retries: int = 6
     azure_retry_base_delay: float = 0.5
 
     # Azure API concurrency (Batch 2) — TWO documented limits, no hidden per-stage caps (see

@@ -6,9 +6,16 @@ from app.services import assessment as pipeline
 from app.services.currency import from_usd
 from app.services.findings import (
     FindingsEngine,
+    advisor_rec_is_subscription_scoped,
     build_advisor_index,
     metrics_confidence,
     severity_from_savings,
+)
+from app.services.reservations import (
+    parse_reservation_recommendations,
+    reconcile_sql_recommendations,
+    reconcile_vm_recommendations,
+    sql_purchasing_model,
 )
 
 DISK_RID = "/subscriptions/sub-1/resourceGroups/rg-a/providers/microsoft.compute/disks/disk-1"
@@ -352,7 +359,8 @@ async def test_no_finding_ever_exceeds_measured_spend():
 # prices for most VM SKUs, so it either fabricated a discount or under-covered. There is no longer any
 # tool-computed RI discount, prod/nonprod guess, or retail RI fallback anywhere in the engine.
 
-def _vm_ri_group(sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=3, region="eastus"):
+def _vm_ri_group(sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=3, region="eastus",
+                 subscription_id="sub-1", scope="Single"):
     """A parsed VM reservationRecommendation group (what reservations.py produces for virtualmachines)."""
     terms = {}
     if p1 is not None:
@@ -362,8 +370,16 @@ def _vm_ri_group(sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=3, region="eastu
         terms["P3Y"] = {"monthly_savings": p3, "monthly_ondemand": 400.0,
                         "monthly_reserved": round(400.0 - p3, 2), "quantity": qty}
     return {"resource_type": "virtualmachines", "category": "ri_vm", "product": "Virtual Machines",
-            "sku": sku, "region": region, "scope": "Single", "flexibility_group": None,
-            "subscription_id": "sub-1", "terms": terms}
+            "sku": sku, "region": region, "scope": scope, "flexibility_group": None,
+            "subscription_id": subscription_id, "terms": terms}
+
+
+def _current_vm(sku="Standard_D2s_v3", subscription_id="sub-1", region="eastus", name="vm-1", rid=None):
+    """A current Resource-Graph VM inventory row (running/deallocated), scoped to the assessed sub."""
+    rid = rid or (f"/subscriptions/{subscription_id}/resourceGroups/rg-a/providers/"
+                  f"microsoft.compute/virtualmachines/{name}")
+    return {"id": rid, "name": name, "subscriptionId": subscription_id, "location": region,
+            "vmSize": sku, "powerState": "VM running"}
 
 
 def test_vm_ri_comes_from_reservation_engine_with_real_numbers():
@@ -380,11 +396,356 @@ def test_vm_ri_comes_from_reservation_engine_with_real_numbers():
     assert f["confidence"] >= 0.85                         # Azure-computed → high confidence
 
 
+def test_ri_terms_are_independent_and_expose_payg_baseline():
+    # 1-year and 3-year savings come from Azure's SEPARATE per-term recommendations and must stay
+    # distinct (never one derived from the other); the finding also carries the PAYG on-demand baseline
+    # so the drawer can show PAYG vs 1-year vs 3-year cost/savings/%.
+    engine = FindingsEngine(pricing=FakePricing())
+    d = engine.commitments_from_recommendations([_vm_ri_group(p1=100.0, p3=160.0, qty=3)])[0]["details"]
+    assert d["total_1yr_monthly"] == 100.0
+    assert d["total_3yr_monthly"] == 160.0
+    assert d["total_1yr_monthly"] != d["total_3yr_monthly"]      # not the same price
+    assert d["total_ondemand_monthly"] == 400.0                  # Azure's costWithNoReservedInstances
+
+
+def test_ri_single_term_does_not_fabricate_the_other():
+    # Azure returned ONLY a 1-year rec (no 3-year) → the 3-year total is None (not a fabricated copy of
+    # the 1-year figure); the headline uses the 1-year saving.
+    engine = FindingsEngine(pricing=FakePricing())
+    f = engine.commitments_from_recommendations([_vm_ri_group(p1=100.0, p3=None, qty=2)])[0]
+    d = f["details"]
+    assert d["total_1yr_monthly"] == 100.0
+    assert d["total_3yr_monthly"] is None
+    assert d["has_1yr"] is True and d["has_3yr"] is False
+    assert [o["label"] for o in d["reservation_options"]] == ["1-year Reserved Instance"]  # no fake 3yr
+    assert f["estimated_savings_monthly"] == 100.0
+
+
+def test_ri_three_year_only_does_not_fabricate_a_one_year_value():
+    # THE regression guard for the fabrication bug: when Azure returns ONLY a 3-year rec, the 1-year
+    # total must be None — NOT a copy of the 3-year saving. (The old aggregate did `one_total += s3`
+    # when s1 was absent, so the drawer showed the 3-year figure as if it were an independent 1-year
+    # price.) The 3-year figure is used for the headline; the 1-year option is omitted entirely.
+    engine = FindingsEngine(pricing=FakePricing())
+    f = engine.commitments_from_recommendations([_vm_ri_group(p1=None, p3=160.0, qty=2)])[0]
+    d = f["details"]
+    assert d["total_3yr_monthly"] == 160.0
+    assert d["total_1yr_monthly"] is None              # NOT fabricated from the 3-year value
+    assert d["has_3yr"] is True and d["has_1yr"] is False
+    # per-item 1-year saving is also None (not a copy of the 3-year saving)
+    assert d["reservation_items"][0]["monthly_savings"] is None
+    assert d["reservation_items"][0]["monthly_savings_3yr"] == 160.0
+    assert [o["label"] for o in d["reservation_options"]] == ["3-year Reserved Instance"]  # no fake 1yr
+    assert f["estimated_savings_monthly"] == 160.0
+
+
+def test_ri_mixed_terms_sum_each_term_purely():
+    # Two SKUs: one has BOTH terms, one has ONLY 3-year. Per-term totals must sum only the real recs —
+    # 1-year total = the single 1-year rec; 3-year total = both 3-year recs. No cross-copying inflates
+    # the 1-year figure with the 3-year-only SKU's saving.
+    engine = FindingsEngine(pricing=FakePricing())
+    groups = [
+        _vm_ri_group(sku="Standard_D2s_v3", p1=100.0, p3=160.0, qty=3),
+        _vm_ri_group(sku="Standard_E4s_v3", p1=None, p3=90.0, qty=1),
+    ]
+    d = engine.commitments_from_recommendations(groups)[0]["details"]
+    assert d["total_1yr_monthly"] == 100.0             # only the SKU with a real 1-year rec
+    assert d["total_3yr_monthly"] == 250.0             # 160 + 90 (both real 3-year recs)
+    assert d["n_1yr"] == 1 and d["n_3yr"] == 2
+
+
 def test_vm_with_no_azure_ri_recommendation_produces_nothing():
     # Azure returned no VM reservation recommendation → we recommend no RI (never fabricate one),
     # even for a busy, steadily-running VM.
     engine = FindingsEngine(pricing=FakePricing())
     assert engine.commitments_from_recommendations([]) == []
+
+
+# ── RI reconciliation against CURRENT subscription inventory ────────────────────────
+# Azure's reservation recommendations are historical/usage-based and can name SKUs for VMs that have
+# been moved out of (or deleted from) the assessed subscription. The reconciliation layer treats the
+# current Resource-Graph VM inventory as the hard boundary before an RI becomes an actionable finding.
+
+def _ri(engine, groups, current_vms):
+    """Reconcile then aggregate — the exact production order (assessment.py)."""
+    reconciled = reconcile_vm_recommendations(groups, current_vms, assessment_id=1)
+    return engine.commitments_from_recommendations(reconciled)
+
+
+def test_ri_present_vms_produce_finding_with_affected_from_inventory():
+    # (Case 1 / 6 / 11) Subscription HAS matching VMs → RI finding is created and its affected-resource
+    # list/count comes from CURRENT inventory (real resource ids), not the historical SKU groups.
+    engine = FindingsEngine(pricing=FakePricing())
+    inv = [_current_vm(name=f"vm-{i}") for i in range(6)]        # 6 current D2s_v3 VMs in sub-1
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v3")], inv)
+    assert len(out) == 1
+    d = out[0]["details"]
+    assert d["affected_count"] == 6                               # equals current matching VM count
+    assert len(d["affected_vms"]) == 6
+    assert all(vm["id"].startswith("/subscriptions/sub-1/") for vm in d["affected_vms"])
+
+
+def test_ri_zero_current_vms_produces_no_finding():
+    # (Case 2 / 12) THE reported bug: subscription has 0 VMs but Azure returns a historical RI for 6.
+    # No actionable RI finding may be created — historical usage is not proof the VMs currently exist.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v5", qty=6)], current_vms=[])
+    assert out == []
+
+
+def test_ri_moved_out_vms_do_not_appear_as_current():
+    # (Case 3 / 9) VMs that previously lived in sub-1 were moved to sub-2. A stale sub-1 recommendation
+    # must not resurface them: sub-1 inventory no longer contains the SKU → excluded.
+    engine = FindingsEngine(pricing=FakePricing())
+    inv_sub2_only = [_current_vm(subscription_id="sub-2", name="vm-moved")]
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v3", subscription_id="sub-1")], inv_sub2_only)
+    assert out == []
+
+
+def test_ri_multi_subscription_isolation():
+    # (Case 4) sub-A has matching VMs, sub-B does not. Only sub-A's recommendation survives, and every
+    # affected resource resolves to sub-A — sub-B resources never leak into the finding.
+    engine = FindingsEngine(pricing=FakePricing())
+    groups = [
+        _vm_ri_group(sku="Standard_D2s_v3", subscription_id="sub-A"),
+        _vm_ri_group(sku="Standard_D2s_v3", subscription_id="sub-B"),
+    ]
+    inv = [_current_vm(subscription_id="sub-A", name="a1"),
+           _current_vm(subscription_id="sub-A", name="a2")]   # nothing in sub-B
+    out = _ri(engine, groups, inv)
+    assert len(out) == 1
+    d = out[0]["details"]
+    assert d["affected_count"] == 2
+    assert {vm["subscription_id"] for vm in d["affected_vms"]} == {"sub-A"}
+
+
+def test_ri_sku_level_no_matching_vm_creates_no_affected_resources():
+    # (Case 5) A SKU-level recommendation whose SKU is absent from current inventory (the sub has OTHER
+    # VMs, just not this family) → excluded; no affected VM resources are fabricated.
+    engine = FindingsEngine(pricing=FakePricing())
+    inv_other_family = [_current_vm(sku="Standard_E4s_v5", name="e1")]  # E-series, not the D2s_v5 rec
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v5")], inv_other_family)
+    assert out == []
+
+
+def test_ri_instance_size_flexibility_is_matched():
+    # A rec for Standard_D2s_v5 is covered by a present Standard_D4s_v5 (same flexibility family) — we
+    # must NOT false-exclude a present VM of a different size in the recommended family.
+    engine = FindingsEngine(pricing=FakePricing())
+    inv = [_current_vm(sku="Standard_D4s_v5", name="d4")]
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v5")], inv)
+    assert len(out) == 1
+    assert out[0]["details"]["affected_count"] == 1
+
+
+def test_ri_shared_scope_not_auto_single_subscription():
+    # (Case 7) A shared-scope (billing-account) recommendation is NOT automatically actionable for the
+    # subscription: it only survives if the assessed subscription currently has a matching VM. Here the
+    # SKU is absent → excluded, so a shared-scope rec cannot masquerade as a single-sub finding.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v5", scope="Shared")], current_vms=[])
+    assert out == []
+
+
+def test_ri_non_vm_recommendation_passes_through_unreconciled():
+    # Non-VM RI (e.g. SQL) has no comparable VM inventory here, so it is NOT dropped by VM reconciliation
+    # (documented pass-through) — the fix must not silently kill non-VM reservations.
+    engine = FindingsEngine(pricing=FakePricing())
+    sql_group = {"resource_type": "sqldatabases", "category": "sql_db_reserved_capacity",
+                 "product": "SQL Database", "sku": "GP_Gen5", "region": "eastus", "scope": "Single",
+                 "flexibility_group": None, "subscription_id": "sub-1",
+                 "terms": {"P1Y": {"monthly_savings": 50.0, "monthly_ondemand": 200.0,
+                                   "monthly_reserved": 150.0, "quantity": 1}}}
+    out = _ri(engine, [sql_group], current_vms=[])   # zero VMs must not affect a SQL RI
+    assert len(out) == 1
+    assert out[0]["category"] == "sql_db_reserved_capacity"
+
+
+def test_ri_stale_removal_zeroes_savings_consistently():
+    # (Case 10) When the only RI is stale, it contributes nothing to savings — there is simply no RI
+    # finding, so category/total savings and the affected-resource count are all consistently zero.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _ri(engine, [_vm_ri_group(sku="Standard_D2s_v5", p1=100.0, p3=160.0)], current_vms=[])
+    assert out == []
+    assert sum(f["estimated_savings_monthly"] for f in out) == 0
+
+
+# ── Azure SQL Database reservation recommendations (vCore eligibility + reconciliation) ──
+# SQL Database reservation pricing applies ONLY to the vCore purchasing model; DTU databases are not
+# eligible. Azure's recommendation is SKU/usage-based (no database id), so it is reconciled against the
+# current SQL DB inventory exactly like VMs, but with vCore-vs-DTU eligibility.
+
+def _sql_ri_group(sku="SQLDB_Gen5", p1=40.0, p3=60.0, qty=2, region="eastus",
+                  subscription_id="sub-1", scope="Single"):
+    """A parsed SQL Database reservationRecommendation group (category sql_db_reserved_capacity)."""
+    terms = {}
+    if p1 is not None:
+        terms["P1Y"] = {"monthly_savings": p1, "monthly_ondemand": 200.0,
+                        "monthly_reserved": round(200.0 - p1, 2), "quantity": qty}
+    if p3 is not None:
+        terms["P3Y"] = {"monthly_savings": p3, "monthly_ondemand": 200.0,
+                        "monthly_reserved": round(200.0 - p3, 2), "quantity": qty}
+    return {"resource_type": "sqldatabases", "category": "sql_db_reserved_capacity",
+            "product": "SQL Database", "sku": sku, "region": region, "scope": scope,
+            "flexibility_group": None, "subscription_id": subscription_id, "terms": terms}
+
+
+def _current_sql_db(tier="GeneralPurpose", subscription_id="sub-1", region="eastus",
+                    name="db-1", sku="GP_Gen5_2", rid=None):
+    """A current Resource-Graph SQL Database inventory row (vCore tiers = GeneralPurpose/BusinessCritical/
+    Hyperscale; DTU tiers = Basic/Standard/Premium)."""
+    rid = rid or (f"/subscriptions/{subscription_id}/resourceGroups/rg/providers/"
+                  f"microsoft.sql/servers/srv/databases/{name}")
+    return {"id": rid, "name": name, "subscriptionId": subscription_id, "location": region,
+            "tier": tier, "skuName": sku, "capacity": 2}
+
+
+def _sql_ri(engine, groups, sql_dbs):
+    reconciled = reconcile_sql_recommendations(groups, sql_dbs, assessment_id=7)
+    return engine.commitments_from_recommendations(reconciled)
+
+
+def test_sql_reservation_resourcetype_and_sku_are_parsed_not_dropped():
+    # (Investigation #3/#7/#9/#12) The Consumption API's resourceType 'SQLDatabases' maps to the SQL
+    # reserved-capacity category, and the SKU is read from skuName (SQL recs have no normalizedSize) — so
+    # a real SQL reservation is neither dropped for a missing SKU nor misclassified as VM/Other.
+    raw = [{"properties": {"resourceType": "SQLDatabases", "skuName": "SQLDB_Gen5", "location": "eastus",
+            "term": "P3Y", "scope": "Single", "lookBackPeriod": "Last30Days", "recommendedQuantity": 2,
+            "subscriptionId": "sub-1", "netSavings": 60.0, "costWithNoReservedInstances": 200.0,
+            "totalCostWithReservedInstances": 140.0}}]
+    groups = parse_reservation_recommendations(raw, "sub-1")
+    assert len(groups) == 1
+    assert groups[0]["category"] == "sql_db_reserved_capacity"   # NOT ri_vm, NOT dropped
+    assert groups[0]["sku"] == "SQLDB_Gen5"                       # extracted from skuName
+
+
+def test_sql_purchasing_model_classification():
+    assert sql_purchasing_model({"tier": "GeneralPurpose"}) == "vCore"
+    assert sql_purchasing_model({"tier": "BusinessCritical"}) == "vCore"
+    assert sql_purchasing_model({"tier": "Hyperscale"}) == "vCore"
+    assert sql_purchasing_model({"tier": "Standard"}) == "DTU"
+    assert sql_purchasing_model({"tier": "Basic"}) == "DTU"
+
+
+def test_sql_vcore_db_plus_recommendation_creates_finding():
+    # (Case 13 / 16 / 19 / 20) Current vCore SQL DB + Azure SQL reservation rec → a SQL Reserved Capacity
+    # finding whose affected resources are the ACTUAL database resource ids (never the subscription id).
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _sql_ri(engine, [_sql_ri_group()], [_current_sql_db(tier="GeneralPurpose")])
+    assert len(out) == 1
+    assert out[0]["category"] == "sql_db_reserved_capacity"      # correct category, not "Other"/advisor
+    d = out[0]["details"]
+    assert d["affected_count"] == 1
+    assert d["affected_vms"][0]["id"].endswith("/databases/db-1")   # real DB id
+    assert d["affected_vms"][0]["id"] != "sub-1"                    # never the subscription id
+
+
+def test_sql_dtu_db_is_not_reservation_eligible():
+    # (Cases E + F) Neither a DTU Basic nor a DTU Standard database is vCore, so even if a recommendation
+    # exists it is not actionable — no SQL RI finding is created for either.
+    engine = FindingsEngine(pricing=FakePricing())
+    for dtu_tier in ("Basic", "Standard"):
+        out = _sql_ri(engine, [_sql_ri_group()], [_current_sql_db(tier=dtu_tier)])
+        assert out == [], f"DTU {dtu_tier} must not produce a SQL RI finding"
+
+
+def test_sql_db_present_but_no_recommendation_fabricates_nothing():
+    # (Case 15) A current vCore SQL DB with NO Azure recommendation → no fabricated finding or savings.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _sql_ri(engine, [], [_current_sql_db(tier="GeneralPurpose")])
+    assert out == []
+
+
+def test_sql_recommendation_with_no_matching_current_db_is_excluded():
+    # (Case 17) Azure returns a SQL reservation rec but the subscription has no current SQL DB (moved out
+    # / deleted) → stale/unverifiable, excluded from actionable savings.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _sql_ri(engine, [_sql_ri_group()], [])
+    assert out == []
+
+
+def test_sql_recommendation_never_becomes_vm_or_other_and_survives_vm_reconciler():
+    # (Case 18 / 19) The VM reconciler must pass SQL groups through untouched (zero VMs must not drop a
+    # SQL rec), and the category must remain SQL reserved capacity.
+    engine = FindingsEngine(pricing=FakePricing())
+    reconciled = reconcile_vm_recommendations([_sql_ri_group()], current_vms=[], assessment_id=7)
+    assert len(reconciled) == 1 and reconciled[0]["category"] == "sql_db_reserved_capacity"
+    out = _sql_ri(engine, reconciled, [_current_sql_db()])
+    assert out and out[0]["category"] == "sql_db_reserved_capacity"
+
+
+def test_sql_reservation_preserves_billing_currency_no_conversion():
+    # (Case 22) Savings use Azure's figures verbatim in the assessment's billing currency — no USD
+    # hardcoding, no conversion (INR in → INR value out, symbol ₹ in the client-facing text).
+    engine = FindingsEngine(pricing=FakePricing(), currency="INR")
+    out = _sql_ri(engine, [_sql_ri_group(p1=40.0, p3=60.0)], [_current_sql_db()])
+    assert out[0]["estimated_savings_monthly"] == 60.0          # Azure's 3-year net saving, unchanged
+    assert "₹" in out[0]["description"]                          # billing currency symbol, not $
+
+
+def test_sql_reservation_multi_subscription_isolation():
+    # (Case 21 / 23 / D) sub-A has a vCore SQL DB, sub-B does not → only sub-A's rec survives and every
+    # affected DB resolves to sub-A; sub-B never contaminates the finding.
+    engine = FindingsEngine(pricing=FakePricing())
+    groups = [_sql_ri_group(subscription_id="sub-A"), _sql_ri_group(subscription_id="sub-B")]
+    dbs = [_current_sql_db(subscription_id="sub-A", name="a-db")]     # nothing in sub-B
+    out = _sql_ri(engine, groups, dbs)
+    assert len(out) == 1
+    d = out[0]["details"]
+    assert d["affected_count"] == 1
+    assert {r["subscription_id"] for r in d["affected_vms"]} == {"sub-A"}
+
+
+def test_sql_ri_affected_is_a_database_never_server_or_subscription():
+    # (Case E / F) The affected resource is always the ACTUAL database resource id (contains
+    # '/databases/') — never the subscription id, never a bare server id.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _sql_ri(engine, [_sql_ri_group(subscription_id="sub-1")], [_current_sql_db(name="db-x")])
+    rid = out[0]["details"]["affected_vms"][0]["id"]
+    assert "/databases/" in rid                       # a database, resolved from inventory
+    assert rid != "sub-1" and not rid.endswith("/servers/srv")   # not the subscription, not the server
+
+
+def test_sql_ri_region_mismatch_is_relaxed_when_eligible_vcore_exists():
+    # THE likely live cause: Azure's recommendation region string and the ARG `location` string diverge.
+    # With eligible vCore SQL DBs present, the finding must still surface (region relaxed) rather than
+    # being false-excluded — resolved against the current DB.
+    engine = FindingsEngine(pricing=FakePricing())
+    rec = _sql_ri_group(region="West US")                          # Azure display-name style
+    db = _current_sql_db(region="westus")                          # ARG canonical style (won't string-eq)
+    out = _sql_ri(engine, [rec], [db])
+    assert len(out) == 1
+    assert out[0]["details"]["affected_count"] == 1
+
+
+def test_sql_ri_region_mismatch_still_excluded_when_no_eligible_vcore():
+    # Region relaxation must NOT fabricate: if there is no eligible vCore SQL DB in the subscription at
+    # all, the recommendation is still excluded (no finding).
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _sql_ri(engine, [_sql_ri_group(region="West US")], [_current_sql_db(region="eastus", tier="Standard")])
+    assert out == []
+
+
+def test_sql_vcore_inferred_from_skuname_when_tier_blank():
+    # (classification robustness) When the inventory row's sku.tier is blank, the vCore model is inferred
+    # from the SKU name (GP_/BC_/HS_/Gen family) so a real vCore DB isn't dropped as ineligible.
+    assert sql_purchasing_model({"tier": "", "skuName": "GP_Gen5_2"}) == "vCore"
+    assert sql_purchasing_model({"tier": "", "skuName": "BC_Gen5_8"}) == "vCore"
+    assert sql_purchasing_model({"tier": "", "skuName": "S3"}) == "DTU"
+    engine = FindingsEngine(pricing=FakePricing())
+    out = _sql_ri(engine, [_sql_ri_group()], [_current_sql_db(tier="", sku="GP_Gen5_2", name="db-b")])
+    assert len(out) == 1 and out[0]["details"]["affected_count"] == 1
+
+
+def test_sql_ri_terms_independent_1yr_and_3yr():
+    # (Case G) 1-year and 3-year SQL savings are kept independent; a single-term rec does not fabricate
+    # the other term.
+    engine = FindingsEngine(pricing=FakePricing())
+    both = _sql_ri(engine, [_sql_ri_group(p1=40.0, p3=60.0)], [_current_sql_db()])[0]["details"]
+    assert both["total_1yr_monthly"] == 40.0 and both["total_3yr_monthly"] == 60.0
+    assert both["total_1yr_monthly"] != both["total_3yr_monthly"]
+    only3 = _sql_ri(engine, [_sql_ri_group(p1=None, p3=60.0)], [_current_sql_db()])[0]["details"]
+    assert only3["total_3yr_monthly"] == 60.0 and only3["total_1yr_monthly"] is None
 
 
 def test_vm_ri_dropped_when_azure_reports_no_saving():
@@ -651,12 +1012,34 @@ def test_deallocated_vm_quantifies_attached_disk_cost():
     assert f["details"]["disk_monthly_cost"] == 42.5
 
 
-def test_deallocated_vm_is_zero_without_cost_data():
-    # No per-resource billing → can't quantify the disk cost → 0 (dropped by the zero-savings filter).
-    vm = {"id": "/s/vm", "name": "vm", "vmSize": "Standard_D2s_v3", "powerState": "VM deallocated",
-          "osDiskId": "/s/disk", "dataDisks": []}
-    f = FindingsEngine(pricing=FakePricing()).detect_deallocated_vms([vm])[0]
-    assert f["estimated_savings_monthly"] == 0.0
+def test_deallocated_vms_aggregate_into_one_finding():
+    # Multiple deallocated VMs → ONE aggregated finding (not one card per VM), with the VMs listed in
+    # details and the total = sum of every VM's still-billing disk cost.
+    def _vm(i, cost):
+        did = f"/s/disk-{i}"
+        return ({"id": f"/s/vm-{i}", "name": f"vm-{i}", "subscriptionId": "s", "location": "eastus",
+                 "vmSize": "Standard_D2s_v3", "powerState": "VM deallocated",
+                 "osDiskId": did, "dataDisks": []}, {did.lower(): cost})
+    vms, cost_map = [], {}
+    for i, c in enumerate([10.0, 20.0, 5.0]):
+        vm, cm = _vm(i, c)
+        vms.append(vm)
+        cost_map.update(cm)
+    out = FindingsEngine(pricing=FakePricing(), cost_map=cost_map).detect_deallocated_vms(vms)
+    assert len(out) == 1                                    # ONE aggregated card, not three
+    f = out[0]
+    assert f["resource_id"] is None                         # resource-less aggregate (escapes dedupe)
+    assert f["estimated_savings_monthly"] == 35.0           # 10 + 20 + 5
+    assert f["details"]["affected_count"] == 3
+    assert len(f["details"]["affected_vms"]) == 3
+    assert f["details"]["affected_vms"][0]["monthly_savings"] == 20.0   # sorted by saving desc
+
+
+def test_deallocated_vm_without_cost_data_is_dropped():
+    # No per-resource billing → can't quantify the disk cost → the VM is excluded (no fabricated finding).
+    vm = {"id": "/s/vm", "name": "vm", "subscriptionId": "s", "vmSize": "Standard_D2s_v3",
+          "powerState": "VM deallocated", "osDiskId": "/s/disk", "dataDisks": []}
+    assert FindingsEngine(pricing=FakePricing()).detect_deallocated_vms([vm]) == []
 
 
 def test_paused_sql_db_grounds_in_actual_cost():
@@ -950,6 +1333,59 @@ async def test_advisor_finding_and_correlation_index():
     assert f["category"] == "advisor_cost"
     assert f["advisor_recommendation_id"] == "ADV-1"
     assert f["severity"] == "high"  # 120/mo is the 100–300 "high" band
+
+
+# ── SECOND RI leak path: Azure Advisor reservation-purchase recommendations ─────────
+# The live #118 bug: an Advisor VM reservation rec is subscription-scoped (resource = the subscription
+# itself) and bypassed the Consumption reconciliation, leaking into "Other" with the subscription id as
+# the affected resource — even with zero current VMs.
+
+def _advisor_vm_reservation_rec(sub_id="005e9433-0d52-4b38-97aa-1b2c3d4e5f60", rec_id="ADV-RI"):
+    """An Azure Advisor VM reservation PURCHASE recommendation — subscription-scoped, exactly the shape
+    of the live leak ("Consider virtual machine reserved instance to save over the on-demand costs")."""
+    return {
+        "id": f"/subscriptions/{sub_id}/providers/Microsoft.Advisor/recommendations/{rec_id}",
+        "properties": {
+            "category": "Cost", "impact": "Medium",
+            "impactedField": "Microsoft.Subscriptions/subscriptions", "impactedValue": sub_id,
+            "shortDescription": {
+                "problem": "Consider virtual machine reserved instance to save over the on-demand costs",
+                "solution": "Buy a VM reserved instance"},
+            "extendedProperties": {"annualSavingsAmount": "396", "savingsAmount": "33"},
+            "resourceMetadata": {"resourceId": f"/subscriptions/{sub_id}"},
+        },
+    }
+
+
+def test_advisor_scope_detection_helper():
+    # A real deployed resource id contains '/providers/'; anything shallower is subscription/scope.
+    assert advisor_rec_is_subscription_scoped("/subscriptions/abc") is True
+    assert advisor_rec_is_subscription_scoped("005e9433-0d52-4b38-97aa-1b2c3d4e5f60") is True  # bare guid
+    assert advisor_rec_is_subscription_scoped("") is True
+    assert advisor_rec_is_subscription_scoped(VM_RID) is False               # real VM resource
+    assert advisor_rec_is_subscription_scoped(DISK_RID) is False             # real disk resource
+    # impactedField can flag a reservation even if a resourceId is present
+    assert advisor_rec_is_subscription_scoped(
+        VM_RID, impacted_field="Microsoft.Subscriptions/subscriptions") is True
+
+
+def test_advisor_vm_reservation_rec_never_becomes_a_finding():
+    # (Live #118) The Advisor VM reservation rec must NOT become a finding — reservations come only from
+    # the inventory-reconciled Consumption path — and must NEVER use the subscription id as a resource.
+    engine = FindingsEngine(pricing=FakePricing())
+    out = engine.advisor_findings([_advisor_vm_reservation_rec()])
+    assert out == []
+
+
+def test_advisor_reservation_rec_excluded_even_mixed_with_a_real_rec():
+    # Only the subscription-scoped reservation rec is dropped; a genuine resource-scoped rec survives and
+    # its resource is a REAL resource id (never the subscription).
+    engine = FindingsEngine(pricing=FakePricing(),
+                            advisor_index=build_advisor_index([_advisor_rec(DISK_RID)]))
+    out = engine.advisor_findings([_advisor_vm_reservation_rec(), _advisor_rec(DISK_RID)])
+    assert len(out) == 1
+    assert "/providers/" in (out[0]["resource_id"] or "")     # real resource, not the subscription id
+    assert out[0]["advisor_recommendation_id"] == "ADV-1"
 
 
 async def test_sql_ahb_is_retired_never_fabricates_a_saving():

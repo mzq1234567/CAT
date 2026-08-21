@@ -22,8 +22,8 @@ interface ReservationItem {
   sku?: string;
   region?: string;
   quantity?: number;
-  monthly_savings?: number;
-  monthly_savings_3yr?: number | null;
+  monthly_savings?: number | null;      // 1-year saving; null when Azure returned no 1-year rec
+  monthly_savings_3yr?: number | null;  // 3-year saving; null when Azure returned no 3-year rec
   environment?: string; // "prod" | "nonprod" | "unknown" (unknown → assumed production)
 }
 interface EligibleVm {
@@ -55,7 +55,13 @@ interface EvidenceDetails {
   // aggregated commitment finding (many SKUs/VMs rolled into one)
   kind?: string;
   reservation_items?: ReservationItem[];
-  total_3yr_monthly?: number | null;
+  total_1yr_monthly?: number | null;  // null when Azure returned no 1-year rec (never fabricated)
+  total_3yr_monthly?: number | null;  // null when Azure returned no 3-year rec (never fabricated)
+  total_ondemand_monthly?: number | null; // best-term PAYG baseline (Azure figures)
+  total_ondemand_1yr?: number | null; // PAYG baseline for the 1-year recs
+  total_ondemand_3yr?: number | null; // PAYG baseline for the 3-year recs
+  has_1yr?: boolean;
+  has_3yr?: boolean;
   // aggregated AHB (Windows VMs or SQL resources)
   eligible_vms?: EligibleVm[];
   eligible_count?: number;
@@ -109,6 +115,67 @@ function Heading({ icon, children }: { icon: React.ReactNode; children: React.Re
 }
 
 /**
+ * PAYG vs 1-year vs 3-year, annualised. Each term's savings + % is its OWN Azure figure (1-year and
+ * 3-year come from Azure's separate per-term recommendations, never derived from one another). A term
+ * row is shown ONLY when Azure actually returned a recommendation for that term — a single-term rec
+ * shows one row (labelled "Recommended reservation"), never a fabricated comparison.
+ */
+function TermBreakdown({
+  paygMonthly,
+  oneYearSaveMonthly,
+  threeYearSaveMonthly,
+}: {
+  paygMonthly: number;
+  oneYearSaveMonthly: number | null;
+  threeYearSaveMonthly: number | null;
+}) {
+  const paygYr = paygMonthly * 12;
+  const term = (saveMonthly: number) => ({
+    reservedYr: Math.max(0, (paygMonthly - saveMonthly) * 12),
+    saveYr: saveMonthly * 12,
+    pct: paygMonthly > 0 ? Math.round((saveMonthly / paygMonthly) * 100) : 0,
+  });
+  const one = oneYearSaveMonthly != null ? term(oneYearSaveMonthly) : null;
+  const three = threeYearSaveMonthly != null ? term(threeYearSaveMonthly) : null;
+  const both = one != null && three != null;
+
+  const Row = ({ label, reservedYr, saveYr, pct }: { label: string; reservedYr: number; saveYr: number; pct: number }) => (
+    <Box display="flex" alignItems="baseline" justifyContent="space-between" gap={1} sx={{ py: 0.85, borderTop: `1px solid ${colors.border}` }}>
+      <Box minWidth={0}>
+        <Typography variant="body2" fontWeight={700} color={colors.textPrimary}>{label}</Typography>
+        <Typography variant="caption" color={colors.textMuted}>{fmtUSD(reservedYr)} / yr reserved</Typography>
+      </Box>
+      <Box textAlign="right" flexShrink={0}>
+        <Typography variant="body2" fontWeight={800} sx={{ color: SAVINGS_COLOR, lineHeight: 1.15 }}>
+          Save {fmtUSD(saveYr)} / yr
+        </Typography>
+        <Typography variant="caption" color={colors.textMuted}>{pct}% lower</Typography>
+      </Box>
+    </Box>
+  );
+
+  // When only one term exists, name it plainly rather than implying a 1-vs-3 choice.
+  const oneLabel = both ? "1-year reservation" : "Recommended reservation (1-year)";
+  const threeLabel = both ? "3-year reservation" : "Recommended reservation (3-year)";
+
+  return (
+    <Box sx={{ mb: 1.75, p: 1.75, borderRadius: 2, bgcolor: colors.surfaceElevated, border: `1px solid ${colors.border}` }}>
+      <Box display="flex" alignItems="baseline" justifyContent="space-between" gap={1} sx={{ pb: 0.85 }}>
+        <Typography variant="body2" fontWeight={600} color={colors.textSecondary}>Current (pay-as-you-go)</Typography>
+        <Typography variant="body2" fontWeight={800} color={colors.textPrimary}>{fmtUSD(paygYr)} / yr</Typography>
+      </Box>
+      {one && <Row label={oneLabel} reservedYr={one.reservedYr} saveYr={one.saveYr} pct={one.pct} />}
+      {three && <Row label={threeLabel} reservedYr={three.reservedYr} saveYr={three.saveYr} pct={three.pct} />}
+      {!both && (
+        <Typography variant="caption" color={colors.textMuted} display="block" sx={{ pt: 0.85 }}>
+          Azure returned a {three ? "3-year" : "1-year"} recommendation only for these resources.
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+/**
  * The whole commitment story in ONE panel with a SINGLE term control.
  *
  * Previously this was two panels — a term selector on the options total AND a separate 1yr/3yr
@@ -152,16 +219,25 @@ function CommitmentPanel({
 
       {d.source === "azure_reservation_recommendations" && (
         <Typography variant="caption" color={colors.textMuted} display="block" mb={1}>
-          From Azure's own reservation engine — computed on your actual usage at your real prices,
+          From Azure's own reservation engine, computed on your actual usage at your real prices,
           excluding reservations you already own.
-          {d.monthly_ondemand != null && d.monthly_reserved != null && (
-            <> On-demand ≈ {fmtUSD(d.monthly_ondemand)}/mo → reserved ≈ {fmtUSD(d.monthly_reserved)}/mo.</>
-          )}
         </Typography>
+      )}
+
+      {/* PAYG vs 1-year vs 3-year, annualised, with each term's own savings + % (real Azure figures;
+          1-year and 3-year are Azure's separate per-term recommendations, never derived from each
+          other). A term row appears only when Azure returned a rec for it; a single-term rec shows one
+          row. Rendered when the aggregate finding carries the on-demand baseline and at least one term. */}
+      {d.total_ondemand_monthly != null && (d.total_1yr_monthly != null || d.total_3yr_monthly != null) && (
+        <TermBreakdown
+          paygMonthly={d.total_ondemand_monthly}
+          oneYearSaveMonthly={d.total_1yr_monthly ?? null}
+          threeYearSaveMonthly={d.total_3yr_monthly ?? null}
+        />
       )}
       {d.source !== "azure_reservation_recommendations" && d.payg_monthly != null && (
         <Typography variant="caption" color={colors.textMuted} display="block" mb={1}>
-          Pay-as-you-go today: {fmtUSD(d.payg_monthly)} / mo. Select a term to compare — it re-prices
+          Pay-as-you-go today: {fmtUSD(d.payg_monthly)} / mo. Select a term to compare, it re-prices
           the breakdown below.
         </Typography>
       )}
@@ -255,7 +331,7 @@ function CommitmentPanel({
                     {v.environment === "unknown" && (
                       <Box
                         component="span"
-                        title="No environment tag — assumed production. Verify before committing."
+                        title="No environment tag, assumed production. Verify before committing."
                         sx={{
                           ml: 1, px: 0.6, py: 0.05, borderRadius: 1, fontSize: 10, fontWeight: 700,
                           color: colors.warning, bgcolor: alpha(colors.warning, 0.14),
@@ -442,14 +518,14 @@ export default function FindingEvidence({
             )}
           </Box>
           <Typography variant="caption" color={colors.textMuted} mt={1} display="block">
-            Potential savings — you realise them only on VMs covered by eligible {ahbLicence} licences you
+            Potential savings, you realise them only on VMs covered by eligible {ahbLicence} licences you
             already own (with active Software Assurance or qualifying subscription licences), applied to
             each VM's actual billed cost.
             {(d.excluded_count ?? 0) > 0 && (
               <> {d.excluded_count} additional {ahbNoun}{(d.excluded_count ?? 0) !== 1 ? "s" : ""} could
               not be quantified (no billing data or no live licence price) and are excluded from the total.</>
             )}
-            {d.partial_billing && <> Figures reflect a partial billing period — re-run after a full billing month.</>}
+            {d.partial_billing && <> Figures reflect a partial billing period, re-run after a full billing month.</>}
           </Typography>
         </Panel>
       )}

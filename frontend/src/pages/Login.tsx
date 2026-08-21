@@ -7,6 +7,7 @@ import SavingsOutlinedIcon from "@mui/icons-material/SavingsOutlined";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
 import { loginRequest } from "../auth/msalConfig";
 import { useReducedMotion } from "../components/assessment/useAssessmentMotion";
+import { useThemeMode } from "../components/themeMode";
 import { colors } from "../theme";
 import tptLogo from "../assets/tpt-logo-dark.png";
 
@@ -120,12 +121,13 @@ function SignInBackdrop({ reduced }: { reduced: boolean }) {
 const POINTS = [
   { icon: <InsightsOutlinedIcon sx={{ fontSize: 18 }} />, text: "See where your Azure spend can be optimized" },
   { icon: <SavingsOutlinedIcon sx={{ fontSize: 18 }} />, text: "Quantify actionable savings, backed by your own Azure data" },
-  { icon: <ShieldOutlinedIcon sx={{ fontSize: 18 }} />, text: "Read-only — nothing in your environment is changed" },
+  { icon: <ShieldOutlinedIcon sx={{ fontSize: 18 }} />, text: "Read-only: nothing in your environment is changed" },
 ];
 
 export default function Login() {
   const { instance } = useMsal();
   const reduced = useReducedMotion();
+  const { mode } = useThemeMode();
 
   const handleLogin = () => {
     instance.loginRedirect(loginRequest).catch(console.error);
@@ -165,7 +167,10 @@ export default function Login() {
           component="img"
           src={tptLogo}
           alt="Tech Plus Talent"
-          sx={{ display: "block", width: "100%", maxWidth: 240, mx: "auto", mb: 3.5, height: "auto" }}
+          sx={{
+            display: "block", width: "100%", maxWidth: 240, mx: "auto", mb: 3.5, height: "auto",
+            filter: mode === "dark" ? "brightness(0) invert(1)" : "none",
+          }}
         />
 
         <Typography variant="h5" fontWeight={800} color={colors.textPrimary} mb={1} sx={{ letterSpacing: "-0.02em" }}>
@@ -216,7 +221,7 @@ export default function Login() {
         </Button>
 
         <Typography variant="caption" color={colors.textMuted} display="block" mt={3} sx={{ lineHeight: 1.6 }}>
-          Secure, read-only analysis using your existing Azure access — no changes are made to your
+          Secure, read-only analysis using your existing Azure access, no changes are made to your
           resources.
         </Typography>
       </Paper>

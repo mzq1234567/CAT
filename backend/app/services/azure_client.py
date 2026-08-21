@@ -59,6 +59,12 @@ METRICS_API = "2023-10-01"
 COST_MANAGEMENT_API = "2023-11-01"
 CONSUMPTION_API = "2023-05-01"
 
+# Cost Management throttles harder than any other ARM surface and asks for long Retry-After waits, so it
+# gets its OWN, more patient retry envelope (still strictly bounded — never an infinite loop). These do
+# NOT affect any other Azure API's retry behaviour.
+COST_MANAGEMENT_MAX_RETRIES = 12          # was 8; a few more bounded retries to ride out a 429 burst
+COST_MANAGEMENT_MAX_RETRY_AFTER = 180.0   # honour Azure's Retry-After up to 3 min (global cap is 60s)
+
 
 class AzureClient:
     def __init__(
@@ -92,7 +98,7 @@ class AzureClient:
     async def _send(
         self, client: httpx.AsyncClient, method: str, url: str,
         *, max_retries: Optional[int] = None, use_breaker: bool = True,
-        label: Optional[str] = None, **kwargs,
+        label: Optional[str] = None, retry_after_cap: Optional[float] = None, **kwargs,
     ) -> httpx.Response:
         """Send a request with bounded concurrency + retry/backoff on 429/5xx and (optionally) the
         shared circuit breaker.
@@ -116,6 +122,7 @@ class AzureClient:
             breaker=self._breaker if use_breaker else None,
             label=label or _label_for(method, url),
             stats=self.stats,
+            retry_after_cap=retry_after_cap,
         )
 
     async def get_subscriptions(self) -> List[Dict]:
@@ -312,7 +319,9 @@ class AzureClient:
 
         async with self._client(90) as client:
             while url:
-                r = await self._send(client, "POST", url, json=body, max_retries=8, use_breaker=False)
+                r = await self._send(client, "POST", url, json=body,
+                                     max_retries=COST_MANAGEMENT_MAX_RETRIES, use_breaker=False,
+                                     retry_after_cap=COST_MANAGEMENT_MAX_RETRY_AFTER)
                 if r.status_code in (403, 404):
                     break
                 r.raise_for_status()  # a persistent 429 surfaces here → CostThrottled at the caller

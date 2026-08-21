@@ -43,16 +43,23 @@ SERVICE_COLUMNS = [{"name": "Cost"}, {"name": "ServiceName"}, {"name": "Currency
 
 
 def _composite_handler(*, metric_values=(2.0,) * 7, max_metric_values=None, advisor=None,
-                       cost_rows=None, service_rows=None, cost_status=200,
-                       memory_available_values=(98.0,) * 7, reservation_recs=None):
+                       cost_rows=None, service_rows=None, cost_status=200, cost_throttle_first_n=0,
+                       memory_available_values=(98.0,) * 7, reservation_recs=None, sql_db_rows=None,
+                       vm_rows=None):
     """One handler routing by host+path across all Azure APIs + Retail Prices.
 
     Defaults: low CPU (avg+max ~2%) and high available memory (~98%, i.e. ~2% used) → the mock
     VM classifies as idle in the happy-path test (both signals must be low, not CPU alone).
+
+    `cost_throttle_first_n` makes the FIRST N Cost Management query calls return HTTP 429 (with a
+    Retry-After) and the rest succeed — to exercise throttle-then-recover via the retry layer.
     """
+    cm_calls = [0]   # Cost Management query call counter (for cost_throttle_first_n)
     retail = retail_prices_handler()
     advisor = advisor if advisor is not None else []
     reservation_recs = reservation_recs if reservation_recs is not None else []
+    sql_db_rows = sql_db_rows if sql_db_rows is not None else []
+    vm_rows = vm_rows if vm_rows is not None else [ARG_RUNNING_VM]
     cost_rows = cost_rows if cost_rows is not None else [
         [25.0, DISK_ID, "USD"], [72.0, VM_ID, "USD"], [4.0, IP_ID, "USD"],
     ]
@@ -85,7 +92,9 @@ def _composite_handler(*, metric_values=(2.0,) * 7, max_metric_values=None, advi
             elif "Windows_Server" in query:  # windows-without-AHB query (also contains 'VM running')
                 rows = []
             elif "'VM running'" in query:
-                rows = [ARG_RUNNING_VM]
+                rows = list(vm_rows)
+            elif "sku.family" in query:   # full SQL DB inventory (reservation reconciliation)
+                rows = list(sql_db_rows)
             else:
                 rows = []
             return httpx.Response(200, json={"data": rows})
@@ -94,6 +103,10 @@ def _composite_handler(*, metric_values=(2.0,) * 7, max_metric_values=None, advi
         if "/providers/Microsoft.Advisor/recommendations" in path:
             return httpx.Response(200, json={"value": advisor})
         if "/providers/Microsoft.CostManagement/query" in path:
+            cm_calls[0] += 1
+            if cm_calls[0] <= cost_throttle_first_n:
+                return httpx.Response(429, headers={"Retry-After": "1"},
+                                     json={"error": {"code": "TooManyRequests", "message": "throttled"}})
             if cost_status != 200:
                 return httpx.Response(cost_status, json={"error": {"message": "no cost access"}})
             body = json.loads(request.content.decode())
@@ -223,7 +236,9 @@ def test_dedupe_keeps_one_finding_per_resource():
 async def test_pipeline_uses_reservation_recommendations(pipeline_env):
     TestSession, install, seed = pipeline_env
     # Azure's reservation engine covers NON-VM types (VMs go through the production-targeted VM
-    # detector). A real SQL reservation rec must surface as an authoritative reserved-capacity finding.
+    # detector). A real SQL reservation rec surfaces as an authoritative reserved-capacity finding ONLY
+    # when the assessed subscription currently has a reservation-eligible (vCore) SQL Database — the
+    # reconciliation layer resolves the affected database from CURRENT inventory.
     recs = [{
         "kind": "legacy", "location": "eastus",
         "properties": {
@@ -233,7 +248,10 @@ async def test_pipeline_uses_reservation_recommendations(pipeline_env):
             "recommendedQuantity": 2, "subscriptionId": "sub-1",
         },
     }]
-    install(_composite_handler(reservation_recs=recs))
+    sql_db = {"id": "/subscriptions/sub-1/resourceGroups/rg/providers/microsoft.sql/servers/srv/databases/db-1",
+              "name": "db-1", "subscriptionId": "sub-1", "resourceGroup": "rg", "location": "eastus",
+              "tier": "GeneralPurpose", "skuName": "GP_Gen5_2", "family": "Gen5", "capacity": 2}
+    install(_composite_handler(reservation_recs=recs, sql_db_rows=[sql_db]))
     aid = seed()
 
     await pipeline.run_assessment(aid, ["sub-1"], "token")
@@ -244,6 +262,44 @@ async def test_pipeline_uses_reservation_recommendations(pipeline_env):
     assert ri[0].estimated_savings_monthly == 123.0
     assert ri[0].details["source"] == "azure_reservation_recommendations"
     assert ri[0].resource_id is None  # SKU-level purchase rec
+    # Affected resource resolved from CURRENT inventory — the real DB id, never the subscription id.
+    assert ri[0].details["affected_count"] == 1
+    assert ri[0].details["affected_vms"][0]["id"].endswith("/databases/db-1")
+
+
+async def test_pipeline_excludes_advisor_vm_reservation_when_no_current_vm(pipeline_env):
+    # LIVE #118 REPRODUCTION through the real pipeline: a subscription with ZERO VMs where Azure ADVISOR
+    # returns a VM reservation PURCHASE rec ("Consider virtual machine reserved instance to save over the
+    # on-demand costs"). That rec is subscription-scoped and previously leaked into an "Other"/advisor_cost
+    # finding using the subscription id as its resource. It must now produce NO finding at all — no
+    # advisor_cost, no subscription-id-as-resource, zero VM RI savings.
+    TestSession, install, seed = pipeline_env
+    sub_id = "005e9433-0d52-4b38-97aa-1b2c3d4e5f60"
+    advisor = [{
+        "id": f"/subscriptions/{sub_id}/providers/Microsoft.Advisor/recommendations/ADV-RI",
+        "properties": {
+            "category": "Cost", "impact": "Medium",
+            "impactedField": "Microsoft.Subscriptions/subscriptions", "impactedValue": sub_id,
+            "shortDescription": {
+                "problem": "Consider virtual machine reserved instance to save over the on-demand costs",
+                "solution": "Buy a VM reserved instance"},
+            "extendedProperties": {"annualSavingsAmount": "396", "savingsAmount": "33"},
+            "resourceMetadata": {"resourceId": f"/subscriptions/{sub_id}"},
+        },
+    }]
+    # No VMs and no other inventory → the ONLY thing Azure offers is the Advisor VM reservation rec.
+    install(_composite_handler(advisor=advisor, vm_rows=[], cost_rows=[],
+                               service_rows=[[100.0, "SQL Database", "USD"]]))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    findings = s.query(Finding).all()
+    assert [f for f in findings if f.category == "advisor_cost"] == []      # no "Other" advisor finding
+    assert [f for f in findings if f.category == "ri_vm"] == []             # no VM RI finding
+    # Nothing may use the subscription id (bare or /subscriptions/{id}) as its affected resource.
+    assert all((f.resource_id or "") not in (sub_id, f"/subscriptions/{sub_id}") for f in findings)
 
 
 async def test_pipeline_detects_billing_currency(pipeline_env):
@@ -281,6 +337,141 @@ async def test_pipeline_without_cost_access(pipeline_env):
     assert a.cost_data_available == 0
     assert a.current_monthly_spend is None
     assert a.current_annual_spend is None
+
+
+async def test_cost_management_429_retries_then_recovers(pipeline_env, monkeypatch):
+    # (A) Cost Management throttles the first request (HTTP 429) then succeeds. The retry layer waits out
+    # the 429 and gets the billing data → spend populated, quantified findings usable, run NOT partial.
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)   # don't actually wait out backoff
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler(cost_throttle_first_n=1))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    a = s.get(Assessment, aid)
+    assert a.status == "completed"
+    assert a.cost_data_available == 1                # billing recovered after the retry
+    assert a.current_monthly_spend is not None       # real spend, from the recovered response
+    assert a.data_quality == "complete"              # a recovered throttle is NOT a partial run
+    assert a.collection_diagnostics["billing_failed_subs"] == 0
+
+
+async def test_cost_management_429_exhausted_stays_partial_no_fabrication(pipeline_env, monkeypatch):
+    # (B) Cost Management stays throttled (every request 429) until retries + the patient second attempt
+    # are exhausted. The run must record the failure honestly and never fabricate spend/savings, while
+    # resource-based findings (which don't need billing) still surface.
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)
+    monkeypatch.setattr(pipeline, "BILLING_RETRY_DELAY_SECONDS", 0)   # don't wait the ~45s patient retry
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler(cost_status=429))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    a = s.get(Assessment, aid)
+    assert a.status == "completed"                   # the assessment still completes
+    assert a.data_quality == "partial"               # honest failure state, not "complete"
+    assert a.collection_diagnostics["billing_failed_subs"] >= 1
+    assert a.collection_diagnostics["retry"]["throttled_responses"] >= 1
+    assert a.cost_data_available == 0
+    assert a.current_monthly_spend is None           # NO fabricated current spend
+    assert a.current_annual_spend is None            # NO fabricated projected spend
+    assert a.total_savings_annual == 0.0             # billing-dependent savings stay unquantified
+    # Resource-based findings STILL work without billing (inventory succeeded): disk + IP as REVIEW.
+    cats = {f.category for f in s.query(Finding).filter(Finding.assessment_id == aid).all()}
+    assert "unattached_managed_disks" in cats and "orphaned_public_ips" in cats
+
+
+async def test_new_subscription_empty_billing_stays_complete_not_partial(pipeline_env, monkeypatch):
+    # (D) A genuinely new subscription: Cost Management returns HTTP 200 with NO rows (no history yet).
+    # Billing collection SUCCEEDED (empty), so this is COMPLETE — clearly distinct from the 429 failure
+    # above (which is PARTIAL). No fabricated spend either.
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler(cost_rows=[], service_rows=[]))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    a = s.get(Assessment, aid)
+    assert a.status == "completed"
+    assert a.cost_data_available == 0
+    assert a.data_quality == "complete"              # empty-but-successful billing != a throttle failure
+    assert a.collection_diagnostics["billing_failed_subs"] == 0
+    assert a.current_monthly_spend is None           # no fabricated spend
+
+
+async def test_cost_management_exhausts_then_recovers_clears_stale_partial(pipeline_env, monkeypatch):
+    # (#127 REGRESSION) The first cost-map query exhausts all its 429 retries (billing marked failed AND a
+    # retry chain exhausted), but the outer cost-map re-fetch then succeeds. Because billing ULTIMATELY
+    # recovered, the run must be COMPLETE: the stale billing-failed flag is cleared and the recovered
+    # (transient) exhaustion is forgiven, with spend populated and normal grounded findings.
+    from app.services.azure_client import COST_MANAGEMENT_MAX_RETRIES
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)          # skip retry backoff
+    monkeypatch.setattr(pipeline, "COST_MAP_RETRY_DELAY_SECONDS", 0)   # skip the 25s cost-map re-fetch wait
+    TestSession, install, seed = pipeline_env
+    # Throttle exactly the first cost-map query to exhaustion (initial + every retry), then let the
+    # service query and the outer cost-map re-fetch succeed.
+    install(_composite_handler(cost_throttle_first_n=COST_MANAGEMENT_MAX_RETRIES + 1))
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    s = TestSession()
+    a = s.get(Assessment, aid)
+    diag = a.collection_diagnostics
+    assert diag["retry"]["throttled_responses"] >= 1   # throttling genuinely occurred (telemetry preserved)
+    assert a.cost_data_available == 1                  # billing recovered
+    assert a.current_monthly_spend is not None         # real spend populated
+    assert diag["billing_failed_subs"] == 0            # stale failure flag CLEARED (the fix)
+    assert diag["retry"]["exhausted"] == 0             # the recovered billing exhaustion is forgiven
+    assert a.data_quality == "complete"                # no longer falsely partial
+    findings = s.query(Finding).filter(Finding.assessment_id == aid).all()
+    assert len(findings) >= 1 and all(f.evidence_state == "quantified" for f in findings)  # normal grounding
+
+
+async def test_cost_management_200_immediately_is_complete(pipeline_env, monkeypatch):
+    # (TEST 3) No throttling at all: existing behavior unchanged — billing available, nothing failed.
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())                      # 200 on the first request
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    assert a.cost_data_available == 1
+    assert a.collection_diagnostics["billing_failed_subs"] == 0
+    assert a.collection_diagnostics["retry"]["exhausted"] == 0
+    assert a.data_quality == "complete"
+
+
+async def test_billing_recovers_but_other_collector_failure_is_partial(pipeline_env, monkeypatch):
+    # (TEST 4) Billing succeeds, but an INDEPENDENT collector (metrics) genuinely fails. The run is PARTIAL
+    # only because of the metrics failure; billing is NOT marked failed, and spend is still available.
+    monkeypatch.setattr(resilience, "_sleep", _instant_sleep)
+
+    async def _metrics_fail(client, vms, days=30, report=None):
+        if report is not None:
+            report.note_metrics(len(vms), len(vms))    # every VM's metric call failed
+        return [{**vm, "max_cpu": None, "avg_cpu": None, "cpu_datapoints": 0,
+                 "peak_memory_used_pct": None, "memory_available": False, "metrics_failed": True} for vm in vms]
+    monkeypatch.setattr(pipeline, "enrich_vms_with_metrics", _metrics_fail)
+    TestSession, install, seed = pipeline_env
+    install(_composite_handler())                      # billing 200
+    aid = seed()
+
+    await pipeline.run_assessment(aid, ["sub-1"], "token")
+
+    a = TestSession().get(Assessment, aid)
+    assert a.cost_data_available == 1                              # billing succeeded
+    assert a.collection_diagnostics["billing_failed_subs"] == 0    # billing NOT marked failed
+    assert a.collection_diagnostics["metrics_failed"] >= 1
+    assert a.data_quality == "partial"                            # partial ONLY due to metrics
 
 
 async def test_pipeline_degraded_billing_marks_findings_review(pipeline_env, monkeypatch):
@@ -379,6 +570,7 @@ async def test_billing_transient_failure_marks_partial(pipeline_env, monkeypatch
     # A transient 500 on Cost Management (after retries) is a FAILURE, not "zero spend" → PARTIAL.
     TestSession, install, seed = pipeline_env
     monkeypatch.setattr(resilience, "_sleep", _instant_sleep)   # don't actually wait out the backoff
+    monkeypatch.setattr(pipeline, "BILLING_RETRY_DELAY_SECONDS", 0)   # nor the patient billing re-attempt
     install(_composite_handler(cost_status=500))
     aid = seed()
 

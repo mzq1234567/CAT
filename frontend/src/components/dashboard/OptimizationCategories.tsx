@@ -69,7 +69,7 @@ export default function OptimizationCategories({
         />
         {selected && (
           <Typography variant="caption" color={colors.textMuted}>
-            Showing <b style={{ color: colors.textSecondary }}>{selected}</b> — click again or "All
+            Showing <b style={{ color: colors.textSecondary }}>{selected}</b>, click again or "All
             categories" to reset.
           </Typography>
         )}

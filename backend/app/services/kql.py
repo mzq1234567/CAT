@@ -251,6 +251,20 @@ def sql_ahb_eligible_query() -> str:
           tier = tostring(sku.tier), skuName = tostring(sku.name), vcores, tags"""
 
 
+def sql_databases_query() -> str:
+    """All current Azure SQL Databases (excluding the `master` system DB), with the fields needed to
+    tell the vCore purchasing model (reservation-eligible) from DTU (NOT reservation-eligible):
+    `sku.tier` (GeneralPurpose/BusinessCritical/Hyperscale = vCore; Basic/Standard/Premium = DTU),
+    `sku.name`, `sku.family` and the vCore/DTU capacity. Used to reconcile Azure's SQL reservation
+    recommendations against SQL Databases that actually exist now in the assessed subscription."""
+    return """Resources
+| where type == 'microsoft.sql/servers/databases'
+| where name != 'master'
+| project id, name, subscriptionId, resourceGroup, location,
+          tier = tostring(sku.tier), skuName = tostring(sku.name),
+          family = tostring(sku.family), capacity = toint(sku.capacity), tags"""
+
+
 def all_resources_summary_query() -> str:
     """Full inventory: top-level resources counted by type. Powers 'N resources / M types scanned'.
 
@@ -284,6 +298,8 @@ def filtered_inventory_queries() -> Dict[str, str]:
         "deallocated_vms": deallocated_vms_query(),
         "paused_sql_databases": paused_sql_databases_query(),
         "stopped_sql_managed_instances": stopped_sql_managed_instances_query(),
+        "sql_databases": sql_databases_query(),   # full SQL DB inventory for RI reconciliation
+
         "running_vms": running_vms_query(),
         # Broader coverage — cost-bearing orphans/waste (new)
         "orphaned_snapshots": orphaned_snapshots_query(),

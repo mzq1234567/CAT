@@ -3,6 +3,7 @@ import { Box, Typography } from "@mui/material";
 import { alpha, keyframes } from "@mui/material/styles";
 import { colors } from "../../theme";
 import { Assessment } from "../../types";
+import { useThemeMode } from "../themeMode";
 import { useReducedMotion } from "./useAssessmentMotion";
 
 /**
@@ -102,12 +103,16 @@ function Slot({
 
 function ResourceNodes({ assessment }: { assessment: Assessment }) {
   const reduced = useReducedMotion();
+  // Subscribe to the theme mode so a theme SWITCH re-renders the pills (their `colors.*` styles refresh);
+  // context-driven re-renders bypass the memo comparator below, which only gates prop-driven ones.
+  const { mode } = useThemeMode();
   const labels = labelsFor(assessment);
   const slots = SLOTS.slice(0, Math.min(SLOTS.length, labels.length));
 
   return (
     <Box
       aria-hidden
+      data-theme-mode={mode}
       sx={{
         position: "absolute",
         inset: 0,

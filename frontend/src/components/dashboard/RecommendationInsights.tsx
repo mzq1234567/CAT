@@ -133,7 +133,7 @@ export default function RecommendationInsights({
                   color={colors.textMuted}
                   sx={{ display: "block", textAlign: "center", mt: 1.5 }}
                 >
-                  + {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit — shown separately (needs licences)
+                  + {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit, shown separately (needs licences)
                 </Typography>
               )}
             </Box>
@@ -167,7 +167,7 @@ export default function RecommendationInsights({
       {/* Waterfall (or impact distribution when spend is partial) */}
       <Grid item xs={12} md={4}>
         {reconciles ? (
-          <ChartCard title="Spend After Optimization" subtitle="Current spend − savings = projected">
+          <ChartCard title="Spend After Optimization" subtitle="Current spend minus savings = projected">
             <Waterfall
               current={currentAnnual}
               savings={totalAnnual}
@@ -198,7 +198,7 @@ export default function RecommendationInsights({
               </Box>
               {ahbPotential > 0 && (
                 <Typography variant="caption" color={colors.textMuted} sx={{ display: "block", mt: 2, lineHeight: 1.5 }}>
-                  + {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit — shown separately (needs licences)
+                  + {fmtCompact(ahbPotential)} / yr potential via Hybrid Benefit, shown separately (needs licences)
                 </Typography>
               )}
             </Box>

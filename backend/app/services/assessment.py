@@ -46,7 +46,11 @@ from .metrics import (
     enrich_vms_with_metrics,
 )
 from .pricing import get_pricing_engine
-from .reservations import parse_reservation_recommendations
+from .reservations import (
+    parse_reservation_recommendations,
+    reconcile_sql_recommendations,
+    reconcile_vm_recommendations,
+)
 from .state_machine import AssessmentState, ProgressTracker
 
 logger = logging.getLogger("cat.assessment")
@@ -57,6 +61,11 @@ _FINDING_COLUMNS = {c.name for c in Finding.__table__.columns} - {"id", "assessm
 # How long to wait out a Cost Management throttle before retrying the per-resource cost-map query once
 # (only when the subscription total succeeded but the per-resource detail didn't — see run_assessment).
 COST_MAP_RETRY_DELAY_SECONDS = 25
+# When the WHOLE billing (per-resource cost AND service-level spend) is throttled out, wait this long for
+# the Cost Management throttle window to clear, then make ONE more patient attempt before recording the
+# failure. Bounded and one-shot — only runs on an actual 429 failure, never on a successful (or genuinely
+# empty new-subscription) billing collection.
+BILLING_RETRY_DELAY_SECONDS = 45
 
 # Findings whose saving is Azure's OWN authoritative number (not our list-price estimate) — kept even
 # when per-resource billing is unavailable, since they don't depend on our cost grounding.
@@ -68,7 +77,7 @@ def _withhold_ungrounded(findings: List[Dict]) -> List[Dict]:
 
     A grounded finding (saving derived from actual billed cost → `validated`, or carrying an actual cost)
     is kept, as are authoritative Azure-sourced findings (Advisor, reservation recommendations). Only a
-    finding whose saving is a pure list-price guess with no billed cost behind it is withheld — those are
+    finding whose saving is a pure list-price guess with no billed cost behind it is withheld, those are
     the ones that otherwise show inflated numbers (e.g. a Bastion capped to the whole subscription spend)
     that read as fabricated. Zero-saving informational findings are left untouched.
     """
@@ -81,7 +90,7 @@ def _withhold_ungrounded(findings: List[Dict]) -> List[Dict]:
             or (f.get("details") or {}).get("source") == "azure_reservation_recommendations"
         )
         if monthly > 0 and not grounded and not authoritative:
-            continue  # ungrounded list-price estimate — withhold rather than mislead
+            continue  # ungrounded list-price estimate, withhold rather than mislead
         kept.append(f)
     return kept
 
@@ -164,6 +173,10 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.event("Reading billed cost from Azure Cost Management")
         # One monthly-history query per sub yields BOTH the last-month cost basis and the
         # month-over-month steadiness signal (half the load on the throttled billing API).
+        # Baseline retry-exhaustion count BEFORE billing, so we can tell a billing 429 that exhausted
+        # then RECOVERED (a transient event, must not force PARTIAL) from exhaustions in other phases
+        # (e.g. reservations) which must be preserved. See the "forgive" step after billing below.
+        exhausted_before_billing = report.retry.exhausted
         cost_map, consistency, growth, complete_months, cost_basis, billing_currency = \
             await _gather_cost_and_consistency(client, subscription_ids, report)
         service_costs, currency, spend_estimated, spend_period_days = await _gather_spend_baseline(
@@ -172,22 +185,47 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         # throttled the heavier query specifically. Wait out the throttle and try the cost map once more
         # before giving up — one grounded retry beats a whole run of ungrounded list-price estimates.
         if not cost_map and service_costs:
-            logger.warning("Per-resource billing empty though subscription spend succeeded — retrying "
+            logger.warning("Per-resource billing empty though subscription spend succeeded, retrying "
                            "cost map after %ss backoff.", COST_MAP_RETRY_DELAY_SECONDS)
             await asyncio.sleep(COST_MAP_RETRY_DELAY_SECONDS)
             cost_map, consistency, growth, complete_months, cost_basis, billing_currency = \
                 await _gather_cost_and_consistency(client, subscription_ids, report)
+        # SECOND PATIENT ATTEMPT: the WHOLE billing (per-resource AND service-level) was throttled out —
+        # a genuine 429 failure (report.billing_failed_subs recorded it), NOT a new subscription with no
+        # history (those queries SUCCEED empty, so billing_failed_subs is 0 and this is skipped, adding no
+        # delay). Give the throttle window time and try the whole billing ONCE more before recording the
+        # failure. If it now succeeds, the failure clears; if it still fails, the re-attempt re-records it
+        # so the run stays honestly PARTIAL. Never fabricates spend.
+        if not cost_map and not service_costs and report.billing_failed_subs > 0:
+            logger.warning("Cost Management billing throttled out (429); waiting %ss for the throttle "
+                           "window to clear and retrying the whole billing once.", BILLING_RETRY_DELAY_SECONDS)
+            tracker.event("Cost Management throttled, waiting to retry billing")
+            await asyncio.sleep(BILLING_RETRY_DELAY_SECONDS)
+            # The patient re-attempt is authoritative: the gather marks each sub recovered on success or
+            # failed on failure, so a now-successful billing clears the earlier failure by itself.
+            cost_map, consistency, growth, complete_months, cost_basis, billing_currency = \
+                await _gather_cost_and_consistency(client, subscription_ids, report)
+            service_costs, currency, spend_estimated, spend_period_days = await _gather_spend_baseline(
+                client, subscription_ids, complete_month_exists=complete_months >= 2, report=report)
         # Per-resource billing is unavailable for this run when the subscription clearly HAS billing
         # (service spend came back) but no per-resource cost did — grounded findings can't be quantified.
         billing_detail_unavailable = (not cost_map) and bool(service_costs)
         report.billing_detail_unavailable = billing_detail_unavailable
+        # FORGIVE billing-phase retry exhaustions when billing ULTIMATELY recovered. A 429 that exhausted
+        # its inline retries but was recovered by the outer cost-map / whole-billing retry is a transient
+        # event, not a final failure, so it must not keep the run PARTIAL (assessment #127). We only clear
+        # the exhaustions that accrued DURING billing, and only when billing is genuinely OK (no failed sub,
+        # not detail-degraded); exhaustions from other phases (e.g. throttled reservations) are preserved,
+        # and a real billing failure keeps its exhaustion. Throttle telemetry (throttled_responses) is kept.
+        if report.billing_failed_subs == 0 and not billing_detail_unavailable:
+            report.retry.exhausted = exhausted_before_billing
         if cost_map:
             tracker.event(f"Matched billed cost for {len(cost_map):,} resources")
         elif billing_detail_unavailable:
-            tracker.event("Per-resource billed cost unavailable (Cost Management throttled) — grounded "
+            tracker.event("Per-resource billed cost unavailable (Cost Management throttled), grounded "
                           "findings withheld; re-run for accurate figures")
         else:
-            tracker.event("No billed cost returned — estimates will use list pricing")
+            tracker.event("No billed cost returned, estimates will use list pricing")
         # Authoritative billing currency: whatever Cost Management actually returned — the service-cost
         # response first, else the per-resource billing response. Only when NO billing query returned a
         # currency (no billing access at all, so no spend is shown either) do we fall back to the default.
@@ -226,7 +264,7 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.event("Evaluating reservations, hybrid benefit, right-sizing and waste")
         findings = await _detect_all(
             engine, inventory, running_vms, advisor_recs, reservation_recs, active_asps,
-            active_sql_dbs, active_sql_mis, premium_disks
+            active_sql_dbs, active_sql_mis, premium_disks, assessment_id=assessment_id
         )
         # When per-resource billing is unavailable, withhold OUR ungrounded list-price findings rather
         # than show numbers that read as fabricated (e.g. a Bastion capped to the whole subscription
@@ -245,9 +283,12 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         # an unpriced finding into REVIEW / "Not quantified", so they're safe by construction.
         data_quality = report.data_quality()
         client_note = report.client_message()
+        # Always log a per-stage collection summary so the EXACT source of any partial result is
+        # identifiable from the backend logs (no tokens/secrets) — not just a vague "partial".
+        logger.info("Assessment %s collection summary: %s", assessment_id, report.stage_summary())
         if data_quality != "complete":
-            logger.warning("Assessment %s data quality=%s; diagnostics=%s",
-                           assessment_id, data_quality, report.diagnostics())
+            logger.warning("Assessment %s data quality=%s; failed sources=%s; diagnostics=%s",
+                           assessment_id, data_quality, report.failed_sources(), report.diagnostics())
             if client_note:
                 tracker.event(client_note)
         _persist_findings_and_totals(
@@ -261,7 +302,7 @@ async def run_assessment(assessment_id: int, subscription_ids: List[str], token:
         tracker.advance(AssessmentState.COMPLETED)
         tracker.event("Assessment complete")
 
-    except Exception as exc:  # noqa: BLE001 — record failure, never crash the worker
+    except Exception as exc:  # noqa: BLE001, record failure, never crash the worker
         logger.exception("Assessment %s failed", assessment_id)
         db.rollback()
         tracker.fail(str(exc))
@@ -281,7 +322,7 @@ async def _gather_advisor(
         if isinstance(r, list):
             recs.extend(r)
         elif report is not None:
-            report.advisor_failed_subs += 1   # a failed sub is NOT "no Advisor recs" — flag it
+            report.advisor_failed_subs += 1   # a failed sub is NOT "no Advisor recs", flag it
     return recs
 
 
@@ -303,7 +344,7 @@ async def _gather_cost_and_consistency(
     cost_basis: Dict[str, Dict] = {}   # per-resource basis metadata (label + estimate + variability)
     combined_totals: Dict[str, float] = {}
     detected_currency: str | None = None
-    for r in results:
+    for sub, r in zip(subscription_ids, results):
         if isinstance(r, tuple):
             cm, cons, totals, basis, cur = r
             cost_map.update(cm)
@@ -312,8 +353,10 @@ async def _gather_cost_and_consistency(
             for month, amount in totals.items():
                 combined_totals[month] = combined_totals.get(month, 0.0) + amount
             detected_currency = detected_currency or cur
+            if report is not None:
+                report.mark_billing_recovered(sub)   # this sub's cost query succeeded (clears any prior fail)
         elif report is not None:
-            report.billing_failed_subs += 1    # billing query FAILED for this sub — not "zero spend"
+            report.mark_billing_failed(sub)           # billing query FAILED for this sub, not "zero spend"
     series = [combined_totals[m] for m in sorted(combined_totals)]
     growth = linear_growth_rate(series)
     # A complete previous billing month exists only if ≥ 2 complete months carried cost — i.e. billing
@@ -328,7 +371,7 @@ async def _gather_reservation_recs(
     """Azure's own reservation purchase recommendations, parsed + merged across subscriptions.
 
     This is the SOLE, authoritative source of Reserved Instance recommendations (VMs and non-VM alike).
-    Empty when Cost Management access is unavailable (403/404) or no reservation is worthwhile — in
+    Empty when Cost Management access is unavailable (403/404) or no reservation is worthwhile, in
     which case NO RI recommendation is shown (we never fall back to a retail-estimated discount).
     """
     results = await asyncio.gather(
@@ -344,7 +387,7 @@ async def _gather_reservation_recs(
         elif report is not None:
             report.reservation_failed_subs += 1   # failed to fetch recs for this sub (≠ none worthwhile)
     if raw_count and not groups:
-        logger.warning("Reservation recs: Azure returned %d raw items but the parser kept 0 — "
+        logger.warning("Reservation recs: Azure returned %d raw items but the parser kept 0, "
                        "check resourceType/SKU mapping in reservations.py.", raw_count)
     logger.info("Reservation recs: %d raw items → %d grouped recommendations.", raw_count, len(groups))
     return groups
@@ -363,19 +406,21 @@ async def _gather_service_costs(
     )
     totals: Dict[str, float] = {}
     currencies: set = set()
-    for r in results:
+    for sub, r in zip(subscription_ids, results):
         if isinstance(r, tuple):
             svc, cur = r
             for service, cost in svc.items():
                 totals[service] = totals.get(service, 0.0) + cost
             if cur:
                 currencies.add(cur)
+            if report is not None:
+                report.mark_billing_recovered(sub)   # this sub's service-cost query succeeded
         elif report is not None:
-            report.billing_failed_subs += 1    # service-cost query FAILED for this sub — not "zero spend"
+            report.mark_billing_failed(sub)           # service-cost query FAILED for this sub, not "zero spend"
     # Almost always one billing currency; if subscriptions report different ones, summing them would
     # be nonsense — surface it loudly and report in the first (don't silently mix).
     if len(currencies) > 1:
-        logger.error("Subscriptions report mixed billing currencies %s — totals may be unreliable; "
+        logger.error("Subscriptions report mixed billing currencies %s, totals may be unreliable; "
                      "run one currency at a time.", currencies)
     currency = next(iter(currencies), None)
     return totals, currency
@@ -402,14 +447,16 @@ async def _gather_spend_baseline(
     totals: Dict[str, float] = {}
     currency: str | None = None
     period_days = 0
-    for r in results:
+    for sub, r in zip(subscription_ids, results):
         if isinstance(r, dict):
             for service, cost in r["service_costs"].items():
                 totals[service] = totals.get(service, 0.0) + cost
             currency = currency or r.get("currency")
             period_days = max(period_days, int(r.get("period_days") or 0))
+            if report is not None:
+                report.mark_billing_recovered(sub)   # this sub's run-rate query succeeded
         elif isinstance(r, BaseException) and report is not None:
-            report.billing_failed_subs += 1   # run-rate query FAILED for this sub — not "zero spend"
+            report.mark_billing_failed(sub)           # run-rate query FAILED for this sub, not "zero spend"
 
     if not totals:  # no daily data either → fall back to whatever last-month/MTD returns
         totals, currency = await _gather_service_costs(client, subscription_ids, report)
@@ -420,7 +467,7 @@ async def _gather_spend_baseline(
 
 async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_recs=None,
                       active_asps=None, active_sql_dbs=None, active_sql_mis=None,
-                      premium_disks=None) -> List[Dict]:
+                      premium_disks=None, assessment_id=None) -> List[Dict]:
     reservation_recs = reservation_recs or []
     active_asps = active_asps or []
     active_sql_dbs = active_sql_dbs or []
@@ -453,7 +500,24 @@ async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_
     # eligibility, only reservable SKUs the customer actually uses. We never compute a discount or
     # recommend a reservation Azure didn't. (The old retail-estimate VM RI detector was retired — the
     # Retail Prices API doesn't publish reservation prices for most VM SKUs.)
-    findings += engine.commitments_from_recommendations(reservation_recs)
+    #
+    # RECONCILIATION: Azure's recommendations are HISTORICAL/usage-based and lag inventory changes, so a
+    # VM moved out of (or deleted from) the assessed subscription can still appear. Before a VM RI
+    # becomes an actionable finding we cross-check it against the CURRENT Resource-Graph VM inventory
+    # (running + deallocated, already scoped to the assessed subscriptions): stale recommendations for
+    # SKUs no longer present in the subscription are excluded, and affected resources are resolved from
+    # current inventory. If a subscription has zero current VMs, no VM RI finding can be produced.
+    current_vms = (inventory.get("running_vms") or []) + (inventory.get("deallocated_vms") or [])
+    reconciled_recs = reconcile_vm_recommendations(
+        reservation_recs, current_vms, assessment_id=assessment_id)
+    # SQL Database reservations are reconciled against the CURRENT SQL DB inventory with vCore-vs-DTU
+    # eligibility (DTU can't be reserved). Azure SQL reservations are SKU/usage-based and carry no
+    # database id, so — like VMs — a stale historical rec must not resurface databases that no longer
+    # exist, and affected resources are resolved only from current inventory.
+    current_sql_dbs = inventory.get("sql_databases") or []
+    reconciled_recs = reconcile_sql_recommendations(
+        reconciled_recs, current_sql_dbs, assessment_id=assessment_id)
+    findings += engine.commitments_from_recommendations(reconciled_recs)
     # Windows AHB (licence, additive with reservations) — excludes VMs we'd delete (idle/stopped).
     findings += await engine.detect_windows_ahb(
         inventory.get("windows_vms_without_ahb", []), exclude_ids=delete_ids)
@@ -479,15 +543,15 @@ async def _detect_all(engine, inventory, running_vms, advisor_recs, reservation_
 async def _gather_inventory_summary(client: AzureClient, subscription_ids: List[str]):
     """Return (total_resources, distinct_type_count, major_types, ok) across the subscriptions.
 
-    `major_types` is the top resource types by count as [{"type": short_name, "count": n}] — used
+    `major_types` is the top resource types by count as [{"type": short_name, "count": n}], used
     for the report's Environment Details table (which takes the top 3) and for the live discovery
     metrics on the running-assessment screen. On failure returns (0, 0, [], **False**) so the caller
-    records the count as UNKNOWN (not a fabricated zero) and flags the run PARTIAL — a failed count
+    records the count as UNKNOWN (not a fabricated zero) and flags the run PARTIAL, a failed count
     query must never read as "this environment has 0 resources".
     """
     try:
         rows = await client.query_resource_graph(subscription_ids, all_resources_summary_query())
-    except Exception as exc:  # noqa: BLE001 — a summary failure must not fail the assessment
+    except Exception as exc:  # noqa: BLE001, a summary failure must not fail the assessment
         logger.warning("Inventory summary query failed: %s", type(exc).__name__)
         return 0, 0, [], False
     total = sum(int(r.get("resourceCount") or 0) for r in rows)
@@ -584,7 +648,7 @@ def resolve_overlaps(findings: List[Dict]) -> List[Dict]:
     savings is counted toward the total (ties → the concrete per-VM action). The loser's
     `counted_savings_*` is reduced (the RI aggregate is reduced by that instance's per-unit saving; a
     superseded per-VM finding drops to 0). Every finding is still DISPLAYED at its own `estimated_savings_*`
-    — only the total uses `counted_savings_*`. No finding is hidden from the UI.
+   , only the total uses `counted_savings_*`. No finding is hidden from the UI.
     """
     # Build RI coverage per (sku, region): remaining instances + per-instance monthly saving (in the same
     # term the RI headline uses — 3-year if available, else 1-year).
@@ -781,7 +845,7 @@ def _persist_findings_and_totals(
         # ≤ spend by construction. If it somehow isn't, that's a real bug to surface — not to paper
         # over by forcing savings == spend (which reads as a nonsensical 100% reduction).
         if assessment.total_savings_annual > assessment.current_annual_spend > 0:
-            logger.error("Assessment %s: savings (%.0f) exceed spend (%.0f) despite grounding — "
+            logger.error("Assessment %s: savings (%.0f) exceed spend (%.0f) despite grounding, "
                          "investigate.", assessment_id, assessment.total_savings_annual,
                          assessment.current_annual_spend)
     elif resource_cost_total and resource_cost_total > 0:

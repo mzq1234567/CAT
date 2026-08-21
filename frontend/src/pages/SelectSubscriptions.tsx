@@ -77,7 +77,7 @@ export default function SelectSubscriptions() {
   return (
     <Layout
       title="Select Subscriptions"
-      subtitle="Choose the Azure subscriptions you want to assess. We use your existing Azure access to review the environment — read-only, with no changes to your resources."
+      subtitle="Choose the Azure subscriptions you want to assess. We use your existing Azure access to review the environment, read-only, with no changes to your resources."
     >
       <Box maxWidth={820} sx={{ pb: 12 }}>
         {mutation.isError && (

@@ -28,7 +28,7 @@ export function AdvisorImpactChip({ finding }: { finding: Finding }) {
   const impact = (finding.details as { impact?: string } | null)?.impact;
   if (finding.category !== "advisor_cost" || !impact) return null;
   return (
-    <Tooltip title="Azure Advisor's own impact rating for this recommendation. It's informational — the Impact chip reflects the size of the saving.">
+    <Tooltip title="Azure Advisor's own impact rating for this recommendation. It's informational, the Impact chip reflects the size of the saving.">
       <Chip
         size="small"
         variant="outlined"
@@ -79,7 +79,7 @@ export function ValidationChip({ finding }: { finding: Finding }) {
   if (!status || status === "unvalidated") {
     if (finding.estimated_savings_monthly <= 0) return null;
     return (
-      <Tooltip title="This figure is an estimate that couldn't be matched to a specific billed line item (e.g. a nominal rate for an orphaned resource) — treat it as approximate.">
+      <Tooltip title="This figure is an estimate that couldn't be matched to a specific billed line item (e.g. a nominal rate for an orphaned resource), treat it as approximate.">
         <Chip
           size="small"
           variant="outlined"
@@ -108,7 +108,7 @@ export function ValidationChip({ finding }: { finding: Finding }) {
       title={
         isReview
           ? reviewDetail
-          : "Grounded in your actual billed cost (Cost Management) — this is a fraction of what you really pay, not a list-price guess."
+          : "Grounded in your actual billed cost (Cost Management), this is a fraction of what you really pay, not a list-price guess."
       }
     >
       <Chip

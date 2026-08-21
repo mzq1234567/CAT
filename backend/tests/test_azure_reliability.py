@@ -211,6 +211,24 @@ def test_completeness_partial_on_any_failure():
     assert "429" not in msg and "Traceback" not in msg
 
 
+def test_partial_message_names_the_specific_failed_source():
+    # The client message must identify WHICH source failed, not a vague "some data".
+    r = CollectionReport(subscriptions_requested=2, resources_discovered=42)
+    r.note_inventory(20, [])
+    r.mark_billing_failed("sub-a")
+    r.note_metrics(requested=8, failed=3)
+    sources = r.failed_sources()
+    assert any("cost data" in s for s in sources)
+    assert any("utilisation metrics" in s for s in sources)
+    msg = r.client_message() or ""
+    assert "cost data" in msg and "utilisation metrics" in msg
+    assert "429" not in msg and "Traceback" not in msg     # still client-safe
+    # The per-stage log summary pinpoints the failing operation for the backend logs.
+    summary = r.stage_summary()
+    assert summary["cost_data"] == "failed" and summary["metrics"].startswith("partial")
+    assert summary["resource_inventory"] == "ok"
+
+
 def test_completeness_partial_on_metrics_or_billing_failure():
     r = CollectionReport(subscriptions_requested=1, resources_discovered=10)
     r.note_inventory(20, [])
@@ -218,7 +236,7 @@ def test_completeness_partial_on_metrics_or_billing_failure():
     assert r.data_quality() == PARTIAL
     r2 = CollectionReport(subscriptions_requested=1, resources_discovered=10)
     r2.note_inventory(20, [])
-    r2.billing_failed_subs = 1
+    r2.mark_billing_failed("sub-a")
     assert r2.data_quality() == PARTIAL
 
 

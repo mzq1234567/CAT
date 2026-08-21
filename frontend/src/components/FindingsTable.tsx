@@ -68,7 +68,7 @@ function ValidationChip({ finding }: { finding: Finding }) {
       ? ` ${finding.validation_variance_pct > 0 ? "+" : ""}${finding.validation_variance_pct.toFixed(0)}%`
       : "";
   return (
-    <Tooltip title={isReview ? "Estimate deviates from actual cost — review" : "Validated vs actual cost"}>
+    <Tooltip title={isReview ? "Estimate deviates from actual cost; review" : "Validated vs actual cost"}>
       <Chip
         size="small"
         label={`${isReview ? "Review" : "OK"}${variance}`}

@@ -1,6 +1,6 @@
 import React from "react";
 import {
-  Avatar, Box, Button, Stack, Tooltip, Typography,
+  Avatar, Box, Button, Stack, ToggleButton, ToggleButtonGroup, Tooltip, Typography,
 } from "@mui/material";
 import { alpha } from "@mui/material/styles";
 import { useMsal } from "@azure/msal-react";
@@ -9,8 +9,48 @@ import DashboardIcon from "@mui/icons-material/Dashboard";
 import AssessmentIcon from "@mui/icons-material/Assessment";
 import AddCircleOutlineIcon from "@mui/icons-material/AddCircleOutline";
 import LogoutIcon from "@mui/icons-material/Logout";
+import LightModeOutlinedIcon from "@mui/icons-material/LightModeOutlined";
+import DarkModeOutlinedIcon from "@mui/icons-material/DarkModeOutlined";
 import { colors, gradients } from "../theme";
+import { useThemeMode } from "./themeMode";
 import tptLogo from "../assets/tpt-logo-dark.png";
+
+/** Compact Light/Dark segmented control for the sidebar footer. */
+function ThemeToggle() {
+  const { mode, setMode } = useThemeMode();
+  return (
+    <ToggleButtonGroup
+      size="small"
+      exclusive
+      value={mode}
+      onChange={(_, v) => v && setMode(v)}
+      fullWidth
+      sx={{
+        "& .MuiToggleButton-root": {
+          textTransform: "none",
+          fontWeight: 600,
+          fontSize: 12,
+          gap: 0.75,
+          py: 0.6,
+          color: colors.textSecondary,
+          borderColor: colors.border,
+          "&.Mui-selected": {
+            color: colors.accentBlue,
+            bgcolor: alpha(colors.accentBlue, 0.14),
+            "&:hover": { bgcolor: alpha(colors.accentBlue, 0.2) },
+          },
+        },
+      }}
+    >
+      <ToggleButton value="light">
+        <LightModeOutlinedIcon sx={{ fontSize: 16 }} /> Light
+      </ToggleButton>
+      <ToggleButton value="dark">
+        <DarkModeOutlinedIcon sx={{ fontSize: 16 }} /> Dark
+      </ToggleButton>
+    </ToggleButtonGroup>
+  );
+}
 
 const SIDEBAR_WIDTH = 240;
 
@@ -53,7 +93,11 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
   const { instance, accounts } = useMsal();
   const navigate = useNavigate();
   const location = useLocation();
+  const { mode } = useThemeMode();
   const account = accounts[0];
+  // The only logo asset is the dark-ink wordmark (built for light surfaces); on the dark sidebar it
+  // would be invisible, so render it as a clean light wordmark in dark mode.
+  const logoFilter = mode === "dark" ? "brightness(0) invert(1)" : "none";
 
   const initials =
     account?.name
@@ -93,7 +137,7 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
             component="img"
             src={tptLogo}
             alt="Tech Plus Talent"
-            sx={{ display: "block", width: "100%", maxWidth: 168, height: "auto" }}
+            sx={{ display: "block", width: "100%", maxWidth: 168, height: "auto", filter: logoFilter }}
           />
           <Typography
             fontSize={10}
@@ -157,6 +201,11 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
             );
           })}
         </Stack>
+
+        {/* Appearance — Light / Dark theme toggle */}
+        <Box sx={{ px: 1.5, pb: account ? 0 : 1.5 }}>
+          <ThemeToggle />
+        </Box>
 
         {/* User card */}
         {account && (

@@ -186,7 +186,7 @@ export default function Results() {
 
       {assessment.status === "failed" && (
         <Alert severity="error" icon={<ErrorOutlineIcon />}>
-          This assessment couldn't be completed. Please try running it again — if the problem persists,
+          This assessment couldn't be completed. Please try running it again. If the problem persists,
           contact your TechPlus Talent consultant.
         </Alert>
       )}

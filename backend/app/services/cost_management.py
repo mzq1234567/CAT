@@ -56,10 +56,10 @@ def _month_bounds(now: datetime):
 def build_cost_query(now: Optional[datetime] = None, month_to_date: bool = False) -> Dict[str, Any]:
     """ActualCost grouped by ResourceId, for the LAST COMPLETE calendar month.
 
-    A manual cost assessment reads *last month's bill* — never the current month, which isn't fully
+    A manual cost assessment reads *last month's bill*, never the current month, which isn't fully
     billed yet (Azure posts costs with a delay). We express it as an explicit `Custom` date range
     (more reliable across API versions than the named `TheLastMonth`). `month_to_date=True` switches
-    to the current month so far — the fallback used only when the subscription is too new to have a
+    to the current month so far, the fallback used only when the subscription is too new to have a
     complete previous month (otherwise it would report no cost at all).
     """
     now = now or datetime.now(timezone.utc)
@@ -83,7 +83,7 @@ def build_cost_query(now: Optional[datetime] = None, month_to_date: bool = False
 def parse_cost_rows(payload: Dict[str, Any], days: int = DEFAULT_WINDOW_DAYS) -> Dict[str, float]:
     """Turn a Cost Management (last-month) response into `{resource_id_lower: monthly_cost}`.
 
-    Column order is not assumed — indices resolve by name. The figure is already a full calendar
+    Column order is not assumed, indices resolve by name. The figure is already a full calendar
     month, so it is summed per resource id with no normalisation. (`days` is accepted for backward
     compatibility and ignored.)
     """
@@ -147,7 +147,7 @@ def area_for_service(service_name: str) -> str:
 
 
 def build_service_cost_query(now: Optional[datetime] = None, month_to_date: bool = False) -> Dict[str, Any]:
-    """ActualCost grouped by ServiceName for the last complete month — the whole-bill view."""
+    """ActualCost grouped by ServiceName for the last complete month, the whole-bill view."""
     body = build_cost_query(now=now, month_to_date=month_to_date)
     body["dataset"]["grouping"] = [{"type": "Dimension", "name": "ServiceName"}]
     return body
@@ -209,7 +209,7 @@ async def get_actual_cost_by_service(
 
 # ── Run-rate baseline (subscriptions with no complete previous billing month) ──────
 
-AVG_DAYS_PER_MONTH = 30.4375  # 365.25 / 12 — normalises a partial period to a monthly figure
+AVG_DAYS_PER_MONTH = 30.4375  # 365.25 / 12, normalises a partial period to a monthly figure
 
 
 def _parse_usage_date(v) -> Optional[date]:
@@ -227,7 +227,7 @@ def _parse_usage_date(v) -> Optional[date]:
 
 
 def build_daily_service_cost_query(now: Optional[datetime] = None, days_back: int = 62) -> Dict[str, Any]:
-    """ActualCost per DAY, grouped by ServiceName, over the last `days_back` days — used to estimate a
+    """ActualCost per DAY, grouped by ServiceName, over the last `days_back` days, used to estimate a
     run rate for subscriptions too new to have a complete previous billing month."""
     now = now or datetime.now(timezone.utc)
     start = now - timedelta(days=days_back)
@@ -278,7 +278,7 @@ async def get_runrate_baseline(
 
     For a subscription with no complete previous billing month (new or recently migrated), the last
     "month" is a partial fragment that badly under- or mis-states spend. Instead we take the observed
-    billing period (first day with cost → last day with cost — the DAILY data is authoritative on which
+    billing period (first day with cost → last day with cost, the DAILY data is authoritative on which
     days actually billed, so a subscription that only started billing part-way through last month is
     correctly measured from that day, not from the 1st), compute the average daily spend, and normalise
     it to a representative month. Returns None when no daily cost data is available.
@@ -341,7 +341,7 @@ def parse_monthly_history(payload: Dict[str, Any]) -> Dict[str, list]:
     """Monthly-granularity response → `{resource_id_lower: [cost_per_month, ...]}`, oldest → newest.
 
     Rows carry a month column (BillingMonth / UsageDate); we sort by it so the LAST element is the
-    most recent complete month — which the cost basis reads directly.
+    most recent complete month, which the cost basis reads directly.
     """
     props = payload.get("properties", {})
     columns = [c.get("name") for c in props.get("columns", [])]
@@ -513,7 +513,7 @@ async def get_cost_map_and_consistency(
     steadiness signal, and the growth-trend totals) and the current month-to-date (→ the current
     run-rate). Each resource's `cost_map` figure is chosen by `representative_monthly_cost`, so a
     partial-billing fragment is run-rated and a bursty resource uses a conservative representative
-    figure — never a single arbitrary month.
+    figure, never a single arbitrary month.
     """
     now = now or datetime.now(timezone.utc)
     payload = await client.query_cost_management(
@@ -556,7 +556,7 @@ def cost_consistency(history: Dict[str, list], min_stable_months: int = 2,
     """Per-resource steadiness: mean monthly cost, months billed, and a `stable` flag.
 
     `stable` = billed in ≥ `min_stable_months` months with a coefficient of variation ≤ threshold
-    (costs within ~25% of each other) — i.e. the resource is consistently used, so a reservation is
+    (costs within ~25% of each other), i.e. the resource is consistently used, so a reservation is
     safe. An erratic resource (big month-to-month swings) is flagged so commitments carry a caveat.
     """
     out: Dict[str, Dict] = {}

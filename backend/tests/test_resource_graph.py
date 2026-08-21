@@ -66,6 +66,7 @@ def test_registry_has_all_buckets():
         "rightsizable_sql_managed_instances", "rightsizable_premium_disks",
         "sql_virtual_machines",
         "deallocated_vms", "paused_sql_databases", "stopped_sql_managed_instances",
+        "sql_databases",
         "running_vms",
         # broader coverage — cost-bearing only
         "orphaned_snapshots", "empty_load_balancers", "idle_nat_gateways", "bastion_hosts",

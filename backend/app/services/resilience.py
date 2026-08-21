@@ -87,6 +87,7 @@ async def retry_request(
     breaker: Optional[CircuitBreaker] = None,
     label: str = "azure call",
     stats: Optional[RetryStats] = None,
+    retry_after_cap: Optional[float] = None,
 ) -> httpx.Response:
     """Call `send()` with bounded retry/backoff on throttling + a circuit breaker.
 
@@ -97,7 +98,14 @@ async def retry_request(
     responses are 429 (throttled) and transient 5xx, honouring `Retry-After` when Azure supplies it,
     else exponential backoff with full jitter. `label` names the API/resource for logs (never a token
     or secret — headers are not logged). `stats` accrues run-level throttle/retry counters.
+
+    `retry_after_cap` bounds how long a single Azure-supplied `Retry-After` wait may be honoured. It
+    defaults to the global MAX_BACKOFF_SECONDS; the Cost Management path passes a HIGHER cap (Azure's
+    billing API throttles hard and asks for long waits, so honouring its `Retry-After` beyond 60s is
+    what lets the query succeed instead of exhausting). It only affects the `Retry-After` branch — the
+    exponential-backoff fallback stays capped at MAX_BACKOFF_SECONDS for every caller.
     """
+    ra_cap = retry_after_cap if retry_after_cap is not None else MAX_BACKOFF_SECONDS
     attempt = 0
     while True:
         if breaker is not None and not breaker.allow():
@@ -131,7 +139,7 @@ async def retry_request(
 
         if status in RETRYABLE_STATUS and attempt < max_retries:
             retry_after = _retry_after_seconds(response)
-            delay = min(retry_after, MAX_BACKOFF_SECONDS) if retry_after is not None else _backoff(base_delay, attempt)
+            delay = min(retry_after, ra_cap) if retry_after is not None else _backoff(base_delay, attempt)
             reason = "throttled (429)" if status == 429 else f"server error ({status})"
             if stats is not None:
                 stats.retries += 1
