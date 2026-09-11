@@ -1,11 +1,9 @@
 import React from "react";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
-import { MsalProvider, useIsAuthenticated, useMsal } from "@azure/msal-react";
-import { PublicClientApplication } from "@azure/msal-browser";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ThemeProvider, CssBaseline } from "@mui/material";
 
-import { msalConfig } from "./auth/msalConfig";
+import { AuthProvider, useAuth } from "./auth/AuthProvider";
 import { applyColorScheme, getStoredMode, themeFor, ThemeMode } from "./theme";
 import { ThemeModeContext } from "./components/themeMode";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -13,8 +11,6 @@ import Login from "./pages/Login";
 import SelectSubscriptions from "./pages/SelectSubscriptions";
 import Assessments from "./pages/Assessments";
 import Results from "./pages/Results";
-
-const msalInstance = new PublicClientApplication(msalConfig);
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -26,10 +22,7 @@ const queryClient = new QueryClient({
 });
 
 function AuthGate({ children }: { children: React.ReactNode }) {
-  const isAuthenticated = useIsAuthenticated();
-  const { inProgress } = useMsal();
-
-  if (inProgress !== "none") return null; // MSAL is initialising
+  const { isAuthenticated } = useAuth();
   if (!isAuthenticated) return <Login />;
   return <>{children}</>;
 }
@@ -53,7 +46,7 @@ export default function App() {
   );
 
   return (
-    <MsalProvider instance={msalInstance}>
+    <AuthProvider>
       <QueryClientProvider client={queryClient}>
         <ThemeModeContext.Provider value={themeCtx}>
           <ThemeProvider theme={muiTheme}>
@@ -77,6 +70,6 @@ export default function App() {
           </ThemeProvider>
         </ThemeModeContext.Provider>
       </QueryClientProvider>
-    </MsalProvider>
+    </AuthProvider>
   );
 }

@@ -3,7 +3,7 @@ import {
   Avatar, Box, Button, Stack, ToggleButton, ToggleButtonGroup, Tooltip, Typography,
 } from "@mui/material";
 import { alpha } from "@mui/material/styles";
-import { useMsal } from "@azure/msal-react";
+import { useAuth } from "../auth/AuthProvider";
 import { useLocation, useNavigate } from "react-router-dom";
 import DashboardIcon from "@mui/icons-material/Dashboard";
 import AssessmentIcon from "@mui/icons-material/Assessment";
@@ -90,22 +90,22 @@ const NAV: NavItem[] = [
 ];
 
 export default function Layout({ children, title, subtitle, actions }: Props) {
-  const { instance, accounts } = useMsal();
+  const { account, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const { mode } = useThemeMode();
-  const account = accounts[0];
   // The only logo asset is the dark-ink wordmark (built for light surfaces); on the dark sidebar it
   // would be invisible, so render it as a clean light wordmark in dark mode.
   const logoFilter = mode === "dark" ? "brightness(0) invert(1)" : "none";
 
+  const displayName = account?.email?.split("@")[0] ?? "Signed in";
   const initials =
-    account?.name
-      ?.split(" ")
+    displayName
+      .split(/[.\-_ ]/)
       .map((n) => n[0])
       .slice(0, 2)
       .join("")
-      .toUpperCase() ?? "?";
+      .toUpperCase() || "?";
 
   return (
     <Box sx={{ display: "flex", minHeight: "100vh", bgcolor: colors.bg }}>
@@ -236,11 +236,11 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
                     noWrap
                     color={colors.textPrimary}
                   >
-                    {account.name ?? "Signed in"}
+                    {displayName}
                   </Typography>
-                  <Tooltip title={account.username}>
+                  <Tooltip title={account.email}>
                     <Typography variant="caption" color={colors.textMuted} noWrap component="div">
-                      {account.username}
+                      {account.email}
                     </Typography>
                   </Tooltip>
                 </Box>
@@ -251,7 +251,7 @@ export default function Layout({ children, title, subtitle, actions }: Props) {
                 variant="outlined"
                 color="inherit"
                 startIcon={<LogoutIcon fontSize="small" />}
-                onClick={() => instance.logoutRedirect()}
+                onClick={() => logout()}
                 sx={{
                   color: colors.textSecondary,
                   borderColor: colors.border,

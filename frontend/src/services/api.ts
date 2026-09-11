@@ -1,7 +1,5 @@
 import axios from "axios";
-import { useMsal } from "@azure/msal-react";
-import { InteractionRequiredAuthError } from "@azure/msal-browser";
-import { armTokenRequest } from "../auth/msalConfig";
+import { useAuth } from "../auth/AuthProvider";
 import {
   Assessment, AssessmentSummary, Finding, FindingsByCategory, PreflightResponse, Subscription,
 } from "../types";
@@ -9,25 +7,10 @@ import {
 const http = axios.create({ baseURL: "/api" });
 
 export function useApi() {
-  const { instance, accounts } = useMsal();
-
-  async function getToken(): Promise<string> {
-    const account = accounts[0];
-    if (!account) throw new Error("Not authenticated");
-    try {
-      const result = await instance.acquireTokenSilent(armTokenRequest(account));
-      return result.accessToken;
-    } catch (err) {
-      if (err instanceof InteractionRequiredAuthError) {
-        const result = await instance.acquireTokenPopup(armTokenRequest(account));
-        return result.accessToken;
-      }
-      throw err;
-    }
-  }
+  const { getToken } = useAuth();
 
   async function authHeaders() {
-    return { Authorization: `Bearer ${await getToken()}` };
+    return { Authorization: `Bearer ${getToken()}` };
   }
 
   return {
@@ -96,7 +79,7 @@ export function useApi() {
     },
 
     async downloadReport(id: number): Promise<void> {
-      const token = await getToken();
+      const token = getToken();
       const response = await http.get(`/assessments/${id}/report/pdf`, {
         headers: { Authorization: `Bearer ${token}` },
         responseType: "blob",
