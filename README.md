@@ -248,7 +248,7 @@ push to `feature` deploys** through `.github/workflows/deploy.yml` (frontend bui
 publish-profile deploy → `/api/health` smoke test). Full setup + the App Settings list: `SETUP.md` §4.
 
 ```bash
-# App Service startup command:  bash backend/startup.sh     (repo root is deployed; see backend/startup.sh)
+# App Service startup command:  bash backend/startup.sh  (Oryx unpacks the app to /tmp/<id>; script cds relative to itself)
 # DB: sqlite:////home/data/cat.db  (persistent /home share; schema created at startup — no alembic step)
 ```
 
