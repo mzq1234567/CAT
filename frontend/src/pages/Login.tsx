@@ -1,11 +1,15 @@
-import { Box, Button, Paper, Stack, Typography } from "@mui/material";
+import React from "react";
+import { Alert, Box, Button, CircularProgress, Paper, Stack, Typography } from "@mui/material";
 import { keyframes } from "@mui/material/styles";
-import { useMsal } from "@azure/msal-react";
 import MicrosoftIcon from "@mui/icons-material/Window";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import CheckIcon from "@mui/icons-material/Check";
+import OpenInNewIcon from "@mui/icons-material/OpenInNew";
 import InsightsOutlinedIcon from "@mui/icons-material/InsightsOutlined";
 import SavingsOutlinedIcon from "@mui/icons-material/SavingsOutlined";
 import ShieldOutlinedIcon from "@mui/icons-material/ShieldOutlined";
-import { loginRequest } from "../auth/msalConfig";
+import { useAuth } from "../auth/AuthProvider";
+import { DeviceLoginError, DeviceStart, pollDeviceLogin, startDeviceLogin } from "../auth/deviceLogin";
 import { useReducedMotion } from "../components/assessment/useAssessmentMotion";
 import { useThemeMode } from "../components/themeMode";
 import { colors } from "../theme";
@@ -124,14 +128,97 @@ const POINTS = [
   { icon: <ShieldOutlinedIcon sx={{ fontSize: 18 }} />, text: "Read-only: nothing in your environment is changed" },
 ];
 
+type Phase = "idle" | "starting" | "pending" | "error";
+
 export default function Login() {
-  const { instance } = useMsal();
   const reduced = useReducedMotion();
   const { mode } = useThemeMode();
+  const { setSession } = useAuth();
 
-  const handleLogin = () => {
-    instance.loginRedirect(loginRequest).catch(console.error);
-  };
+  const [phase, setPhase] = React.useState<Phase>("idle");
+  const [device, setDevice] = React.useState<DeviceStart | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [copied, setCopied] = React.useState(false);
+
+  // Kept in refs so the polling loop never reads stale values and can be cancelled on unmount/restart.
+  const timerRef = React.useRef<number | undefined>(undefined);
+  const deadlineRef = React.useRef<number>(0);
+  const activeRef = React.useRef(false);
+
+  const stopPolling = React.useCallback(() => {
+    activeRef.current = false;
+    if (timerRef.current !== undefined) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = undefined;
+    }
+  }, []);
+
+  React.useEffect(() => () => stopPolling(), [stopPolling]);
+
+  const poll = React.useCallback(
+    async (sessionId: string, interval: number) => {
+      if (!activeRef.current) return;
+      if (Date.now() > deadlineRef.current) {
+        stopPolling();
+        setError("Your Microsoft sign-in code expired. Please start a new sign-in attempt.");
+        setPhase("error");
+        return;
+      }
+      try {
+        const result = await pollDeviceLogin(sessionId);
+        if (!activeRef.current) return;
+        if (result.status === "complete" && result.access_token && result.account && result.expires_on) {
+          stopPolling();
+          // Hands the delegated ARM token to the app; AuthGate re-renders and unmounts this screen.
+          setSession({
+            access_token: result.access_token,
+            expires_on: result.expires_on,
+            account: result.account,
+          });
+          return;
+        }
+        timerRef.current = window.setTimeout(() => poll(sessionId, interval), interval * 1000);
+      } catch (err) {
+        if (!activeRef.current) return;
+        stopPolling();
+        setError(err instanceof DeviceLoginError ? err.message : "Microsoft sign-in could not be completed.");
+        setPhase("error");
+      }
+    },
+    [setSession, stopPolling]
+  );
+
+  const handleLogin = React.useCallback(async () => {
+    stopPolling();
+    setError(null);
+    setCopied(false);
+    setPhase("starting");
+    try {
+      const started = await startDeviceLogin();
+      setDevice(started);
+      setPhase("pending");
+      deadlineRef.current = Date.now() + started.expires_in * 1000;
+      activeRef.current = true;
+      timerRef.current = window.setTimeout(
+        () => poll(started.session_id, started.interval || 5),
+        (started.interval || 5) * 1000
+      );
+    } catch (err) {
+      setError(err instanceof DeviceLoginError ? err.message : "Could not start Microsoft sign-in.");
+      setPhase("error");
+    }
+  }, [poll, stopPolling]);
+
+  const copyCode = React.useCallback(async () => {
+    if (!device) return;
+    try {
+      await navigator.clipboard.writeText(device.user_code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard blocked — the code is shown for manual entry */
+    }
+  }, [device]);
 
   return (
     <Box
@@ -209,16 +296,84 @@ export default function Login() {
           ))}
         </Stack>
 
-        <Button
-          variant="contained"
-          size="large"
-          fullWidth
-          startIcon={<MicrosoftIcon />}
-          onClick={handleLogin}
-          sx={{ py: 1.5, fontSize: 15 }}
-        >
-          Sign in with Microsoft
-        </Button>
+        {phase === "pending" && device ? (
+          <Stack spacing={2}>
+            <Typography variant="body2" color={colors.textSecondary} sx={{ lineHeight: 1.6 }}>
+              To sign in, open the Microsoft device-login page and enter this code:
+            </Typography>
+
+            <Box
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 1,
+                px: 2,
+                py: 1.5,
+                borderRadius: 2,
+                border: `1px solid ${colors.border}`,
+                bgcolor: colors.surfaceElevated ?? colors.surface,
+              }}
+            >
+              <Typography
+                sx={{ fontFamily: "monospace", fontSize: 26, fontWeight: 700, letterSpacing: "0.12em", color: colors.textPrimary }}
+              >
+                {device.user_code}
+              </Typography>
+              <Button
+                size="small"
+                variant="text"
+                startIcon={copied ? <CheckIcon fontSize="small" /> : <ContentCopyIcon fontSize="small" />}
+                onClick={copyCode}
+              >
+                {copied ? "Copied" : "Copy"}
+              </Button>
+            </Box>
+
+            <Button
+              variant="contained"
+              size="large"
+              fullWidth
+              startIcon={<OpenInNewIcon />}
+              onClick={() => window.open(device.verification_uri, "_blank", "noopener,noreferrer")}
+              sx={{ py: 1.5, fontSize: 15 }}
+            >
+              Open Microsoft sign-in
+            </Button>
+
+            <Box display="flex" alignItems="center" justifyContent="center" gap={1.25} mt={0.5}>
+              <CircularProgress size={16} thickness={5} />
+              <Typography variant="body2" color={colors.textMuted}>
+                Waiting for Microsoft authentication…
+              </Typography>
+            </Box>
+
+            <Button size="small" variant="text" color="inherit" onClick={() => { stopPolling(); setPhase("idle"); }}
+              sx={{ color: colors.textMuted }}>
+              Cancel
+            </Button>
+          </Stack>
+        ) : phase === "error" ? (
+          <Stack spacing={2}>
+            <Alert severity="error" sx={{ textAlign: "left" }}>{error}</Alert>
+            <Button variant="contained" size="large" fullWidth startIcon={<MicrosoftIcon />}
+              onClick={handleLogin} sx={{ py: 1.5, fontSize: 15 }}>
+              Try again
+            </Button>
+          </Stack>
+        ) : (
+          <Button
+            variant="contained"
+            size="large"
+            fullWidth
+            disabled={phase === "starting"}
+            startIcon={phase === "starting" ? <CircularProgress size={18} color="inherit" /> : <MicrosoftIcon />}
+            onClick={handleLogin}
+            sx={{ py: 1.5, fontSize: 15 }}
+          >
+            {phase === "starting" ? "Starting sign-in…" : "Sign in with Microsoft"}
+          </Button>
+        )}
 
         <Typography variant="caption" color={colors.textMuted} display="block" mt={3} sx={{ lineHeight: 1.6 }}>
           Secure, read-only analysis using your existing Azure access, no changes are made to your

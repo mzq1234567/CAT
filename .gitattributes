@@ -1,0 +1,4 @@
+# Files that run on Linux (App Service / GitHub Actions) must never get CRLF from a Windows checkout.
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf

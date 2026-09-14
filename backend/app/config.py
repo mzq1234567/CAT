@@ -17,6 +17,31 @@ class Settings(BaseSettings):
     rate_limit_window_seconds: int = 60
     log_level: str = "INFO"
 
+    # ── Authentication mode (device-code) ─────────────────────────────────────────────
+    # Azure CAT authenticates users with the OAuth 2.0 DEVICE AUTHORIZATION GRANT, driven by the
+    # backend (the /devicecode + /token endpoints do not allow browser CORS, so the browser cannot run
+    # the flow itself). The frontend shows the user_code + verification_uri and polls our backend; the
+    # backend polls Entra and returns the resulting delegated ARM access token to the browser, which then
+    # sends it as `Authorization: Bearer` exactly as before — so everything downstream is unchanged.
+    #
+    #   azure_device_code_client_id — the public client the device flow is INITIATED with. Defaults to
+    #     Microsoft's well-known Azure CLI public client id, which is pre-provisioned in every tenant, so
+    #     a user with the right Azure RBAC can sign in WITHOUT a tenant admin consenting to a custom app.
+    #   azure_auth_authority — the login authority; `organizations` = any work/school tenant (Azure subs
+    #     never live under personal MSAs). JWKS/issuer verification still uses the `common` metadata.
+    #   azure_arm_scope — the delegated scope requested; must stay ARM user_impersonation for ARM access.
+    #
+    # NOTE: this is separate from `azure_client_id` below (which drives the appid VALIDATION check). In a
+    # deployment that uses the CLI client, set AZURE_CLIENT_ID to the same value so minted tokens pass the
+    # "issued for this application" check. See security/token.py and dependencies.get_verifier().
+    azure_auth_mode: str = "device_code"
+    azure_device_code_client_id: str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"  # Microsoft Azure CLI
+    azure_auth_authority: str = "https://login.microsoftonline.com/organizations"
+    azure_arm_scope: str = "https://management.azure.com/user_impersonation openid profile"
+    # Safety cap on how long a single device-code login session may be polled for (Entra's own
+    # `expires_in` is ~15 min; this bounds our server-side session store regardless).
+    device_code_session_ttl_seconds: int = 900
+
     # Token security — verify the Azure AD RS256 signature (JWKS) on every request.
     # Secure by default; disabling it re-opens a tenant-isolation bypass (see security/token.py).
     verify_token_signature: bool = True

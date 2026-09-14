@@ -48,25 +48,36 @@ Open http://localhost:5173
 
 ---
 
-## 4. Deploy to Azure App Service
+## 4. Deploy to Azure App Service (CI/CD)
 
-**Build frontend:**
+Deployed as ONE Linux App Service (`tpt-azure-cat`, resource group `Ayush_RG`, plan `azure-cat-plan` B1,
+Python 3.12) — FastAPI serves `frontend/dist` as static files. **Every push to `feature` deploys** via
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml): type-check + build the frontend, run the
+backend tests, zip the repo-root layout (`backend/` + `frontend/dist/` + root `requirements.txt` shim),
+deploy with the publish profile, then smoke-test `/api/health`.
+
+**One-time setup (already done for `tpt-azure-cat`; repeat only for a new app):**
 ```bash
-cd frontend
-npm run build        # outputs to frontend/dist/
+az appservice plan create -n azure-cat-plan -g Ayush_RG -l eastus --is-linux --sku B1
+az webapp create -n tpt-azure-cat -g Ayush_RG -p azure-cat-plan --runtime "PYTHON:3.12"
+az webapp config appsettings set -n tpt-azure-cat -g Ayush_RG --settings   AZURE_CLIENT_ID=04b07795-8ddb-461a-bbee-02f9e1bf7b46   CORS_ORIGINS='["https://tpt-azure-cat.azurewebsites.net"]'   VERIFY_TOKEN_SIGNATURE=true TOKEN_ENFORCE_AUDIENCE=true DEBUG_FINDINGS_REASONING=false   DATABASE_URL=sqlite:////home/data/cat.db LOG_LEVEL=INFO SCM_DO_BUILD_DURING_DEPLOYMENT=true
+az webapp config set -n tpt-azure-cat -g Ayush_RG --startup-file "bash backend/startup.sh" --always-on true
+az webapp update -n tpt-azure-cat -g Ayush_RG --https-only true
+az webapp config set -n tpt-azure-cat -g Ayush_RG --generic-configurations '{"healthCheckPath": "/api/health"}'
+# Enable SCM basic auth (needed by the publish profile), then download the profile:
+az resource update -g Ayush_RG --namespace Microsoft.Web --parent sites/tpt-azure-cat   --resource-type basicPublishingCredentialsPolicies -n scm --set properties.allow=true
+az webapp deployment list-publishing-profiles -n tpt-azure-cat -g Ayush_RG --xml
 ```
+Paste the XML as the GitHub secret **`AZURE_WEBAPP_PUBLISH_PROFILE`** (repo → Settings → Secrets and
+variables → Actions).
 
-**Deploy backend + frontend/dist to App Service:**
-```bash
-cd backend
-# The FastAPI app serves frontend/dist as static files automatically
-# Set Startup Command: bash startup.sh
-# Set App Settings:
-#   AZURE_CLIENT_ID = <your-client-id>
-#   CORS_ORIGINS = ["https://your-app.azurewebsites.net"]
-```
-
-Add `https://your-app.azurewebsites.net` as a redirect URI in the App Registration.
+**Notes**
+- `AZURE_CLIENT_ID` is Microsoft's Azure CLI public client (the device-code flow's default) — no app
+  registration or redirect URI is needed. Swap in your own client id if you register one.
+- The SQLite DB lives at `/home/data/cat.db` — outside `wwwroot` (wiped on deploy), on App Service's
+  persistent `/home` share. Tables are created at startup (`create_all` + `ensure_runtime_columns`).
+- Single instance only: login sessions, rate limiter and pricing cache are in-process. Do not scale out
+  without moving to Postgres (`DATABASE_URL`) + a shared cache.
 
 ---
 

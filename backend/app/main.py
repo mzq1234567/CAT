@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .database import Base, engine, ensure_runtime_columns
-from .api.routes import assessments, subscriptions
+from .api.routes import assessments, auth, subscriptions
 from .errors import register_error_handlers
 from .logging_config import configure_logging
 from .middleware import RequestContextMiddleware
@@ -60,15 +60,17 @@ app.add_middleware(
 
 register_error_handlers(app)
 
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(subscriptions.router, prefix="/api/subscriptions", tags=["subscriptions"])
 app.include_router(assessments.router, prefix="/api/assessments", tags=["assessments"])
-
-# Serve React build in production (Azure App Service)
-frontend_dist = pathlib.Path(__file__).parent.parent.parent / "frontend" / "dist"
-if frontend_dist.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="static")
-
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+# Serve React build in production (Azure App Service). Mounted LAST: a mount at "/" matches every
+# path, so any route registered after it (e.g. /api/health) would be shadowed and 404.
+frontend_dist = pathlib.Path(__file__).parent.parent.parent / "frontend" / "dist"
+if frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="static")
