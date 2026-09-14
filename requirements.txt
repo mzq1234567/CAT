@@ -1,0 +1,3 @@
+# Deployment shim for Azure App Service: Oryx only auto-detects Python (and runs pip install) when a
+# requirements.txt exists at the deployed root. The real dependency list lives in backend/.
+-r backend/requirements.txt

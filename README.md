@@ -243,22 +243,17 @@ npm install && npm run dev           # http://localhost:5173
 
 ## Deployment
 
-Deploys as a single **Azure App Service** (FastAPI serves the built React app):
+One Linux **Azure App Service** (`tpt-azure-cat`, B1, Python 3.12) serving the built React app; **every
+push to `feature` deploys** through `.github/workflows/deploy.yml` (frontend build → backend tests → zip →
+publish-profile deploy → `/api/health` smoke test). Full setup + the App Settings list: `SETUP.md` §4.
 
 ```bash
-cd frontend && npm run build         # → frontend/dist/ (served by FastAPI)
-# App Service startup command:  bash startup.sh
-# App Settings:  AZURE_CLIENT_ID=<client-id>
-#                CORS_ORIGINS=["https://<your-app>.azurewebsites.net"]
-#                VERIFY_TOKEN_SIGNATURE=true
-# On deploy, run:  alembic upgrade head
+# App Service startup command:  bash backend/startup.sh     (repo root is deployed; see backend/startup.sh)
+# DB: sqlite:////home/data/cat.db  (persistent /home share; schema created at startup — no alembic step)
 ```
 
-Add `https://<your-app>.azurewebsites.net` as a redirect URI on the app registration. For scale beyond a
-single instance, swap SQLite for Postgres (`DATABASE_URL`) and move the in-memory cache/rate-limiter to
-Redis.
-
----
+For scale beyond a single instance, swap SQLite for Postgres (`DATABASE_URL`) and move the in-memory
+cache/rate-limiter/login-session store to a shared backend.
 
 ## Database
 
